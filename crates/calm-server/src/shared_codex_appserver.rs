@@ -98,6 +98,20 @@ pub const SPAWN_ENV_PASSTHROUGH: &[&str] = &[
     "CODEX_ACCESS_TOKEN",
     "OPENAI_ORGANIZATION",
     "OPENAI_PROJECT",
+    // Internal/provider wrappers may use these to acquire credentials, select
+    // a gateway/model catalog, and start an authenticated local proxy before
+    // exec'ing the real Codex binary. They are intentionally explicit rather
+    // than allowing arbitrary parent environment inheritance.
+    "LLMGW_OPENAI_API_KEY",
+    "LLMGW_CHATGPT_ACCOUNT_ID",
+    "LLMGW_SERVICE_SECRET",
+    "LLMGW_SOURCE",
+    "LLMGW_OG_PROXY",
+    "LLMGW_OG_PROXY_PORT",
+    "LLMGW_FORCE_LOGIN",
+    "LLMGW_SSO_CALLBACK_PORT",
+    "CODEX_SUBSCRIPTION_COMPAT",
+    "USTTP_MODE",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1385,16 +1399,18 @@ impl SharedCodexAppServer {
     }
 
     pub fn compute_env_signature(
+        codex_bin: &str,
         ingest_url: &str,
         http_proxy: Option<&str>,
         https_proxy: Option<&str>,
     ) -> String {
         let mut h = Sha256::new();
-        // #863 — schema-version salt. The first boot of an upgraded binary
-        // mismatches every pre-upgrade persisted signature, so the existing
-        // reap-for-respawn takeover path (`try_takeover_live`) is guaranteed
-        // to replace a daemon spawned with the old (leaky) inherited env.
-        h.update(b"env-schema-v2:863|");
+        // Schema/version salt. The first boot of an upgraded binary mismatches
+        // every pre-upgrade signature. Including the launcher path also makes
+        // switching from `codex` to a wrapper trigger a controlled respawn.
+        h.update(b"env-schema-v3:codex-launcher|");
+        h.update(codex_bin.as_bytes());
+        h.update(b"|");
         h.update(ingest_url.as_bytes());
         h.update(b"|");
         h.update(http_proxy.unwrap_or_default().as_bytes());
@@ -1424,6 +1440,7 @@ impl SharedCodexAppServer {
 
     fn env_signature_for_snapshot(&self, snapshot: &SpawnEnvSnapshot) -> String {
         Self::compute_env_signature(
+            &self.codex_bin,
             &self.ingest_url,
             snapshot.http_proxy.as_deref(),
             snapshot.https_proxy.as_deref(),
@@ -1597,7 +1614,7 @@ impl SharedCodexAppServer {
             }
         };
         // #954 defect 3 — signature mismatch + verified healthy daemon ⇒
-        // ADOPT-AND-DRAIN, never reap-for-respawn. The v2 salt (#863)
+        // ADOPT-AND-DRAIN, never reap-for-respawn. The signature schema salt
         // guarantees a mismatch on every first boot after an upgrade, so
         // the old policy executed a healthy daemon at boot — that reap is
         // what killed prod on 7/12. Adoption proceeds normally below;
@@ -4521,10 +4538,10 @@ mod tests {
         h.update(b"|");
         let pre_salt = hex::encode(h.finalize())[..16].to_string();
 
-        let v2 = SharedCodexAppServer::compute_env_signature(ingest, None, None);
+        let v3 = SharedCodexAppServer::compute_env_signature("codex", ingest, None, None);
         assert_ne!(
-            v2, pre_salt,
-            "compute_env_signature must be salted (env-schema-v2:863)"
+            v3, pre_salt,
+            "compute_env_signature must be salted and launcher-aware"
         );
     }
 

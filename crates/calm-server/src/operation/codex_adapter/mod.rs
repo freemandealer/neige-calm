@@ -531,19 +531,16 @@ impl ProviderAdapter for CodexAdapter {
             .await?
             .ok_or_else(|| CalmError::Internal(format!("terminal {terminal_id} vanished")))?;
         let is_prompted = output_prompt(output)?.is_some();
-        let command_line = if is_prompted {
-            let thread_id = output.output_string("codex_thread_id", "codex")?;
-            format!(
-                "codex resume {} --remote {}",
-                shell_single_quote(&thread_id),
-                shell_single_quote(&self.shared_codex_appserver.remote_uri()),
-            )
+        let thread_id = if is_prompted {
+            Some(output.output_string("codex_thread_id", "codex")?)
         } else {
-            format!(
-                "codex --remote {}",
-                shell_single_quote(&self.shared_codex_appserver.remote_uri()),
-            )
+            None
         };
+        let command_line = codex_remote_command(
+            &self.codex.codex_bin,
+            thread_id.as_deref(),
+            &self.shared_codex_appserver.remote_uri(),
+        );
 
         if !is_prompted {
             let _pending_spawn_serial_guard = self.pending_codex_threads_spawn_serial.lock().await;
@@ -945,6 +942,7 @@ impl ProviderAdapter for CodexWorkerAdapter {
         let handle = spawn_codex_worker_via_shared_daemon(CodexWorkerSpawnCtx {
             spawn_ctx: ctx,
             shared_codex_appserver: &self.shared_codex_appserver,
+            codex_bin: &self.codex.codex_bin,
             mcp_server: self.mcp_server.as_deref(),
             card: &card,
             term: &term,
@@ -1106,6 +1104,7 @@ impl ProviderAdapter for CodexWorkerAdapter {
 pub(crate) struct CodexWorkerSpawnCtx<'a> {
     pub(crate) spawn_ctx: &'a SpawnCtx,
     pub(crate) shared_codex_appserver: &'a Arc<SharedCodexAppServer>,
+    pub(crate) codex_bin: &'a str,
     pub(crate) mcp_server: Option<&'a McpServer>,
     pub(crate) card: &'a Card,
     pub(crate) term: &'a crate::model::Terminal,
@@ -1245,11 +1244,7 @@ pub(crate) async fn spawn_codex_worker_via_shared_daemon(
         }
     }
 
-    let command_line = format!(
-        "codex resume {} --remote {}",
-        shell_single_quote(&thread_id),
-        shell_single_quote(&remote_uri)
-    );
+    let command_line = codex_remote_command(ctx.codex_bin, Some(&thread_id), &remote_uri);
     match ctx
         .spawn_ctx
         .spawn_terminal(ctx.term, &command_line, ctx.cwd, &env_for_spawn)
@@ -1512,6 +1507,18 @@ async fn build_codex_env(
         env_map.insert("https_proxy".to_string(), Value::String(p.to_string()));
     }
     Ok(Value::Object(env_map))
+}
+
+fn codex_remote_command(codex_bin: &str, thread_id: Option<&str>, remote_uri: &str) -> String {
+    let codex_bin = shell_single_quote(codex_bin);
+    let remote_uri = shell_single_quote(remote_uri);
+    match thread_id {
+        Some(thread_id) => format!(
+            "{codex_bin} resume {} --remote {remote_uri}",
+            shell_single_quote(thread_id)
+        ),
+        None => format!("{codex_bin} --remote {remote_uri}"),
+    }
 }
 
 async fn provision_codex_worker_workspace(

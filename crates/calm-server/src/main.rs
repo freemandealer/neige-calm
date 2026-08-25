@@ -13,7 +13,9 @@ use calm_server::routes;
 use calm_server::state::AppState;
 use calm_server::ws;
 use clap::Parser;
+use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[tokio::main]
@@ -238,12 +240,12 @@ fn mount_frontends(
             web_dist = %web_dist.display(),
             "serving built web bundle under /calm/"
         );
+        let service = ServiceBuilder::new()
+            .layer(frontend_cache_control_layer())
+            .service(ServeDir::new(web_dist).fallback(ServeFile::new(index)));
         app = app
             .route("/", get(|| async { Redirect::temporary("/calm/") }))
-            .nest_service(
-                "/calm",
-                ServeDir::new(web_dist).fallback(ServeFile::new(index)),
-            );
+            .nest_service("/calm", service);
     }
 
     if let Some(fe_dist) = fe_dist {
@@ -252,13 +254,20 @@ fn mount_frontends(
             fe_dist = %fe_dist.display(),
             "serving built next-generation frontend bundle under /next/"
         );
-        app = app.nest_service(
-            "/next",
-            ServeDir::new(fe_dist).fallback(ServeFile::new(index)),
-        );
+        let service = ServiceBuilder::new()
+            .layer(frontend_cache_control_layer())
+            .service(ServeDir::new(fe_dist).fallback(ServeFile::new(index)));
+        app = app.nest_service("/next", service);
     }
 
     app
+}
+
+fn frontend_cache_control_layer() -> SetResponseHeaderLayer<axum::http::HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    )
 }
 
 /// #954 defect 4 — bound on the post-signal HTTP drain. A code invariant
@@ -335,7 +344,7 @@ fn warn_if_worker_hook_callback_is_not_loopback(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, to_bytes};
-    use axum::http::{Method, Request, StatusCode};
+    use axum::http::{Method, Request, Response, StatusCode, header};
     use clap::Parser;
     use std::sync::Arc;
     use std::time::Duration;
@@ -350,7 +359,21 @@ mod tests {
         method: Method,
         uri: &str,
     ) -> (StatusCode, Vec<u8>) {
-        let response = app
+        let response = response_with_method(app, method, uri).await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
+    }
+
+    async fn response_with_method(
+        app: axum::Router,
+        method: Method,
+        uri: &str,
+    ) -> Response<Body> {
+        app
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -359,13 +382,7 @@ mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
             .unwrap()
-            .to_vec();
-        (status, body)
     }
 
     #[tokio::test]
@@ -418,6 +435,23 @@ mod tests {
         assert_eq!(
             response_body(app.clone(), "/calm/asset.txt").await,
             (StatusCode::OK, b"legacy-asset-exact\n".to_vec())
+        );
+        let index_response = response_with_method(app.clone(), Method::GET, "/calm/").await;
+        assert_eq!(
+            index_response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-store, must-revalidate"
+        );
+        let deep_link_response =
+            response_with_method(app.clone(), Method::GET, "/calm/wave/deep-link").await;
+        assert_eq!(
+            deep_link_response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-store, must-revalidate"
+        );
+        let asset_response =
+            response_with_method(app.clone(), Method::GET, "/calm/asset.txt").await;
+        assert_eq!(
+            asset_response.headers()[header::CACHE_CONTROL],
+            "no-cache, no-store, must-revalidate"
         );
         assert_eq!(
             response_body(app, "/next/wave/deep-link").await,

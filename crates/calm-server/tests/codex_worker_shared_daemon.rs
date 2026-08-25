@@ -1349,8 +1349,11 @@ async fn worker_via_shared_daemon_writes_runtime_and_projects_thread_id() {
     .await
     .expect("renderer entry");
     let shell_line = &entry.config().args[1];
+    let expected_launcher = format!("'{}'", fake_codex_bin());
     assert!(
-        shell_line.contains("codex resume 'fake-thread-0001' --remote 'unix://"),
+        shell_line.contains(&format!(
+            "{expected_launcher} resume 'fake-thread-0001' --remote 'unix://"
+        )),
         "shared worker TUI must resume the shared thread: {shell_line}"
     );
     assert!(

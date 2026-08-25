@@ -80,6 +80,7 @@ fn effective_test_env_signature(ingest_url: &str) -> String {
     let https_proxy =
         SharedCodexAppServer::effective_proxy_env(None, &["HTTPS_PROXY", "https_proxy"]);
     SharedCodexAppServer::compute_env_signature(
+        fake_codex_bin(),
         ingest_url,
         http_proxy.as_deref(),
         https_proxy.as_deref(),
@@ -124,6 +125,28 @@ async fn start_new_process_passes_ingest_url_and_proxy_env_without_card_id() {
     assert_eq!(get("http_proxy"), Some("http://proxy.local:3128"));
     assert_eq!(get("HTTPS_PROXY"), Some("http://secure-proxy.local:3129"));
     assert_eq!(get("https_proxy"), Some("http://secure-proxy.local:3129"));
+}
+
+#[tokio::test]
+async fn start_new_process_passes_llmgw_wrapper_environment() {
+    let _guard = ENV_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("LLMGW_SOURCE", "neige-calm-test");
+        std::env::set_var("LLMGW_SERVICE_SECRET", "test-service-secret");
+        std::env::set_var("LLMGW_OG_PROXY", "0");
+    }
+    let _source = EnvGuard("LLMGW_SOURCE");
+    let _secret = EnvGuard("LLMGW_SERVICE_SECRET");
+    let _proxy = EnvGuard("LLMGW_OG_PROXY");
+
+    let root = tempfile::tempdir().unwrap();
+    let daemon = server(&root, repo().await).await;
+    let env = daemon.spawn_env_for_test().await.unwrap();
+    let get = |key: &str| env.get(key).and_then(|value| value.as_deref());
+
+    assert_eq!(get("LLMGW_SOURCE"), Some("neige-calm-test"));
+    assert_eq!(get("LLMGW_SERVICE_SECRET"), Some("test-service-secret"));
+    assert_eq!(get("LLMGW_OG_PROXY"), Some("0"));
 }
 
 #[tokio::test]
@@ -1922,16 +1945,19 @@ fn bounded_exponential_backoff_caps_at_max() {
 }
 
 #[test]
-fn current_env_signature_changes_with_ingest_url_and_proxy() {
-    let s1 = SharedCodexAppServer::compute_env_signature("u1", None, None);
-    let s2 = SharedCodexAppServer::compute_env_signature("u2", None, None);
+fn current_env_signature_changes_with_launcher_ingest_url_and_proxy() {
+    let s1 = SharedCodexAppServer::compute_env_signature("codex-a", "u1", None, None);
+    let s2 = SharedCodexAppServer::compute_env_signature("codex-a", "u2", None, None);
     assert_ne!(s1, s2);
 
-    let s3 = SharedCodexAppServer::compute_env_signature("u1", Some("p"), None);
+    let s3 = SharedCodexAppServer::compute_env_signature("codex-a", "u1", Some("p"), None);
     assert_ne!(s1, s3);
 
-    let s4 = SharedCodexAppServer::compute_env_signature("u1", None, Some("p"));
+    let s4 = SharedCodexAppServer::compute_env_signature("codex-a", "u1", None, Some("p"));
     assert_ne!(s1, s4);
+
+    let s5 = SharedCodexAppServer::compute_env_signature("codex-b", "u1", None, None);
+    assert_ne!(s1, s5);
     assert_eq!(s1.len(), 16);
 }
 
@@ -1942,7 +1968,8 @@ fn current_env_signature_reads_inherited_proxy_when_settings_absent() {
         &["HTTP_PROXY", "http_proxy"],
         inherited_http_proxy("http://from-env"),
     );
-    let sig_with_env = SharedCodexAppServer::compute_env_signature("u1", proxy.as_deref(), None);
+    let sig_with_env =
+        SharedCodexAppServer::compute_env_signature("codex", "u1", proxy.as_deref(), None);
 
     let other_proxy = SharedCodexAppServer::effective_proxy_env_from(
         None,
@@ -1950,7 +1977,7 @@ fn current_env_signature_reads_inherited_proxy_when_settings_absent() {
         inherited_http_proxy("http://other"),
     );
     let sig_with_other_env =
-        SharedCodexAppServer::compute_env_signature("u1", other_proxy.as_deref(), None);
+        SharedCodexAppServer::compute_env_signature("codex", "u1", other_proxy.as_deref(), None);
 
     assert_ne!(
         sig_with_env, sig_with_other_env,
@@ -1965,7 +1992,7 @@ fn current_env_signature_prefers_settings_over_inherited_env() {
         &["HTTP_PROXY", "http_proxy"],
         inherited_http_proxy("http://from-env"),
     );
-    let sig = SharedCodexAppServer::compute_env_signature("u1", proxy.as_deref(), None);
+    let sig = SharedCodexAppServer::compute_env_signature("codex", "u1", proxy.as_deref(), None);
 
     let proxy_no_env = SharedCodexAppServer::effective_proxy_env_from(
         Some("http://from-settings"),
@@ -1973,7 +2000,7 @@ fn current_env_signature_prefers_settings_over_inherited_env() {
         |_| None,
     );
     let sig_no_env =
-        SharedCodexAppServer::compute_env_signature("u1", proxy_no_env.as_deref(), None);
+        SharedCodexAppServer::compute_env_signature("codex", "u1", proxy_no_env.as_deref(), None);
 
     assert_eq!(proxy.as_deref(), Some("http://from-settings"));
     assert_eq!(sig, sig_no_env, "settings override must take precedence");

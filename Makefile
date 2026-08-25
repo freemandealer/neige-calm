@@ -405,8 +405,9 @@ prod: build fe-build prod-dirs prod-repair-codex-homes ## Run production locally
 	@# on the same sock path calm-server resolves
 	@# (CALM_PROC_SUPERVISOR_SOCK env, falling back to
 	@# `CALM_DATA_DIR/proc-supervisor.sock`), wait for it to listen, then
-	@# exec calm-server. A trap on EXIT reaps the supervisor when the
-	@# foreground calm-server stops, so Ctrl-C doesn't leave it dangling.
+	@# run calm-server as a managed child. The shell must remain alive so its
+	@# EXIT trap can reap both processes; exec'ing calm-server here would discard
+	@# the trap and leave an orphan supervisor that can later unlink a new socket.
 	env \
 	  CALM_LISTEN="$(PROD_LISTEN)" \
 	  CALM_ALLOWED_ORIGIN="$(PROD_ALLOWED_ORIGIN)" \
@@ -428,9 +429,26 @@ prod: build fe-build prod-dirs prod-repair-codex-homes ## Run production locally
 	    rm -f "$$SOCK"; \
 	    "$$PROC_SUPERVISOR_BIN" --control-sock "$$SOCK" & \
 	    sup_pid=$$!; \
-	    trap "kill -TERM $$sup_pid 2>/dev/null; wait $$sup_pid 2>/dev/null" EXIT INT TERM; \
-	    until [ -S "$$SOCK" ]; do sleep 0.1; done; \
-	    CALM_PROC_SUPERVISOR_SOCK="$$SOCK" exec "$$CALM_SERVER_BIN" \
+	    server_pid=; \
+	    cleanup() { \
+	      trap - EXIT INT TERM; \
+	      [ -z "$$server_pid" ] || kill -TERM "$$server_pid" 2>/dev/null || true; \
+	      kill -TERM "$$sup_pid" 2>/dev/null || true; \
+	      [ -z "$$server_pid" ] || wait "$$server_pid" 2>/dev/null || true; \
+	      wait "$$sup_pid" 2>/dev/null || true; \
+	    }; \
+	    trap cleanup EXIT; \
+	    trap "exit 130" INT; \
+	    trap "exit 143" TERM; \
+	    until [ -S "$$SOCK" ]; do \
+	      kill -0 "$$sup_pid" 2>/dev/null || { wait "$$sup_pid"; exit $$?; }; \
+	      sleep 0.1; \
+	    done; \
+	    CALM_PROC_SUPERVISOR_SOCK="$$SOCK" "$$CALM_SERVER_BIN" & \
+	    server_pid=$$!; \
+	    wait "$$server_pid"; \
+	    status=$$?; \
+	    exit "$$status" \
 	  '
 
 # ---- housekeeping ------------------------------------------------------

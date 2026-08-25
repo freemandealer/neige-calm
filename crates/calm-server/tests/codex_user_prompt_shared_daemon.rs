@@ -310,8 +310,11 @@ async fn create_prompt_card_spawns_remote_resume_tui() {
         .get(terminal_id)
         .expect("renderer entry");
     let shell_line = &entry.config().args[1];
+    let expected_launcher = "'codex'";
     assert!(
-        shell_line.contains("codex resume 'fake-thread-0001' --remote 'unix://"),
+        shell_line.contains(&format!(
+            "{expected_launcher} resume 'fake-thread-0001' --remote 'unix://"
+        )),
         "unexpected command line: {shell_line}"
     );
 }
@@ -383,8 +386,9 @@ async fn create_empty_card_with_empty_cards_flag_enabled_uses_shared_daemon_pend
         .get(terminal_id)
         .expect("renderer entry");
     let shell_line = &entry.config().args[1];
+    let expected_launcher = "'codex'";
     assert!(
-        shell_line.contains("codex --remote 'unix://"),
+        shell_line.contains(&format!("{expected_launcher} --remote 'unix://")),
         "unexpected command line: {shell_line}"
     );
     assert!(

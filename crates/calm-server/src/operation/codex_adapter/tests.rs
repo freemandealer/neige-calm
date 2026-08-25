@@ -8,6 +8,20 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+#[test]
+fn remote_tui_command_uses_configured_codex_launcher() {
+    let command = codex_remote_command(
+        "/home/user/bin/codex wrapper",
+        Some("thread-1"),
+        "unix:///tmp/codex.sock",
+    );
+
+    assert_eq!(
+        command,
+        "'/home/user/bin/codex wrapper' resume 'thread-1' --remote 'unix:///tmp/codex.sock'"
+    );
+}
+
 struct WorkerLeaseHarness {
     repo: Arc<crate::db::sqlite::SqlxRepo>,
     adapter: CodexWorkerAdapter,

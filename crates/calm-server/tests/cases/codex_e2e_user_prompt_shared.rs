@@ -144,8 +144,11 @@ async fn user_prompt_card_first_turn_true_binary() {
         .terminal_renderer
         .get(terminal_id)
         .expect("remote TUI renderer");
+    let expected_launcher = format!("'{}'", codex_bin.display());
     assert!(
-        entry.config().args[1].contains(&format!("codex resume '{thread_id}' --remote 'unix://")),
+        entry.config().args[1].contains(&format!(
+            "{expected_launcher} resume '{thread_id}' --remote 'unix://"
+        )),
         "remote TUI command should attach the same thread: {}",
         entry.config().args[1]
     );
