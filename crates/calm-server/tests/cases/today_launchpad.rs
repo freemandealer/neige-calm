@@ -27,9 +27,11 @@ use tower::ServiceExt;
 
 use crate::support::git_helpers::attached_repo_fixture;
 
-struct Boot {
-    app: axum::Router,
-    repo: Arc<SqlxRepo>,
+pub(crate) struct Boot {
+    pub(crate) app: axum::Router,
+    pub(crate) repo: Arc<SqlxRepo>,
+    /// The server's live task dispatcher, so a case can stop it from claiming the tasks it declares.
+    pub(crate) dispatcher: Arc<calm_server::dispatcher::Dispatcher>,
     /// This server's own mint counters, per instance so a sibling case in the same binary cannot move them.
     system_area_mint: Arc<SystemAreaMintCounters>,
     /// The managed workspace root this boot was pinned to.
@@ -37,7 +39,7 @@ struct Boot {
     _tmp: TempDir,
 }
 
-async fn boot() -> Boot {
+pub(crate) async fn boot() -> Boot {
     let tmp = TempDir::new().unwrap();
     let repo = Arc::new(SqlxRepo::open("sqlite::memory:").await.unwrap());
     boot_with(tmp, repo, "workspaces").await
@@ -98,6 +100,7 @@ async fn boot_with_rendezvous(
         None => state,
     };
     let system_area_mint = Arc::clone(&state.system_area_mint);
+    let dispatcher = Arc::clone(&state.dispatcher);
     let app = routes::router()
         // `POST /api/today/launchpad/report/reset` extracts a `Principal`, so the session layer has to be present.
         .layer(axum::Extension(calm_server::auth::Principal {
@@ -113,6 +116,7 @@ async fn boot_with_rendezvous(
     Boot {
         app,
         repo,
+        dispatcher,
         system_area_mint,
         workspace_root: tmp.path().join(root_name),
         _tmp: tmp,
@@ -161,7 +165,7 @@ async fn create_track(b: &Boot, body: Value) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn ensure(app: axum::Router) -> (StatusCode, Value) {
+pub(crate) async fn ensure(app: axum::Router) -> (StatusCode, Value) {
     let response = app
         .oneshot(
             Request::post("/api/today/launchpad/ensure")
@@ -995,7 +999,7 @@ async fn shared_managed_path_is_reported_as_a_violation() {
     );
 }
 
-async fn resolve(app: axum::Router) -> (StatusCode, Value) {
+pub(crate) async fn resolve(app: axum::Router) -> (StatusCode, Value) {
     let response = app
         .oneshot(
             Request::get("/api/today/launchpad")
@@ -1009,7 +1013,7 @@ async fn resolve(app: axum::Router) -> (StatusCode, Value) {
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn count(b: &Boot, sql: &str) -> i64 {
+pub(crate) async fn count(b: &Boot, sql: &str) -> i64 {
     sqlx::query_scalar(sql)
         .fetch_one(b.repo.pool())
         .await
@@ -1286,7 +1290,7 @@ async fn today_launchpad_adopt_branch_survives_the_column_rename() {
     );
 }
 
-async fn post(
+pub(crate) async fn post(
     app: axum::Router,
     uri: &str,
     actor: Option<&str>,
