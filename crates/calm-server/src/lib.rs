@@ -540,6 +540,7 @@ pub mod card_role_cache;
 pub(crate) mod claude_code_env;
 pub mod claude_planner;
 pub mod codex_appserver;
+pub mod codex_mcp_toolset;
 pub mod config;
 /// Area folder claim rules, re-exported at the old crate path.
 pub use calm_truth::area_folder_claim;
@@ -832,6 +833,31 @@ mod boot_order_tests {
             .expect("main boot opens reaper gate");
         assert!(card_id_assert < reaper);
         assert!(recover < reaper);
+    }
+
+    /// The Codex MCP catalog follower starts while the state is built, before `main` boots the
+    /// daemon, so the daemon's first Running refreshes every thread it adopted (#2014).
+    #[test]
+    fn codex_mcp_toolset_starts_while_the_state_is_built() {
+        let state_rs = include_str!("state.rs");
+        let toolset = state_rs
+            .find("crate::codex_mcp_toolset::CodexMcpToolset {")
+            .expect("boot starts the Codex MCP catalog follower");
+        let start = &state_rs[toolset..];
+        let end = start.find(';').expect("the start is one statement");
+        assert!(
+            start[..end].contains(".start(&events)"),
+            "{}",
+            &start[..end]
+        );
+        let main_rs = include_str!("main.rs");
+        let state_built = main_rs
+            .find("AppState::boot(&cfg).await")
+            .expect("main builds the state");
+        let daemon_boot = main_rs
+            .find("boot_harnesses(&state).await")
+            .expect("main boots the daemon");
+        assert!(state_built < daemon_boot);
     }
 }
 

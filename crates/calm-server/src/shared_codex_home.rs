@@ -274,6 +274,53 @@ impl SharedCodexHome {
         self.ensure_config(None, Some((shim, daemon_token)))
     }
 
+    /// Bump the kernel entry's `env.NEIGE_MCP_TOOLSET` generation to one past its current value
+    /// and return the new value. An absent or unparseable value counts as 0; the counter wraps, which
+    /// still yields a value unlike the current one, the only property Codex's entry comparison needs.
+    /// Same lock and atomic writer as every other edit. Refuses when the kernel entry has no
+    /// `command`: a lone `env` table would leave Codex an entry it cannot start.
+    pub fn bump_mcp_toolset(&self) -> io::Result<u64> {
+        let lock_path = self.home.join(".config.lock");
+        let _lock = ConfigLock::acquire(&lock_path)?;
+        let cfg_path = self.home.join("config.toml");
+        let text = fs::read_to_string(&cfg_path)?;
+        let mut doc: DocumentMut = text.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("shared CODEX_HOME config.toml is not valid TOML: {e}"),
+            )
+        })?;
+        let key = crate::mcp_server::wiring::MCP_SERVER_KEY;
+        let Some(kernel) = doc
+            .get_mut("mcp_servers")
+            .and_then(|servers| servers.get_mut(key))
+            .and_then(toml_edit::Item::as_table_mut)
+            .filter(|kernel| kernel.contains_key("command"))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shared CODEX_HOME config.toml has no [mcp_servers.{key}] entry to update"),
+            ));
+        };
+        let env = kernel.entry("env").or_insert(toml_edit::table());
+        let Some(env_table) = env.as_table_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("[mcp_servers.{key}].env is not a table"),
+            ));
+        };
+        let toolset_key = crate::mcp_server::wiring::MCP_TOOLSET_ENV;
+        let generation = env_table
+            .get(toolset_key)
+            .and_then(toml_edit::Item::as_str)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .wrapping_add(1);
+        env_table[toolset_key] = toml_edit::value(generation.to_string());
+        write_config_0600(&cfg_path, doc.to_string().as_bytes())?;
+        Ok(generation)
+    }
+
     fn ensure_config(
         &self,
         cwd: Option<&Path>,
