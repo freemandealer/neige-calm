@@ -3,6 +3,7 @@
 
 use crate::error::{CalmError, Result};
 use crate::ids::CardId;
+use crate::mail::TOOL_MAIL_SEND;
 use crate::model::Track;
 use crate::operation::planner_harness_start_adapter::PlannerHarnessStartOperationPayload;
 use crate::operation::{OperationKey, OperationOutcome};
@@ -10,13 +11,17 @@ use crate::routes::idempotency_key::{calm_error_from_operation_failure, stable_p
 use crate::routes::planner_start_fence::CardStartFence;
 use crate::state::RouteState;
 
-use super::KeyedActor;
+use super::{KeyedActor, ResumedStart, SendPath, resumed_start};
 
-/// Which arm submitted, for the sole purpose of reading an `OperationOutcome`.
+/// Which arm submitted: it decides whether the card's conversation is read first and how an
+/// `OperationOutcome` reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum SubmitArm {
     Mint,
-    Resume,
+    /// Joins the chosen operation under its key; submits no start of its own.
+    Replay,
+    /// Submits a new start onto a card an earlier attempt already tried to start.
+    GenuineRetry,
 }
 
 /// Map an operation outcome onto this route's answer, per arm. `SucceededViaCollision`
@@ -69,6 +74,25 @@ fn harness_start_failure_message(reason: &str) -> String {
     )
 }
 
+/// A genuine retry's refusal: what it observed, and where the message goes instead. The same
+/// sentence on every surface; only the send path differs.
+fn planner_has_a_session(
+    send_path: SendPath,
+    request: &PlannerHarnessStartOperationPayload,
+) -> CalmError {
+    let send = match send_path {
+        SendPath::PlannerInput => format!(
+            "through POST /api/cards/{}/planner/input",
+            request.planner_card_id
+        ),
+        SendPath::Mail => format!("with {TOOL_MAIL_SEND} to track {}", request.track_id),
+    };
+    CalmError::Conflict(format!(
+        "track create: this Track's Planner already has a session, so this retry started \
+         nothing and did not deliver the first message; send it to that Planner {send}"
+    ))
+}
+
 /// Submit `planner-harness-start` carrying the first message. Deliberately NOT the
 /// best-effort shape `start_planner_harness` uses: a 201 for an operation that never
 /// enqueued the sentence would lie, and a 5xx is what makes the genuine-retry arm usable.
@@ -119,6 +143,13 @@ pub(super) async fn start_planner_harness_with_first_message(
     // Taken inside the same-key claim the plan holds (`state.rs` lock order); the card exists
     // already, so a send or a reset may be using it.
     let fence = CardStartFence::lock(s, &request.planner_card_id).await;
+    // A genuine retry follows a failed start, and a reset or re-point may have given the card a
+    // conversation since (#2212). That is the send's to continue, not this start's to supersede.
+    if arm == SubmitArm::GenuineRetry
+        && resumed_start(fence.conversation().await?)? == ResumedStart::Conversation
+    {
+        return Err(planner_has_a_session(actor.send_path, &request));
+    }
     let result = fence
         .start(
             &request,

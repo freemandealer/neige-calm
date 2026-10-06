@@ -761,6 +761,56 @@ impl Boot {
         )
     }
 
+    /// One `planner-harness-start` of `planner_card_id` that mirrors the scheduler's child bootstrap in what
+    /// decides the arm: `force_new_thread: false`, the `KernelDispatcher` actor, and a submit straight to the
+    /// operation runtime outside any route and its card fence, so it takes the adapter's NON-deferred arm
+    /// whatever session the card has. It omits the bootstrap's `goal` seed, report card and keyed
+    /// `child-track:` idempotency key (it submits unkeyed); none of them decides the supersede or the harvest.
+    async fn start_non_deferred_like_the_scheduler(&self, track: &Value, planner_card_id: &str) {
+        use calm_server::operation::planner_harness_start_adapter::PlannerHarnessStartOperationPayload;
+        use calm_server::operation::{OperationKey, OperationOutcome};
+
+        // Decoded through the production payload type; every field not named here takes its serde default.
+        let mut fields = json!({
+            "actor": calm_server::ids::ActorId::KernelDispatcher,
+            "track_id": track["id"].as_str().expect("a created track"),
+            "cwd": track["cwd"].as_str().expect("a created track's cwd"),
+            "force_new_thread": false,
+        });
+        fields[calm_truth::db::sqlite::PLANNER_START_CARD_KEY] = json!(planner_card_id);
+        let request: PlannerHarnessStartOperationPayload = serde_json::from_value(fields).unwrap();
+        assert!(
+            !request.force_new_thread && request.goal.is_none() && request.first_message.is_none(),
+            "premise: a plain non-deferred start: {request:?}"
+        );
+        let payload = serde_json::to_value(&request).unwrap();
+        let op_id = self
+            .state
+            .operation_runtime
+            .submit(
+                "planner-harness-start",
+                OperationKey {
+                    operation_key: calm_server::model::new_id(),
+                    idempotency_key: None,
+                    payload_hash: calm_server::model::new_id(),
+                },
+                payload,
+            )
+            .await
+            .unwrap();
+        let outcome = self
+            .state
+            .operation_runtime
+            .wait(&op_id)
+            .await
+            .unwrap()
+            .outcome;
+        assert!(
+            matches!(outcome, OperationOutcome::Succeeded { .. }),
+            "premise: the non-deferred start must succeed: {outcome:?}"
+        );
+    }
+
     async fn shutdown_harnesses(&self) {
         let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM worker_sessions")
             .fetch_all(self.repo.pool())
@@ -1422,7 +1472,8 @@ async fn a_replay_survives_the_track_being_repointed_in_between() {
 }
 
 /// The counterweight: a genuine retry really starts a harness, so it must use the current cwd, not the failed
-/// attempt's (which the re-point has since moved into the trash).
+/// attempt's (which the re-point has since moved into the trash). The re-point's own restart fails too: one that
+/// started the Planner would leave it a conversation, which the retry refuses to supersede (#2212).
 #[tokio::test]
 async fn a_retry_after_a_failure_uses_the_repointed_workspace() {
     let b = boot().await;
@@ -1443,6 +1494,9 @@ async fn a_retry_after_a_failure_uses_the_repointed_workspace() {
     let (_, managed_path) = b.workspace_row(&track_id).await;
 
     let target = user_repo(&b.tmp.path().join("my-project"));
+    b.state
+        .shared_codex_appserver
+        .fail_next_thread_start_for_test();
     let (patched, patch_body) = b.repoint_to(&track_id, &target).await;
     assert_eq!(
         patched,
@@ -1451,6 +1505,13 @@ async fn a_retry_after_a_failure_uses_the_repointed_workspace() {
     );
     let (_, path_after) = b.workspace_row(&track_id).await;
     assert_eq!(PathBuf::from(&path_after), target);
+    let live: i64 = b
+        .count(
+            "SELECT COUNT(*) FROM worker_sessions \
+             WHERE state IN ('starting','running','idle','turn_pending')",
+        )
+        .await;
+    assert_eq!(live, 0, "premise: the re-point's restart failed as well");
 
     let (retry, retry_body) = b
         .create_track(Some("idem-repoint-retry"), Some("second time lucky"))
@@ -3245,9 +3306,10 @@ async fn a_failed_restart_gives_the_harvested_sentence_back() {
     b.shutdown_harnesses().await;
 }
 
-/// The NON-deferred arm of `prepare_tx`: a message-less keyed create's resume starts the existing Planner
-/// with `force_new_thread: false`, which supersedes the card's live predecessor without inheriting anything
-/// from it. (The launchpad's second `ensure` drove this arm until its `reuse` start was deleted, #2251.)
+/// The NON-deferred arm of `prepare_tx`: a start of the existing Planner with `force_new_thread: false`
+/// supersedes the card's live predecessor without inheriting anything from it.
+/// Routes no longer reach this arm with a live predecessor (#2212); the remaining producers are the scheduler's
+/// child bootstrap and crash re-drives, so the start is submitted the way the scheduler submits it.
 #[tokio::test]
 async fn the_non_deferred_arm_carries_an_undrained_sentence_to_its_successor() {
     const LAUNCHPAD_SENTENCE: &str = "check the overnight builds";
@@ -3261,7 +3323,7 @@ async fn the_non_deferred_arm_carries_an_undrained_sentence_to_its_successor() {
     );
     let (runtime, planner_card_id) = b.only_runtime().await;
 
-    // Park the drain, THEN send: the sentence has to be durably queued and still undrained when the second ensure runs.
+    // Park the drain, THEN send: the sentence has to be durably queued and still undrained when the start runs.
     let (entered, release) = b.hold_the_next_drain();
     let (sent, sent_body) = b
         .send_planner_input(&planner_card_id, LAUNCHPAD_SENTENCE)
@@ -3278,16 +3340,12 @@ async fn the_non_deferred_arm_carries_an_undrained_sentence_to_its_successor() {
         "premise: the sentence is durably queued on the predecessor and has not drained"
     );
 
-    // The resume under the same key takes the other arm.
-    let (second, second_body) = b.create_track(Some("idem-non-deferred"), None).await;
-    assert_eq!(
-        second,
-        StatusCode::CREATED,
-        "premise: the resume must answer the key's own track: body={second_body}"
-    );
-    assert_eq!(
-        second_body["id"], first_body["id"],
-        "premise: the resume minted nothing and never reached the arm under test"
+    b.start_non_deferred_like_the_scheduler(&first_body, &planner_card_id)
+        .await;
+    assert_ne!(
+        b.active_runtime_of_card(&planner_card_id).await,
+        runtime,
+        "premise: the start superseded the live predecessor"
     );
     release.notify_one();
 
@@ -3495,13 +3553,13 @@ async fn a_pre_upgrade_sentence_survives_a_failed_mint_that_moved_it() {
 
 /// A move carries the sentence to the successor but leaves the evidence row naming the replaced runtime, so
 /// `user_message_enqueued_on_active_runtime` answers `false` and the summary trigger sends its bootstrap again: an accepted, priced duplicate.
+/// Routes no longer reach the non-deferred arm with a live predecessor (#2212); the remaining producers are the
+/// scheduler's child bootstrap and crash re-drives, so the start is submitted the way the scheduler submits it.
 #[tokio::test]
 async fn a_replaced_runtime_keeps_the_evidence_enqueued_against_it() {
     let b = boot().await;
     let (entered, release) = b.hold_the_next_drain();
 
-    // A message-less keyed create and its resume: the production starts of an existing Planner that
-    // supersede its live runtime (the launchpad's `reuse` start was deleted, #2251).
     let (first, first_body) = b.create_track(Some("idem-replaced-runtime"), None).await;
     assert_eq!(
         first,
@@ -3531,16 +3589,8 @@ async fn a_replaced_runtime_keeps_the_evidence_enqueued_against_it() {
     // The successor's own drain, parked before it exists: the hook is installed BEFORE the mint that creates
     // the successor, so "not drained yet" is a held state rather than a window.
     let (successor_entered, successor_release) = b.hold_the_next_drain();
-    let (second, second_body) = b.create_track(Some("idem-replaced-runtime"), None).await;
-    assert_eq!(
-        second,
-        StatusCode::CREATED,
-        "premise: the resume must answer the key's own track: body={second_body}"
-    );
-    assert_eq!(
-        second_body["id"], first_body["id"],
-        "premise: the resume minted nothing"
-    );
+    b.start_non_deferred_like_the_scheduler(&first_body, &planner_card_id)
+        .await;
 
     let successor = b.active_runtime_of_card(&planner_card_id).await;
     assert_ne!(successor, runtime, "premise: a replacement really happened");
@@ -3723,3 +3773,6 @@ async fn create_model_selection_refuses_agent_before_mint() {
 
 #[path = "track_create_first_message_keyed.rs"]
 mod keyed;
+
+#[path = "track_create_retry_live_session.rs"]
+mod retry_live_session;
