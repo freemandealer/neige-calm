@@ -8,9 +8,9 @@ use super::session_mirror::{
     ensure_runtime_status_transition, session_bind_attribution_mirror_tx,
     session_clear_terminal_run_id_mirror_tx, session_complete_mirror_tx, session_fail_if_active_tx,
     session_mark_superseded_tx, session_repoint_current_links_tx,
-    session_restore_from_superseded_tx, session_set_active_turn_mirror_tx,
-    session_set_handle_state_mirror_tx, session_set_harness_observation_tx,
-    session_set_status_mirror_tx,
+    session_restore_failed_carrier_tx, session_restore_from_superseded_tx,
+    session_set_active_turn_mirror_tx, session_set_handle_state_mirror_tx,
+    session_set_harness_observation_tx, session_set_status_mirror_tx,
 };
 use super::session_row::{agent_provider_to_db, runtime_message};
 use super::{SqlxRepo, begin_immediate_tx, derive_session_identity};
@@ -517,6 +517,44 @@ pub async fn session_mark_superseded_runtime_tx(
     let now = now_ms();
     session_mark_superseded_tx(tx, id, now).await?;
     Ok(())
+}
+
+/// The card's current session when it failed mid-conversation and still owes its queue (#2192):
+/// a wedge or a system error leaves it `failed`, never completed, and unharvested. A failed start
+/// is completed, and keeps its queue for its creator's retry.
+pub async fn session_projection_failed_carrier_for_card_tx(
+    tx: &mut WorkerSessionProjectionTx<'_>,
+    card_id: &str,
+) -> WorkerSessionProjectionResult<Option<WorkerSessionProjection>> {
+    let id: Option<String> = sqlx::query_scalar(
+        r#"SELECT ws.id
+             FROM cards c
+             JOIN worker_sessions ws ON ws.id = c.session_id AND ws.card_id = c.id
+            WHERE c.id = ?1
+              AND ws.state = 'failed'
+              AND ws.completed_at_ms IS NULL
+              AND ws.queue_harvested_at_ms IS NULL"#,
+    )
+    .bind(card_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match id {
+        Some(id) => session_projection_by_id_tx(tx, &id).await,
+        None => Ok(None),
+    }
+}
+
+/// Compensating half of a start that took over the card's failed carrier: the carrier is the
+/// card's current session again, still `failed`, and owes its queue again.
+pub async fn session_restore_failed_carrier_runtime_tx(
+    tx: &mut WorkerSessionProjectionTx<'_>,
+    id: &String,
+) -> WorkerSessionProjectionResult<()> {
+    let session = session_restore_failed_carrier_tx(tx, id, now_ms()).await?;
+    let runtime = session_projection_by_id_tx(tx, id)
+        .await?
+        .ok_or_else(|| runtime_message(format!("worker session {id} missing after restore")))?;
+    session_repoint_current_links_tx(tx, &runtime.card_id, &session).await
 }
 
 /// Tolerant harness phase-mirror / compensation write; deliberately skips the

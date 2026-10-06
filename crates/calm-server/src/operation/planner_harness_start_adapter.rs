@@ -15,10 +15,12 @@ use crate::db::sqlite::{
     harness_items_delete_by_card_tx, harness_items_measure_by_card_tx,
     harvest_pending_user_messages_tx, session_bind_attribution_tx,
     session_clear_queue_harvested_tx, session_delete_tx, session_fail_if_active_runtime_tx,
-    session_handle_state_by_id_tx, session_prepare_deferred_planner_tx,
-    session_projection_active_for_card_tx, session_restore_from_superseded_runtime_tx,
-    session_set_handle_state_of_any_runtime_tx, session_set_handle_state_tx,
-    session_start_runtime_tx, session_supersede_active_tx, session_supersede_and_start_tx,
+    session_handle_state_by_id_tx, session_mark_queue_harvested_tx,
+    session_prepare_deferred_planner_tx, session_projection_active_for_card_tx,
+    session_projection_failed_carrier_for_card_tx, session_restore_failed_carrier_runtime_tx,
+    session_restore_from_superseded_runtime_tx, session_set_handle_state_of_any_runtime_tx,
+    session_set_handle_state_tx, session_start_runtime_tx, session_supersede_active_tx,
+    session_supersede_and_start_tx,
 };
 use crate::db::{Repo, write_in_tx_typed, write_with_event_typed};
 use crate::error::{CalmError, Result};
@@ -765,7 +767,16 @@ impl ProviderAdapter for PlannerHarnessStartAdapter {
         } else {
             None
         };
-        let inherited_snapshot = existing_active_runtime.as_ref().and_then(|runtime| {
+        // #2192: with no active predecessor, the card's current session that failed mid-conversation (a wedge or a system
+        // error) is the predecessor. Its queue is inherited whole, attachments and ids included, and a failed start gives the
+        // card back to it (`restore_old_runtime`).
+        let failed_carrier = if defer_runtime_start && existing_active_runtime.is_none() {
+            session_projection_failed_carrier_for_card_tx(tx, card.id.as_str()).await?
+        } else {
+            None
+        };
+        let predecessor = existing_active_runtime.as_ref().or(failed_carrier.as_ref());
+        let inherited_snapshot = predecessor.and_then(|runtime| {
             let state = runtime.handle_state_json.as_ref()?;
             if state.get("mode").and_then(Value::as_str) != Some(HARNESS_MODE) {
                 return None;
@@ -784,12 +795,14 @@ impl ProviderAdapter for PlannerHarnessStartAdapter {
         let mut inherited_queue_moved = false;
         // What the INHERIT took, for the undo journal: the predecessor is still `active` when the harvest runs, so the harvest's journal cannot cover it.
         let mut inherited_from: Vec<HarvestedFrom> = Vec::new();
+        // The failed carrier's own copy of its queue, carrying the ids the journal names.
+        let mut failed_carrier_keeps: Option<HarnessSnapshot> = None;
         if let Some(inherited) = inherited_snapshot {
             snapshot.push_watermark = inherited.push_watermark;
             // Inheriting the fused entries (not the raw arrays) is what keeps the queue ids the client has already been shown; the inherit CARRIES the predecessor's message ids, it does not mint over them.
             let mut inherited_entries = inherited.pending_entries();
             inherited_queue_moved = true;
-            if let Some(existing) = existing_active_runtime.as_ref() {
+            if let Some(existing) = predecessor {
                 // Only the human sentences are journalled, because only they are returned. `is_user_authored` is the SAME predicate `ensure_message_id` mints under.
                 let mut messages: Vec<HarvestedMessage> = Vec::new();
                 for entry in inherited_entries.iter_mut() {
@@ -820,6 +833,11 @@ impl ProviderAdapter for PlannerHarnessStartAdapter {
                         messages,
                     });
                 }
+            }
+            if failed_carrier.is_some() {
+                let mut kept = inherited.clone();
+                kept.set_pending_entries(inherited_entries.clone());
+                failed_carrier_keeps = Some(kept);
             }
             snapshot.set_pending_entries(inherited_entries);
         }
@@ -905,9 +923,23 @@ impl ProviderAdapter for PlannerHarnessStartAdapter {
             now,
         );
         if defer_runtime_start {
-            if let Some(existing) = existing_active_runtime.as_ref() {
+            if let Some(existing) = predecessor {
                 old_worker_session_id = Some(existing.id.clone());
                 old_runtime_status = Some(existing.status);
+            }
+            // The failed carrier is not emptied: it keeps its queue, under the ids the journal names, as what a failed start
+            // gives back. The stamp is what makes the take exactly-once; nothing reads a stamped row's queue.
+            if let Some(carrier) = failed_carrier.as_ref() {
+                if let Some(kept) = failed_carrier_keeps.as_ref() {
+                    session_set_handle_state_of_any_runtime_tx(
+                        tx,
+                        &carrier.id,
+                        Some(serde_json::to_value(kept)?),
+                        now,
+                    )
+                    .await?;
+                }
+                session_mark_queue_harvested_tx(tx, &carrier.id, now).await?;
             }
             // The inherit is a MOVE: the predecessor stops holding its queue in this transaction, or a later harvest or re-driven operation delivers it twice.
             // Written before `session_prepare_deferred_planner_tx` retires the row, while the ordinary writer still accepts it.
@@ -1671,9 +1703,22 @@ impl ProviderAdapter for PlannerHarnessStartAdapter {
             "fail_runtime" => {
                 let worker_session_id = step.arg_string("runtime_id", "planner harness")?;
                 let journal = read_harvested_from_journal(_output);
+                // For the log line only; a missing value is not this step's concern.
+                let card_id = _output
+                    .data
+                    .get("card_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 write_in_tx_typed(ctx.repo.as_ref(), move |tx| {
                     Box::pin(async move {
-                        return_harvested_queues_and_fail_tx(tx, &worker_session_id, &journal).await
+                        return_harvested_queues_and_fail_tx(
+                            tx,
+                            &card_id,
+                            &worker_session_id,
+                            &journal,
+                        )
+                        .await
                     })
                 })
                 .await
@@ -1845,112 +1890,156 @@ async fn overwrite_queue_from_the_runtimes_own_row_tx(
 /// Fail the runtime and return what it harvested, in one transaction: either it commits or none of it happened.
 async fn return_harvested_queues_and_fail_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    card_id: &str,
     worker_session_id: &str,
     journal: &[HarvestedFromJournalEntry],
 ) -> Result<()> {
     let now = crate::model::now_ms();
-    let successor_state = session_handle_state_by_id_tx(tx, worker_session_id)
+    let successor = session_handle_state_by_id_tx(tx, worker_session_id)
+        .await
+        .map_err(CalmError::from)?
+        .filter(is_harness_snapshot_value)
+        .map(HarnessSnapshot::from_value_strict);
+    let successor_entries = successor
+        .as_ref()
+        .map(HarnessSnapshot::pending_entries)
+        .unwrap_or_default();
+    let held: std::collections::HashSet<&str> = successor_entries
+        .iter()
+        .flat_map(|entry| entry.message_ids().iter().map(String::as_str))
+        .collect();
+    let mut returned_any_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in journal {
+        // What the successor still owes goes back; what it no longer holds, it delivered.
+        let (returning, delivered): (Vec<&HarvestedMessage>, Vec<&HarvestedMessage>) = entry
+            .messages
+            .iter()
+            .partition(|m| m.ids.iter().any(|id| held.contains(id.as_str())));
+        if returning.is_empty() && delivered.is_empty() {
+            continue;
+        }
+        let Some(source_state) = session_handle_state_by_id_tx(tx, &entry.worker_session_id)
+            .await
+            .map_err(CalmError::from)?
+        else {
+            continue;
+        };
+        if !is_harness_snapshot_value(&source_state) {
+            continue;
+        }
+        let mut source = HarnessSnapshot::from_value_strict(source_state);
+        let mut source_entries = source.pending_entries();
+        // #2192: a failed carrier keeps its own copy of what it gave away, so it must drop what the successor delivered,
+        // or restoring it would deliver that again. Only while the row is still stamped: a re-driven give-back finds the
+        // stamp cleared, and what it returned the first time is owed, not delivered. Any stamp is this take's: while the
+        // card points at the successor, the carrier is not the card's session, so no other start can take it and stamp it.
+        // A row that kept no copy (every other source) holds none of these ids, so this changes nothing there.
+        if !delivered.is_empty() && source_still_stamped_tx(tx, &entry.worker_session_id).await? {
+            if successor.is_none() {
+                // No readable successor snapshot reads as "holds nothing", so every journalled message counts as delivered.
+                tracing::warn!(
+                    card_id,
+                    worker_session_id,
+                    source_session = %entry.worker_session_id,
+                    dropped = delivered.len(),
+                    "planner harness give-back: the failed start's session has no readable snapshot; \
+                     the carrier drops the journalled messages it gave away"
+                );
+            }
+            let delivered_ids: std::collections::HashSet<String> = delivered
+                .iter()
+                .flat_map(|m| m.ids.iter().cloned())
+                .collect();
+            // A fold can hold a delivered id next to an owed one; the entry stays while any id is owed.
+            source_entries.retain_mut(|queued| {
+                !(queued.remove_message_ids(&delivered_ids) && queued.is_user_authored())
+            });
+        }
+        // Idempotent against the SOURCE row too: a retired runtime can re-buffer a batch onto its own row after the harvest took it, and pushing it again would deliver the instance twice.
+        let already_on_source: std::collections::HashSet<String> = source_entries
+            .iter()
+            .flat_map(|entry| entry.message_ids().iter().cloned())
+            .collect();
+        for message in &returning {
+            if message
+                .ids
+                .iter()
+                .any(|id| already_on_source.contains(id.as_str()))
+            {
+                // Already back where it belongs; still counts as returned, so it is pruned from the failing runtime below.
+                returned_any_ids.extend(message.ids.iter().cloned());
+                continue;
+            }
+            // The entry goes back under the id it left with, so a give-back returns the same addressable instance rather than a renamed copy.
+            source_entries.push(QueueEntry::user_message_moved(
+                message.text.clone(),
+                message.ids.clone(),
+                message.entry_id.clone().map(QueueEntryId::from_wire),
+            ));
+            returned_any_ids.extend(message.ids.iter().cloned());
+        }
+        source.set_pending_entries(source_entries);
+        session_set_handle_state_of_any_runtime_tx(
+            tx,
+            &entry.worker_session_id,
+            Some(serde_json::to_value(&source)?),
+            now,
+        )
         .await
         .map_err(CalmError::from)?;
-    if let Some(state) = successor_state
-        && is_harness_snapshot_value(&state)
+        // A row this operation stamped and returned nothing to keeps its stamp: its queue is somewhere else, legitimately.
+        if returning.is_empty() {
+            continue;
+        }
+        tracing::info!(
+            worker_session_id = %worker_session_id,
+            returned_to = %entry.worker_session_id,
+            returned = returning.len(),
+            "planner harness: a failed mint returned undelivered user messages"
+        );
+        session_clear_queue_harvested_tx(tx, &entry.worker_session_id)
+            .await
+            .map_err(CalmError::from)?;
+    }
+    if let Some(mut successor) = successor
+        && !returned_any_ids.is_empty()
     {
-        let mut successor = HarnessSnapshot::from_value_strict(state);
-        let successor_entries = successor.pending_entries();
-        let held: std::collections::HashSet<&str> = successor_entries
-            .iter()
-            .flat_map(|entry| entry.message_ids().iter().map(String::as_str))
-            .collect();
-        let mut returned_any_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for entry in journal {
-            let returning: Vec<&HarvestedMessage> = entry
-                .messages
-                .iter()
-                .filter(|m| m.ids.iter().any(|id| held.contains(id.as_str())))
-                .collect();
-            if returning.is_empty() {
+        // SUBTRACT the returned ids; do not delete the entry: `try_fold_tail` can fold a returned id next to a never-harvested one, and the folded text cannot be split.
+        let mut kept = Vec::new();
+        for mut entry in successor_entries {
+            // Two different things make an entry hold no ids, and only one of them means "returned".
+            let emptied_by_the_return = entry.remove_message_ids(&returned_any_ids);
+            if emptied_by_the_return && entry.is_user_authored() {
                 continue;
             }
-            let Some(source_state) = session_handle_state_by_id_tx(tx, &entry.worker_session_id)
-                .await
-                .map_err(CalmError::from)?
-            else {
-                continue;
-            };
-            if !is_harness_snapshot_value(&source_state) {
-                continue;
-            }
-            let mut source = HarnessSnapshot::from_value_strict(source_state);
-            // Idempotent against the SOURCE row too: a retired runtime can re-buffer a batch onto its own row after the harvest took it, and pushing it again would deliver the instance twice.
-            let mut source_entries = source.pending_entries();
-            let already_on_source: std::collections::HashSet<String> = source_entries
-                .iter()
-                .flat_map(|entry| entry.message_ids().iter().cloned())
-                .collect();
-            for message in &returning {
-                if message
-                    .ids
-                    .iter()
-                    .any(|id| already_on_source.contains(id.as_str()))
-                {
-                    // Already back where it belongs; still counts as returned, so it is pruned from the failing runtime below.
-                    returned_any_ids.extend(message.ids.iter().cloned());
-                    continue;
-                }
-                // The entry goes back under the id it left with, so a give-back returns the same addressable instance rather than a renamed copy.
-                source_entries.push(QueueEntry::user_message_moved(
-                    message.text.clone(),
-                    message.ids.clone(),
-                    message.entry_id.clone().map(QueueEntryId::from_wire),
-                ));
-                returned_any_ids.extend(message.ids.iter().cloned());
-            }
-            source.set_pending_entries(source_entries);
-            session_set_handle_state_of_any_runtime_tx(
-                tx,
-                &entry.worker_session_id,
-                Some(serde_json::to_value(&source)?),
-                now,
-            )
-            .await
-            .map_err(CalmError::from)?;
-            // A row this operation stamped and returned nothing to keeps its stamp: its queue is somewhere else, legitimately.
-            tracing::info!(
-                worker_session_id = %worker_session_id,
-                returned_to = %entry.worker_session_id,
-                returned = returning.len(),
-                "planner harness: a failed mint returned undelivered user messages"
-            );
-            session_clear_queue_harvested_tx(tx, &entry.worker_session_id)
-                .await
-                .map_err(CalmError::from)?;
+            kept.push(entry);
         }
-        if !returned_any_ids.is_empty() {
-            // SUBTRACT the returned ids; do not delete the entry: `try_fold_tail` can fold a returned id next to a never-harvested one, and the folded text cannot be split.
-            let mut kept = Vec::new();
-            for mut entry in successor_entries {
-                // Two different things make an entry hold no ids, and only one of them means "returned".
-                let emptied_by_the_return = entry.remove_message_ids(&returned_any_ids);
-                if emptied_by_the_return && entry.is_user_authored() {
-                    continue;
-                }
-                kept.push(entry);
-            }
-            successor.set_pending_entries(kept);
-            session_set_handle_state_of_any_runtime_tx(
-                tx,
-                worker_session_id,
-                Some(serde_json::to_value(&successor)?),
-                now,
-            )
-            .await
-            .map_err(CalmError::from)?;
-        }
+        successor.set_pending_entries(kept);
+        session_set_handle_state_of_any_runtime_tx(
+            tx,
+            worker_session_id,
+            Some(serde_json::to_value(&successor)?),
+            now,
+        )
+        .await
+        .map_err(CalmError::from)?;
     }
     session_fail_if_active_runtime_tx(tx, &worker_session_id.to_string())
         .await
         .map_err(CalmError::from)
+}
+
+/// Whether a give-back source still carries the harvest stamp of the take being undone.
+async fn source_still_stamped_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    worker_session_id: &str,
+) -> Result<bool> {
+    let stamp: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT queue_harvested_at_ms FROM worker_sessions WHERE id = ?1")
+            .bind(worker_session_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(stamp.flatten().is_some())
 }
 
 /// The undo journal, as JSON for `operations.tx_output_json`.
@@ -2192,6 +2281,17 @@ async fn restore_old_runtime_after_spawn_failure(
     old_worker_session_id: String,
     status: WorkerSessionState,
 ) -> Result<()> {
+    // A failed carrier (#2192) goes back to being the card's session, still `failed`.
+    if status == WorkerSessionState::Failed {
+        return write_in_tx_typed(repo, move |tx| {
+            Box::pin(async move {
+                session_restore_failed_carrier_runtime_tx(tx, &old_worker_session_id)
+                    .await
+                    .map_err(CalmError::from)
+            })
+        })
+        .await;
+    }
     active_run_status_to_db(&status)?;
     write_in_tx_typed(repo, move |tx| {
         Box::pin(async move {
