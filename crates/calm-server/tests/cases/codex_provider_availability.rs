@@ -139,3 +139,270 @@ async fn an_undecodable_account_read_is_unavailable_never_a_guess() {
         "{codex}"
     );
 }
+
+/// An account is still present after its refresh credential stops working (#2314).
+#[tokio::test]
+async fn a_refresh_token_reuse_refusal_overrides_cached_account_presence() {
+    let boot = boot(true, |sock| {
+        std::fs::write(
+            sock.with_extension("account-read"),
+            json!({
+                "account": {"type":"chatgpt"}, "requiresOpenaiAuth":true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            sock.with_extension("turn-start-refusal"),
+            "Your access token could not be refreshed because your refresh token was already used. \
+             Sign in again. fixture-private-value",
+        )
+        .unwrap();
+    })
+    .await;
+    assert_eq!(codex_entry(&boot).await["status"], "ready");
+    let failure = boot
+        .state
+        .shared_codex_appserver
+        .turn_start(
+            "auth-regression-thread",
+            vec![calm_server::codex_appserver::InputItem::text(
+                "auth regression",
+            )],
+            &calm_server::planner_model::TurnModelSelection::inherit(),
+            None,
+        )
+        .await;
+    assert!(
+        failure.is_err(),
+        "positive control: the native provider refused the request"
+    );
+    assert!(
+        boot.methods_seen()
+            .iter()
+            .any(|method| method == "turn/start")
+    );
+    let status = codex_entry(&boot).await;
+    assert_eq!(
+        status["status"], "unavailable",
+        "cached account presence must not hide a known authentication failure"
+    );
+    let reason = status["reason"].as_str().expect("an actionable reason");
+    assert!(reason.to_lowercase().contains("sign in"), "{reason}");
+    assert!(
+        !reason.contains("fixture-private-value"),
+        "native sensitive detail must not reach the owner"
+    );
+    assert_eq!(
+        boot.methods_seen()
+            .iter()
+            .filter(|method| method.as_str() == "turn/start")
+            .count(),
+        1,
+        "status reads do not replay model work"
+    );
+}
+
+#[tokio::test]
+async fn authentication_failure_survives_recheck_and_clears_only_on_confirmed_login() {
+    let boot =
+        boot_with_account(json!({"account":{"type":"chatgpt"},"requiresOpenaiAuth":true})).await;
+    assert_eq!(codex_entry(&boot).await["status"], "ready");
+    let daemon = &boot.state.shared_codex_appserver;
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method:"error".into(), params:json!({"error":{"message":"Your access token could not be refreshed because your refresh token has expired. private-fixture-detail"}}),
+    });
+    assert_eq!(codex_entry(&boot).await["status"], "unavailable");
+    for params in [
+        json!({"success":false,"error":"failed"}),
+        json!({"success":true}),
+        json!({"success":"true","error":null}),
+    ] {
+        daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+            method: "account/login/completed".into(),
+            params,
+        });
+        assert_eq!(codex_entry(&boot).await["status"], "unavailable");
+    }
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method: "account/updated".into(),
+        params: json!({"authMode":"chatgpt"}),
+    });
+    let request = Request::builder()
+        .uri("/api/agent-providers?refresh=true")
+        .header("x-calm-actor", "user")
+        .body(Body::empty())
+        .unwrap();
+    let response = boot.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let codex = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["provider"] == "codex")
+        .unwrap();
+    assert_eq!(
+        codex["status"], "unavailable",
+        "account presence and ordinary rechecks are not repair proof"
+    );
+    assert!(
+        !codex["reason"]
+            .as_str()
+            .unwrap()
+            .contains("private-fixture-detail")
+    );
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method: "account/login/completed".into(),
+        params: json!({"loginId":"fixture-login","success":true,"error":null}),
+    });
+    assert_eq!(codex_entry(&boot).await["status"], "ready");
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::TurnStarted {
+        thread_id: "fixture-thread".into(),
+        turn: json!({"id":"fixture-turn"}),
+    });
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::TurnCompleted {
+        thread_id:"fixture-thread".into(),turn:json!({"id":"fixture-turn","status":"failed","error":{"message":"Your access token could not be refreshed because your refresh token was revoked."}}),
+    });
+    assert_eq!(
+        codex_entry(&boot).await["status"],
+        "unavailable",
+        "a later episode must remain visible"
+    );
+}
+
+#[tokio::test]
+async fn authentication_refusal_explains_sign_in_instead_of_changing_the_model() {
+    let boot = boot(true, |sock| {
+        std::fs::write(
+            sock.with_extension("turn-start-refusal"),
+            "Your access token could not be refreshed because your refresh token was revoked. private-fixture-detail",
+        )
+        .unwrap();
+    })
+    .await;
+    let backend: calm_server::harness::backend::PlannerBackend =
+        boot.state.shared_codex_appserver.clone().into();
+    let failure = backend
+        .turn_start(
+            "auth-reader-thread",
+            vec![calm_server::codex_appserver::InputItem::text(
+                "auth regression",
+            )],
+            &calm_server::planner_model::TurnModelSelection::inherit(),
+            "fixture-client-id",
+            None,
+        )
+        .await
+        .expect_err("a native authentication refusal");
+    let calm_server::harness::backend::TurnStartFailure::Refused { error, reader } = failure else {
+        panic!("a definitive authentication refusal must not be transient");
+    };
+    assert!(reader.to_lowercase().contains("sign in"));
+    assert!(!reader.contains("try another") && !reader.contains("private-fixture-detail"));
+    assert!(reader.contains("Your message is still queued"));
+    assert!(!error.to_string().contains("private-fixture-detail"));
+}
+
+#[tokio::test]
+async fn a_pre_login_rpc_refusal_cannot_overwrite_a_verified_login() {
+    let wait_path = std::sync::Mutex::new(None);
+    let boot = boot(true, |sock| {
+        let path = sock.with_extension("turn-start-refusal-wait");
+        std::fs::write(&path, "wait").unwrap();
+        *wait_path.lock().unwrap() = Some(path);
+        std::fs::write(
+            sock.with_extension("turn-start-refusal"),
+            "Your access token could not be refreshed because your refresh token was already used.",
+        )
+        .unwrap();
+    })
+    .await;
+    let daemon = boot.state.shared_codex_appserver.clone();
+    let request = tokio::spawn(async move {
+        daemon
+            .turn_start(
+                "old-auth-request",
+                vec![calm_server::codex_appserver::InputItem::text("auth")],
+                &calm_server::planner_model::TurnModelSelection::inherit(),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !boot
+            .methods_seen()
+            .iter()
+            .any(|method| method == "turn/start")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the old request reached the native transport");
+    boot.state
+        .shared_codex_appserver
+        .emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+            method: "account/login/completed".into(),
+            params: json!({"success":true,"error":null}),
+        });
+    std::fs::remove_file(wait_path.lock().unwrap().take().unwrap()).unwrap();
+    assert!(request.await.unwrap().is_err());
+    assert_eq!(
+        codex_entry(&boot).await["status"],
+        "ready",
+        "an old failure cannot replace newer login proof"
+    );
+}
+
+#[tokio::test]
+async fn cached_authentication_warning_keeps_its_check_timestamp() {
+    let boot =
+        boot_with_account(json!({"account":{"type":"chatgpt"},"requiresOpenaiAuth":true})).await;
+    boot.state.shared_codex_appserver.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method:"error".into(),params:json!({"error":{"message":"Your access token could not be refreshed because your refresh token has expired."}}),
+    });
+    let first = codex_entry(&boot).await;
+    let methods = boot.methods_seen();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let second = codex_entry(&boot).await;
+    assert_eq!(first["status"], "unavailable");
+    assert_eq!(first["checked_at_ms"], second["checked_at_ms"]);
+    assert_eq!(methods, boot.methods_seen());
+}
+
+#[tokio::test]
+async fn a_pre_login_turn_error_cannot_overwrite_a_verified_login() {
+    let boot =
+        boot_with_account(json!({"account":{"type":"chatgpt"},"requiresOpenaiAuth":true})).await;
+    let daemon = &boot.state.shared_codex_appserver;
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::TurnStarted {
+        thread_id: "old-thread".into(),
+        turn: json!({"id":"old-turn"}),
+    });
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method: "account/login/completed".into(),
+        params: json!({"success":true,"error":null}),
+    });
+    let error = json!({"message":"Your access token could not be refreshed because your refresh token was already used."});
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method: "error".into(),
+        params: json!({"threadId":"old-thread","turnId":"old-turn","error":error}),
+    });
+    assert_eq!(codex_entry(&boot).await["status"], "ready");
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::TurnCompleted {
+        thread_id: "old-thread".into(),
+        turn: json!({"id":"old-turn","status":"failed","error":error}),
+    });
+    assert_eq!(codex_entry(&boot).await["status"], "ready");
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::TurnStarted {
+        thread_id: "old-thread".into(),
+        turn: json!({"id":"new-turn"}),
+    });
+    daemon.emit_notification_for_test(calm_server::codex_appserver::Notification::Other {
+        method: "error".into(),
+        params: json!({"threadId":"old-thread","turnId":"new-turn","error":error}),
+    });
+    assert_eq!(codex_entry(&boot).await["status"], "unavailable");
+}
