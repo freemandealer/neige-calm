@@ -117,9 +117,16 @@ export type ConversationEdit = Readonly<{
 /**
  * How this conversation's last Edit or send ended, shown above its composer until its next Edit or send: a newer turn
  * arrived first, or the server refused the send (`edit`: the replace of a turn, which is untouched); a refused send's
- * words are back in the composer (#2068).
+ * words are back in the composer (#2068). `dormant`: refused because the session cannot be resumed, so a fresh session
+ * is offered; `restarted`: that fresh session started (#2192).
  */
-export type EditNotice = Readonly<{ kind: 'stale' } | { kind: 'refused'; message: string; edit: boolean }>;
+export type EditNotice = Readonly<
+  | { kind: 'stale' } | { kind: 'refused'; message: string; edit: boolean } | { kind: 'dormant'; edit: boolean }
+  | { kind: 'restarted' }
+>;
+
+/** A refused send's notice, by the class its failure was read as. */
+export type RefusedSendNotice = Extract<EditNotice, { kind: 'refused' | 'dormant' }>;
 
 export type RememberedConversation = Readonly<{
   conversation: Conversation;
@@ -188,7 +195,9 @@ export type ConversationRegistry = Readonly<{
   /** The edited turn is no longer the latest: edit mode ends and the composer keeps what it holds. */
   leaveEdit: (conversationId: string, outcomeId: string) => void;
   /** The server refused a send (`edit`: an Edit's replace), changing nothing: say why above that conversation's composer. */
-  noteRefusedSend: (conversationId: string, message: string, edit: boolean) => void;
+  noteRefusedSend: (conversationId: string, notice: RefusedSendNotice) => void;
+  /** A fresh session started for that conversation (#2192): its notice replaces whatever the strip said. */
+  noteRestarted: (conversationId: string) => void;
   editNoticeOf: (conversationId: string) => EditNotice | null;
   /** One card's image uploads, held here so a remount or another route sees an upload still in flight. */
   uploadOf: (cardId: string) => UploadState;
@@ -198,6 +207,12 @@ export type ConversationRegistry = Readonly<{
   queueWriteOutOf: (cardId: string) => boolean;
   /** Run one write to that card's queued entries, counted as out until it settles. */
   holdQueueWrite: <T>(cardId: string, write: () => Promise<T>) => Promise<T>;
+  /** Whether a restart of one card's session is unanswered, held here so a remount or another route sees it still out
+   * (#2192). */
+  restartOutOf: (cardId: string) => boolean;
+  /** Run one restart of that card's session, or `null` while one is out: each restart replaces the session the one
+   * before it started. */
+  holdRestart: (cardId: string, restart: () => Promise<void>) => Promise<void> | null;
   /* Deliberately no "open the planner conversation of track W" slot: the track being left is still
        mounted when a create states it, so that intent travels in the history entry instead. */
 }>;
@@ -351,6 +366,17 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     })();
   }, []);
   const queueWriteOutOf = useCallback((cardId: string) => cardId in queueWrites, [queueWrites]);
+  const restartsRef = useRef<ReadonlySet<string>>(new Set());
+  const [restarts, setRestarts] = useState(restartsRef.current);
+  const holdRestart = useCallback((cardId: string, restart: () => Promise<void>): Promise<void> | null => {
+    if (restartsRef.current.has(cardId)) return null;
+    const write = (next: ReadonlySet<string>) => { restartsRef.current = next; setRestarts(next); };
+    write(new Set([...restartsRef.current, cardId]));
+    return Promise.resolve().then(restart).finally(() => {
+      write(new Set([...restartsRef.current].filter((out) => out !== cardId)));
+    });
+  }, []);
+  const restartOutOf = useCallback((cardId: string) => restarts.has(cardId), [restarts]);
   const noteEdit = useCallback((conversationId: string, notice: EditNotice) => {
     setEditNotices((current) => ({ ...current, [conversationId]: notice }));
   }, []);
@@ -379,8 +405,11 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     writeEdit(conversationId, null);
     noteEdit(conversationId, { kind: 'stale' });
   }, [noteEdit, writeEdit]);
-  const noteRefusedSend = useCallback((conversationId: string, message: string, edit: boolean) => {
-    noteEdit(conversationId, { kind: 'refused', message, edit });
+  const noteRefusedSend = useCallback((conversationId: string, notice: RefusedSendNotice) => {
+    noteEdit(conversationId, notice);
+  }, [noteEdit]);
+  const noteRestarted = useCallback((conversationId: string) => {
+    noteEdit(conversationId, { kind: 'restarted' });
   }, [noteEdit]);
   const editOf = useCallback((conversationId: string) => edits[conversationId] ?? null, [edits]);
   const editNoticeOf = useCallback((conversationId: string) => editNotices[conversationId] ?? null, [editNotices]);
@@ -453,11 +482,11 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       adoptedDraftIdOf, finishDraftAdoption,
       outboxOf, beginSend, editOutbox, retireSends, spentRowsOf, nextRead,
       composerOf, editComposer, refillComposer, newConversationComposerOf, editNewConversationComposer,
-      editOf, beginEdit, cancelEdit, leaveEdit, noteRefusedSend, editNoticeOf, uploadOf, editUpload,
-      queueWriteOutOf, holdQueueWrite,
+      editOf, beginEdit, cancelEdit, leaveEdit, noteRefusedSend, noteRestarted, editNoticeOf, uploadOf, editUpload,
+      queueWriteOutOf, holdQueueWrite, restartOutOf, holdRestart,
     }),
     [adoptDraft, adoptedDraftIdOf, clearOpenRequest, conversations, discardDraft,
-      composerOf, discardUnsentDraft, draftOf, editComposer, refillComposer, queueWriteOutOf, holdQueueWrite, editDraft, editNewConversationComposer, newConversationComposerOf, editUpload, finishDraftAdoption, editOf, beginEdit, cancelEdit, leaveEdit, noteRefusedSend, editNoticeOf, uploadOf, outboxOf, beginSend, editOutbox, retireSends, spentRowsOf, nextRead,
+      composerOf, discardUnsentDraft, draftOf, editComposer, refillComposer, queueWriteOutOf, holdQueueWrite, restartOutOf, holdRestart, editDraft, editNewConversationComposer, newConversationComposerOf, editUpload, finishDraftAdoption, editOf, beginEdit, cancelEdit, leaveEdit, noteRefusedSend, noteRestarted, editNoticeOf, uploadOf, outboxOf, beginSend, editOutbox, retireSends, spentRowsOf, nextRead,
       remember, requestOpen,
       requestedOpenFocusesComposer, requestedOpenId, startDraft, turnsOf,
       updateExisting],

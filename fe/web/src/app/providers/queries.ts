@@ -64,6 +64,7 @@ import {
   type PlannerQueueWriteOutcome,
 } from '../../../../core/domain/conversation.ts';
 import { harnessLiveOperation } from '../../../../core/domain/conversation-live.ts';
+import { restartPlannerOperation } from '../../../../core/domain/conversation-restart.ts';
 import {
   ApiError, classifyFailure, DELETE_FAILURES, DELETE_TEXT, refusalText, writeFailureOf, writeFailureText,
 } from '../../../../core/domain/failure-class.ts';
@@ -230,7 +231,7 @@ export function usePlannerMutations(transport: ApiTransportPort, cardId: string,
   /* As `refreshAfter`, but each read is cancelled first: the query layer would otherwise hand back a read still in
      flight from before the answer, and only a read started after it can stand for a send answered after an unknown attempt. */
   const refreshAfterSend = <T,>(result: T): T => {
-    for (const queryKey of [transcriptKey, queryKeys.plannerRun(cardId)]) cancelThenInvalidate(client, queryKey);
+    for (const queryKey of [transcriptKey, queryKeys.plannerRun(cardId)]) void cancelThenInvalidate(client, queryKey);
     return result;
   };
   return {
@@ -245,6 +246,17 @@ export function usePlannerMutations(transport: ApiTransportPort, cardId: string,
       .then((admitted) => runOperation(admitted, compactPlannerOperation(cardId), unauthorized)).then(refreshAfter),
     interrupt: () => Promise.resolve().then(() => admitTransport(transport))
       .then((admitted) => runOperation(admitted, interruptPlannerOperation(cardId), unauthorized)).then(refreshAfter),
+    /* Settles once the run read started after the answer has landed, so what follows reads the new session, not the
+       wedge it replaced (#2192). A failure refreshes too: one whose outcome is unknown may have started a session. */
+    restart: () => {
+      const reread = () => {
+        void refreshTranscript().catch(() => undefined);
+        return cancelThenInvalidate(client, queryKeys.plannerRun(cardId));
+      };
+      return Promise.resolve().then(() => admitTransport(transport))
+        .then((admitted) => runOperation(admitted, restartPlannerOperation(cardId), unauthorized))
+        .then(async (restarted) => { await reread(); return restarted; }, async (error: unknown) => { await reread(); throw error; });
+    },
     /* Resolves rather than rejects on a refusal: a lost compare-and-swap and a drained entry are answers
      * the reader has to be shown. The refresh runs on every path — a 409 proves the cached page is behind. */
     deleteQueued: (entryId: string, ifEntryRev: number): Promise<PlannerQueueWriteOutcome> =>
@@ -847,7 +859,7 @@ export function useTrackMutations(transport: ApiTransportPort, unauthorized: Una
     // Reconcile both list-derived surfaces even if abort raced a committed DELETE.
     onSettled: (_result, _error, variables) => {
       void client.invalidateQueries({ queryKey: queryKeys.tracksInArea(variables.areaId) });
-      cancelThenInvalidate(client, queryKeys.overlaysByKind('track'));
+      void cancelThenInvalidate(client, queryKeys.overlaysByKind('track'));
     },
   });
   /* The card creates answer with the row the kernel just wrote and the next render needs it: the caller
@@ -892,7 +904,7 @@ export function useTrackMutations(transport: ApiTransportPort, unauthorized: Una
     onError: (error, variables) => { if (deleteDone(error)) dropCard(undefined, variables); },
     onSettled: (_result, _error, { trackId }) => {
       void client.invalidateQueries({ queryKey: queryKeys.trackDetail(trackId) });
-      cancelThenInvalidate(client, queryKeys.overlaysByKind('track'));
+      void cancelThenInvalidate(client, queryKeys.overlaysByKind('track'));
     },
   });
   /* No cache write and no invalidation: the projector's `overlay.set` is what drops the row, and a
