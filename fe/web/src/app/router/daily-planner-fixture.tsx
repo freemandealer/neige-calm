@@ -42,6 +42,7 @@ export function renderDailyFixture({ initial = '/', failChanges = false, reply }
     if (request.path.startsWith('/api/today/report-edits')) return ok({ next_cursor: null, edits: [{ event_id: 42, at: Date.parse('2026-10-03T01:00:00Z'), edit: { track_id: project.id, edit_id: 'edit-42', summary_before: 'In progress', summary_after: 'Ready', body_before: '# Before release\n\nBuilding', body_after: '# After release\n\nRelease is ready.' } }] });
     if (request.path.endsWith('/planner/run')) return ok({ card_id: card.id, worker_session_id: 'runtime', phase: 'idle', model: null, reasoning_effort: null, blocked_reason: null, pending_queue: [], running_turn: null, final_reply: null });
     if (request.path.includes('/harness/items')) return ok([]);
+    if (request.path === '/api/plugins') return ok([{ id: 'calendar', version: '0.1.0', enabled: true, state: 'running', manifest_name: 'Calendar', has_config: false, can_uninstall: false, can_disable: false }]);
     if (request.path === '/api/settings') return ok({});
     return ok([]);
   } };
@@ -49,6 +50,9 @@ export function renderDailyFixture({ initial = '/', failChanges = false, reply }
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const router = createAppRouter({ transport, unauthorized, client, cards: bootTestCardRuntime(), onSignOut: () => undefined });
   router.update({ history: createMemoryHistory({ initialEntries: [initial] }) });
-  render(<QueryClientProvider client={client}><ThemeProvider storage={{ getItem: () => null, setItem: () => undefined }}><RouterProvider router={router} /></ThemeProvider></QueryClientProvider>);
+  const container = document.createElement('div');
+  container.id = 'root';
+  document.body.appendChild(container);
+  render(<QueryClientProvider client={client}><ThemeProvider storage={{ getItem: () => null, setItem: () => undefined }}><RouterProvider router={router} /></ThemeProvider></QueryClientProvider>, { container });
   return { router, requests, client };
 }

@@ -610,6 +610,14 @@
     overflow: auto;
   }
 
+  .leadingContent {
+    flex: 0 0 auto;
+    min-inline-size: 0;
+    max-inline-size: var(--document-measure);
+    margin-inline-start: var(--document-start);
+    margin-block-end: var(--space-8);
+  }
+
   /* Uppercase plus tracking standing in for a size the panel cannot spend. */
   .sectionLabel {
     margin-block-start: var(--space-8);
