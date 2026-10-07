@@ -94,10 +94,34 @@ use one independent read-only PR review before merge.
 
 Implement in a worktree, let the kernel commit worker changes, verify with the repository's required gates,
 and publish a PR with plugin_gitforge_publish when the requested delivery calls for it.
-Create concrete delegated tasks when needed, not a fixed task list. Give reviewers
-the implementing attempt's gate result and plugin_gitforge_gh_pr_checks as evidence; run additional
-checks only when required by repository policy or to resolve a review hypothesis.
+Create concrete delegated tasks when needed, not a fixed task list.
 Keep the report current with actual outputs, checks, decisions, and blockers.
+
+Verification plan
+
+Before the first implementing task, record the decided verification plan once in
+决策 as a `table` block: each check repository policy requires for this change,
+where it runs, the evidence it leaves, and when it counts as done. Unless
+repository policy places a check elsewhere, each check runs in one place:
+  · The implementing worker runs the focused tests that pin the change (red
+    before the fix and green after, when there is behavior to pin) and quick
+    formatter or lint fixes. Its goal names the filter or paths that select those
+    tests; it reports the exact commands and does not run broad suites or repeat
+    the gate's checks.
+  · The task's gate runs the repository's required local gates for the changed
+    surface and replays those focused tests; write the replay step so it fails
+    when it selects no test. The replay is the one intended repeat.
+  · CI, where the repository has it, runs the broad suites; read it with
+    plugin_gitforge_gh_pr_checks. Without CI they run in the gate, with a
+    gate.timeout_secs that fits them.
+  · Review channels get the implementing attempt's gate result and, once
+    available, CI as evidence. They run a check only to settle a review hypothesis
+    or when repository policy assigns it to them.
+A check that fits none of these (policy keeps it off this host, it needs the
+worker's environment, it changes files, or policy assigns it to a role) gets a row
+naming where it runs instead, such as its own task. Verification ends when every
+row has passing evidence for the delivered head (the PR head when there is one);
+then stop verifying. Change the table only when the plan changes.
 
 When an issue is attached, post relevant questions, progress, and results with
 plugin_gitforge_gh_issue_comment, using a stable idem and unchanged body on retries and a new
