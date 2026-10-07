@@ -5,17 +5,23 @@ import { z } from 'zod';
 import { agentProviderSchema, type AgentProvider } from '../api/schemas.js';
 import type { ApiOperation } from '../api/types.js';
 import type { ProbeText } from './read-failure.js';
+import { NotSentError, writeClassOf, writeFailureOf, type FailureTable, type WriteClass, type WriteText } from './failure-class.js';
 
 const checkedAtSchema = z.number();
+const authenticationNoticeSchema = z.object({
+  kind: z.enum(['sign_in_required', 'refresh_error_reported', 'state_unavailable', 'retry_requested']),
+  text: z.string(),
+  revision: z.string(),
+}).nullable();
 
 /**
  * One provider's answer. `reason` is the server's own sentence with its fix, present exactly when the
  * provider is not `ready`; `not_configured` is a backend this server was not started with.
  */
 export const providerAvailabilitySchema = z.discriminatedUnion('status', [
-  z.object({ provider: agentProviderSchema, status: z.literal('ready'), reason: z.null(), checked_at_ms: checkedAtSchema }),
-  z.object({ provider: agentProviderSchema, status: z.literal('unavailable'), reason: z.string(), checked_at_ms: checkedAtSchema }),
-  z.object({ provider: agentProviderSchema, status: z.literal('not_configured'), reason: z.string(), checked_at_ms: checkedAtSchema }),
+  z.object({ provider: agentProviderSchema, status: z.literal('ready'), reason: z.null(), checked_at_ms: checkedAtSchema, authentication_notice: authenticationNoticeSchema }),
+  z.object({ provider: agentProviderSchema, status: z.literal('unavailable'), reason: z.string(), checked_at_ms: checkedAtSchema, authentication_notice: authenticationNoticeSchema }),
+  z.object({ provider: agentProviderSchema, status: z.literal('not_configured'), reason: z.string(), checked_at_ms: checkedAtSchema, authentication_notice: authenticationNoticeSchema }),
 ]);
 
 export type ProviderAvailability = z.infer<typeof providerAvailabilitySchema>;
@@ -57,4 +63,31 @@ export function availabilityOf(
   provider: AgentProvider,
 ): ProviderAvailability | null {
   return answers?.find((answer) => answer.provider === provider) ?? null;
+}
+
+export const authenticationRetryResponseSchema = z.object({
+  status: z.literal('retry_requested'),
+  requested_revision: z.string(),
+  recovery_notices: z.array(z.object({ card_id: z.string(), track_id: z.string(), title: z.string(), text: z.string() })),
+});
+export type AuthenticationRetryResponse = z.infer<typeof authenticationRetryResponseSchema>;
+/** Owner authorizes the original queued messages to retry after server-side sign-in. */
+export function codexAuthenticationRetryOperation(revision: string): ApiOperation<AuthenticationRetryResponse> {
+  return { method: 'POST', path: '/api/agent-providers/codex/retry',
+    body: { expected_revision: revision }, responseSchema: authenticationRetryResponseSchema };
+}
+
+/** Definite refusals precede the durable rearm. A 503 may follow its commit, so it is unknown. */
+export const AUTHENTICATION_RETRY_FAILURES: FailureTable<WriteClass> = Object.freeze({
+  rules: Object.freeze([Object.freeze({ status: Object.freeze([400, 403, 409]), is: 'refused' as const })]),
+  unauthorized: 'refused', otherwise: 'unknown',
+});
+export const AUTHENTICATION_RETRY_TEXT: WriteText = Object.freeze({
+  refused: 'The retry was not allowed. Read the current provider status before trying again.',
+  unknown: 'The retry could not be confirmed. Read the current provider status before trying again.',
+});
+export function authenticationRetryFailureText(error: unknown): string {
+  if (writeFailureOf(error) instanceof NotSentError) return 'Not sent. Reconnect before retrying queued messages.';
+  return writeClassOf(error, AUTHENTICATION_RETRY_FAILURES) === 'refused'
+    ? AUTHENTICATION_RETRY_TEXT.refused : AUTHENTICATION_RETRY_TEXT.unknown;
 }
