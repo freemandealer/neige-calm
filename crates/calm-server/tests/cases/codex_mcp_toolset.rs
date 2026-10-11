@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,17 +17,21 @@ use std::time::Duration;
 use calm_server::codex_mcp_toolset::{CodexMcpToolset, DEBOUNCE};
 use calm_server::db::prelude::*;
 use calm_server::db::sqlite::SqlxRepo;
+use calm_server::error::CalmError;
 use calm_server::event::{BroadcastEnvelope, EventBus};
 use calm_server::mcp_server::{AppContext, McpServer, McpShimConfig, build_default_registry};
-use calm_server::plugin_host::{PluginHost, PluginRegistry};
+use calm_server::model::Plugin;
+use calm_server::plugin_host::lifecycle::LifecycleDb;
+use calm_server::plugin_host::{PluginHost, PluginListDb, PluginRegistry};
 use calm_server::shared_codex_appserver::{FakeMcpServerReload, SharedCodexAppServer};
 use calm_server::shared_codex_home::{EXPECTED_MCP_SERVERS, SharedCodexHome};
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::OnceCell;
 use tokio::sync::broadcast::Receiver;
+use tokio::sync::{Notify, OnceCell};
 use tokio::time::{Instant, sleep};
 
 const ECHO_BIN: &str = env!("CARGO_BIN_EXE_plugin-host-stub-echo");
@@ -43,11 +48,59 @@ struct Fx {
     appserver: Arc<SharedCodexAppServer>,
     /// The kernel MCP listener a Codex thread's shim reaches.
     server: Arc<McpServer>,
+    seams: Arc<Seams>,
     _tmp: TempDir,
 }
 
-/// An `app` plugin over the echo stub exposing `tools`.
-fn write_app(plugins_dir: &Path, id: &str, tools: &[&str]) {
+/// Test-held seams in the host's two row ports, pass-through by default: the enabled-bit write can
+/// pause right after it turns a bit on, and the plugin-row enumeration can fail.
+#[derive(Default)]
+struct Seams {
+    pause_after_enable: AtomicBool,
+    flipped: Notify,
+    release: Notify,
+    list_fails: AtomicBool,
+}
+
+struct SeamDb {
+    repo: Arc<dyn Repo>,
+    seams: Arc<Seams>,
+}
+
+#[async_trait::async_trait]
+impl LifecycleDb for SeamDb {
+    async fn enabled_row(&self, id: &str) -> Result<Option<bool>, CalmError> {
+        Ok(self.repo.plugin_get_by_id(id).await?.map(|row| row.enabled))
+    }
+    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), CalmError> {
+        self.repo.plugin_update_enabled(id, enabled).await?;
+        if enabled && self.seams.pause_after_enable.swap(false, Ordering::SeqCst) {
+            self.seams.flipped.notify_one();
+            self.seams.release.notified().await;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PluginListDb for SeamDb {
+    async fn plugins_list_all(&self) -> Result<Vec<Plugin>, CalmError> {
+        if self.seams.list_fails.load(Ordering::SeqCst) {
+            return Err(CalmError::Internal(
+                "injected plugin-row read failure".into(),
+            ));
+        }
+        Ok(self.repo.plugins_list_all().await?)
+    }
+}
+
+/// An `app` plugin over the echo stub exposing `tools`, each `(name, delegated)`.
+fn write_app(plugins_dir: &Path, id: &str, tools: &[(&str, bool)]) {
+    write_app_for(plugins_dir, id, tools, "0.0.1");
+}
+
+/// [`write_app`] requiring kernel `min_kernel`.
+fn write_app_for(plugins_dir: &Path, id: &str, tools: &[(&str, bool)], min_kernel: &str) {
     let dir = plugins_dir.join(id);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     let stub = dir.join("bin").join("stub");
@@ -56,13 +109,21 @@ fn write_app(plugins_dir: &Path, id: &str, tools: &[&str]) {
     }
     let exposes: Vec<Value> = tools
         .iter()
-        .map(|name| json!({ "name": name, "description": format!("{id} {name}") }))
+        .map(|(name, delegated)| {
+            let mut tool = json!({ "name": name, "description": format!("{id} {name}") });
+            if *delegated {
+                tool["approval"] = json!("delegated");
+                tool["annotations"] = json!({ "readOnlyHint": false, "openWorldHint": true });
+            }
+            tool
+        })
         .collect();
+    let delegates = tools.iter().any(|(_, delegated)| *delegated);
     let manifest = json!({
-        "manifest_version": 1,
+        "manifest_version": if delegates { 7 } else { 1 },
         "id": id,
         "version": "0.1.0",
-        "min_kernel_version": "0.0.1",
+        "min_kernel_version": min_kernel,
         "display_name": id,
         "entrypoint": { "command": "bin/stub" },
         "exposes_tools": exposes,
@@ -72,6 +133,24 @@ fn write_app(plugins_dir: &Path, id: &str, tools: &[&str]) {
 
 /// Installed, disabled plugins `(id, tools)`, and a shared home whose kernel entry boot wrote.
 async fn fixture(plugins: &[(&str, &[&str])]) -> Fx {
+    let plugins: Vec<(&str, Vec<(&str, bool)>)> = plugins
+        .iter()
+        .map(|(id, tools)| (*id, tools.iter().map(|tool| (*tool, false)).collect()))
+        .collect();
+    let plugins: Vec<(&str, &[(&str, bool)])> = plugins
+        .iter()
+        .map(|(id, tools)| (*id, tools.as_slice()))
+        .collect();
+    fixture_with(&plugins).await
+}
+
+/// [`fixture`] with tools `(name, delegated)`.
+async fn fixture_with(plugins: &[(&str, &[(&str, bool)])]) -> Fx {
+    fixture_requiring(plugins, &[]).await
+}
+
+/// [`fixture_with`] where the plugins named in `too_new` require a kernel newer than this one.
+async fn fixture_requiring(plugins: &[(&str, &[(&str, bool)])], too_new: &[&str]) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let plugins_dir = tmp.path().join("plugins");
     let data_dir = tmp.path().join("data");
@@ -79,7 +158,12 @@ async fn fixture(plugins: &[(&str, &[&str])]) -> Fx {
     std::fs::create_dir_all(&data_dir).unwrap();
     let repo: Arc<dyn Repo> = Arc::new(SqlxRepo::open("sqlite::memory:").await.unwrap());
     for (id, tools) in plugins {
-        write_app(&plugins_dir, id, tools);
+        let min_kernel = if too_new.contains(id) {
+            "999.0.0"
+        } else {
+            "0.0.1"
+        };
+        write_app_for(&plugins_dir, id, tools, min_kernel);
         repo.plugin_install(calm_server::model::NewPlugin {
             id: (*id).into(),
             version: "0.1.0".into(),
@@ -98,15 +182,24 @@ async fn fixture(plugins: &[(&str, &[&str])]) -> Fx {
         calm_server::card_role_cache::CardRoleCache::new(),
         calm_server::track_area_cache::TrackAreaCache::new(),
     );
-    let host = Arc::new(PluginHost::new_full(
-        Arc::new(plugin_registry),
-        repo.clone(),
-        plugins_dir.clone(),
-        data_dir.clone(),
-        Vec::new(),
-        events.clone(),
-        write.clone(),
-    ));
+    let seams = Arc::new(Seams::default());
+    let seam_db = Arc::new(SeamDb {
+        repo: repo.clone(),
+        seams: seams.clone(),
+    });
+    let host = Arc::new(
+        PluginHost::new_full(
+            Arc::new(plugin_registry),
+            repo.clone(),
+            plugins_dir.clone(),
+            data_dir.clone(),
+            Vec::new(),
+            events.clone(),
+            write.clone(),
+        )
+        .with_lifecycle_db(seam_db.clone())
+        .with_plugin_list_db(seam_db),
+    );
     let host_cell = Arc::new(OnceCell::new());
     host_cell.set(host.clone()).ok().unwrap();
     let ctx = AppContext::new(
@@ -144,6 +237,7 @@ async fn fixture(plugins: &[(&str, &[&str])]) -> Fx {
         home,
         appserver: SharedCodexAppServer::new_fake_running_with_pending(repo.clone(), None),
         server,
+        seams,
         _tmp: tmp,
     }
 }
@@ -160,6 +254,7 @@ impl Fx {
         CodexMcpToolset {
             home: self.home.clone(),
             appserver: appserver.clone(),
+            plugins: self.host.clone(),
             debounce: DEBOUNCE,
         }
         .start(followed);
@@ -185,6 +280,38 @@ impl Fx {
             .get("NEIGE_MCP_TOOLSET")?
             .as_str()
             .map(str::to_string)
+    }
+
+    /// The kernel entry's approval grants: its `tools` map, each checked to be exactly the
+    /// never-ask approval mode.
+    fn granted(&self) -> BTreeSet<String> {
+        let text = std::fs::read_to_string(self.config_path()).unwrap();
+        let config: toml::Value = toml::from_str(&text).unwrap();
+        let Some(tools) = config["mcp_servers"]["neige"].get("tools") else {
+            return BTreeSet::new();
+        };
+        let tools = tools.as_table().unwrap();
+        for (name, tool) in tools {
+            assert_eq!(
+                tool,
+                &toml::Value::Table(toml::toml! { approval_mode = "approve" }),
+                "{name}"
+            );
+        }
+        tools.keys().cloned().collect()
+    }
+
+    /// The kernel entry without the refresh's two fields: what nothing else may change.
+    fn entry_rest(&self) -> toml::Value {
+        let text = std::fs::read_to_string(self.config_path()).unwrap();
+        let mut config: toml::Value = toml::from_str(&text).unwrap();
+        let entry = config["mcp_servers"]["neige"].as_table_mut().unwrap();
+        entry.remove("tools");
+        entry["env"]
+            .as_table_mut()
+            .unwrap()
+            .remove("NEIGE_MCP_TOOLSET");
+        config
     }
 
     /// What a new Codex thread's shim lists now: a daemon-trust `tools/list` with no thread
@@ -474,3 +601,7 @@ async fn a_failed_generation_write_is_retried_at_the_next_plugin_change() {
     fx.wait_reloads(1).await;
     assert_eq!(fx.toolset().as_deref(), Some("1"));
 }
+
+/// #2530 E3c: the approval grants the same refresh writes.
+#[path = "codex_mcp_toolset_approval.rs"]
+mod approval;
