@@ -11,7 +11,7 @@ use super::worker_message::{
     wait_for_reads, written,
 };
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The Claude worker's `UserPromptSubmit` hook for its own session, through the production ingest
 /// route: what Claude posts once it submits the task prompt.
@@ -40,13 +40,20 @@ pub(crate) async fn agent_session(h: &Harness, worker: &Worker) -> String {
 
 fn not_started(attempt: &str) -> String {
     format!(
-        "attempt {attempt} is running, but its worker has not started its task yet; its agent may \
-         still be on a startup screen, which the worker watcher handles. Read its screen or wait, \
-         then send again"
+        "attempt {attempt} is running, but its worker has not started its task: its agent is \
+         likely held on a startup screen, which the worker watcher clears and reports to you. Send \
+         again after its report"
     )
 }
 
+/// A refusal is answered once the call waited for the worker's start: keep that wait short.
+fn short_start_wait(h: &Harness) {
+    h.interaction()
+        .set_message_start_wait(Duration::from_millis(300));
+}
+
 async fn assert_not_started(h: &Harness, f: &Fixture, key: &str) {
+    short_start_wait(h);
     let reply = message(h, json!({"attempt_id":f.worker.task}), key, "x").await;
     assert_refusal(
         &reply,
@@ -64,7 +71,12 @@ async fn post_hook(h: &Harness, worker: &Worker, body: Value) -> axum::http::Sta
 async fn message_to_claude_worker_before_prompt_submit_is_refused() {
     let h = Harness::start().await;
     let f = unstarted(&h, "claude", true, false).await;
+    let sent = Instant::now();
     assert_not_started(&h, &f, "early").await;
+    assert!(
+        sent.elapsed() >= Duration::from_millis(300),
+        "refused after the wait"
+    );
     // By terminal id too: one rule per resolution.
     let reply = message(&h, json!({"terminal_id":f.worker.terminal}), "early-t", "x").await;
     assert_refusal(&reply, -32403, Some("worker_starting"), "has not started");
@@ -108,6 +120,132 @@ async fn message_to_claude_worker_after_prompt_submit_is_written() {
         vec![expected(&f.worker.task, text)],
         "only the message reached the PTY"
     );
+    stop(&h, &f.worker).await;
+}
+
+/// #2554: a message to a starting worker waits inside the call and is written once the worker
+/// starts; the Planner does not guess when to send again.
+#[tokio::test]
+async fn message_waits_for_its_worker_to_start() {
+    let h = Harness::start().await;
+    let f = unstarted(&h, "claude", true, false).await;
+    let text = "narrow the scope to the parser";
+    let delay = Duration::from_millis(800);
+    let sent = Instant::now();
+    let (reply, ()) = tokio::join!(
+        message(&h, json!({"attempt_id":f.worker.task}), "m", text),
+        async {
+            tokio::time::sleep(delay).await;
+            assert!(reads(&f.log).is_empty(), "{:?}", reads(&f.log));
+            prompt_submitted(&h, &f.worker).await;
+        }
+    );
+    written(&reply);
+    assert!(sent.elapsed() >= delay, "{:?}", sent.elapsed());
+    assert_eq!(
+        wait_for_reads(&f.log, 1).await,
+        vec![expected(&f.worker.task, text)],
+        "written once, after the start"
+    );
+    stop(&h, &f.worker).await;
+}
+
+/// The common start inside the wait: dispatched with no worker card yet, then running with its card
+/// stamped, then the task prompt submitted; the message is written once, after all three.
+#[tokio::test]
+async fn message_waits_through_dispatch_for_its_worker_card_and_start() {
+    let h = Harness::start().await;
+    let f = unstarted(&h, "claude", true, false).await;
+    sqlx::query("UPDATE tasks SET status='dispatched',worker_card_id=NULL WHERE id=?1")
+        .bind(&f.worker.task)
+        .execute(h.sql.pool())
+        .await
+        .unwrap();
+    let start = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sqlx::query("UPDATE tasks SET status='running',worker_card_id=?2 WHERE id=?1")
+            .bind(&f.worker.task)
+            .bind(&f.worker.card)
+            .execute(h.sql.pool())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(reads(&f.log).is_empty(), "{:?}", reads(&f.log));
+        prompt_submitted(&h, &f.worker).await;
+    };
+    let (reply, ()) = tokio::join!(
+        message(&h, json!({"attempt_id":f.worker.task}), "m", "x"),
+        start
+    );
+    written(&reply);
+    assert_eq!(
+        wait_for_reads(&f.log, 1).await,
+        vec![expected(&f.worker.task, "x")]
+    );
+    stop(&h, &f.worker).await;
+}
+
+/// A waiting message writes only to the binding it first resolved: a worker session that replaces
+/// it on the same terminal meanwhile is refused, and nothing is written.
+#[tokio::test]
+async fn message_waiting_for_a_replaced_worker_session_writes_nothing() {
+    use calm_server::db::prelude::*;
+    use calm_server::db::sqlite::session_supersede_and_start_tx;
+    use calm_server::session_projection_repo::{
+        AgentProvider, WorkerSessionInit, WorkerSessionKind, WorkerSessionState,
+    };
+    let h = Harness::start().await;
+    h.interaction()
+        .set_message_start_wait(Duration::from_secs(5));
+    let f = unstarted(&h, "claude", true, false).await;
+    let replace = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let old = h
+            .sql
+            .session_get_by_id(&f.worker.session.clone().into())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tx = h.sql.pool().begin().await.unwrap();
+        session_supersede_and_start_tx(
+            &mut tx,
+            &f.worker.session,
+            WorkerSessionInit {
+                id: calm_server::model::new_id(),
+                card_id: f.worker.card.clone(),
+                kind: WorkerSessionKind::ClaudeCard,
+                agent_provider: Some(AgentProvider::Claude),
+                status: WorkerSessionState::Running,
+                terminal_run_id: Some(f.worker.terminal.clone()),
+                thread_id: None,
+                session_id: None,
+                active_turn_id: None,
+                handle_state_json: None,
+                spawn_op_id: old.spawn_op_id,
+                now_ms: calm_server::model::now_ms(),
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    };
+    let sent = Instant::now();
+    let (reply, ()) = tokio::join!(
+        message(&h, json!({"attempt_id":f.worker.task}), "m", "x"),
+        replace
+    );
+    assert_refusal(
+        &reply,
+        -32403,
+        None,
+        "terminal task/session binding changed; show and read again",
+    );
+    assert!(
+        sent.elapsed() < Duration::from_secs(5),
+        "refused before the wait ran out"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(reads(&f.log).is_empty(), "{:?}", reads(&f.log));
     stop(&h, &f.worker).await;
 }
 
