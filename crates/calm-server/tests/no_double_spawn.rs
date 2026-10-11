@@ -3029,7 +3029,7 @@ fn claude_payload(boot: &Boot, track_id: &str, prompt: Option<&str>) -> Value {
             track_id: track_id.to_string(),
             title: None,
             sort: Some(1.0),
-            cwd: "/workspace".into(),
+            cwd: Some("/workspace".into()),
             prompt: prompt.map(ToOwned::to_owned),
             icon_bg: None,
             icon_fg: None,
@@ -3037,6 +3037,7 @@ fn claude_payload(boot: &Boot, track_id: &str, prompt: Option<&str>) -> Value {
             card_id: card_id.clone(),
             claude_session_id,
             settings_path,
+            claude_bin: "/bin/true".into(),
             command_line,
             env: json!({
                 "NEIGE_CARD_ID": card_id,
