@@ -5,10 +5,15 @@ returns only the current consensus, ratings and valuation, so the archive
 stores every daily snapshot itself. The archive is one SQLite file,
 `archive.sqlite3`. It is append-only, and its format is frozen at release.
 
-This package is the persistence boundary (S1-1). It holds the compiled
-endpoint catalog (`src/catalog.rs`) and the `Store` (`src/store/`), which is
-the only owner of the schema, the guard triggers and the catalog check. The
-capture job that fills the archive arrives in S1-2.
+The package has two layers:
+
+- **Persistence (S1-1).** The compiled endpoint catalog (`src/catalog.rs`)
+  and the `Store` (`src/store/`), which is the only owner of the schema, the
+  guard triggers and the catalog check.
+- **Capture job, first half (S1-2a).** The `research-archive` binary with its
+  typed config, environment guard, data-dir lock, token storage, `auth`
+  commands and the Longbridge source; see [The binary](#the-binary). The
+  capture runner, the trading calendar and the systemd units arrive in S1-2b.
 
 ## Schema
 
@@ -330,9 +335,162 @@ Never run `ANALYZE` or `PRAGMA optimize` on the live file: they create
 `sqlite_stat*` tables, which `Store::open` refuses as schema drift. Run them,
 if at all, on a copy.
 
+## The binary
+
+`research-archive <command> --config <file>`. Every command first refuses
+a hostile environment, then reads the config, then sets the region, all
+before any thread starts.
+
+**Config.** A TOML file with every field required; unknown fields are
+refused. `research-archive.example.toml` documents each field:
+`data_dir` (absolute), `oauth_client_id`, `access_region` (`global` or
+`cn`), `http_url` (`https://host`, no path), `quote_ws_url` (`wss://`),
+`callback_port`, `research` (`CODE.MARKET` keys), `indexes` (dotted index
+symbols such as `.SPX.US`), `rps` (1 to 20), `attempt_cap`,
+`attempt_timeout_minutes`, `carry_deadline_minutes`, `window_start`
+(`HH:MM` New York time, at or after 16:00) and `notify_command` (argv with
+an absolute program). The membership request asks for `limit=1000`, so an
+index with more than 1,000 members never yields a complete membership.
+
+**Environment.** The SDK reads `LONGBRIDGE_*`/`LONGPORT_*` variables and
+loads a `.env` from the working directory or any parent into the process
+environment (`src/env_guard.rs` cites the SDK lines). Any such variable,
+or such a `.env` file, makes the binary exit `FATAL` before it reads the
+config. The binary then sets `LONGBRIDGE_REGION` from `access_region`
+itself, so the SDK never probes the network for the region.
+
+Proxy variables (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, …) are deliberately
+honoured: production reaches Longbridge through the host proxy, and both
+reqwest clients in the SDK read them by default. TLS uses rustls with the
+compiled-in webpki roots, so no `SSL_CERT_FILE` or native-certificate
+override is in play.
+
+**Lock.** `<data_dir>/archive.lock`, a non-blocking exclusive `flock`.
+`auth import` and `auth login` take it; while another process holds it they
+do nothing and exit `LOCKED`. The capture (S1-2b) takes it first and exits
+`BUSY` (0) when it is held.
+
+**Token.** The archive's own token lives in
+`<data_dir>/oauth/<client_id>.json` (file 0600, written by temp file with
+a random name, fsync and rename; a name that exists is skipped, never
+removed), in the SDK's token-file format. Writable storage creates
+`oauth/` as 0700, and sets an existing `oauth/` to 0700; the data dir keeps
+whatever mode it has (it is created 0700 when missing). No command prints or
+logs a token.
+
+Every read and write checks the token's contents the same way: the access
+token, and the refresh token when present, must be non-empty visible ASCII,
+which the SDK can send. A token that fails is refused by `auth import`,
+reported by `auth status` (exit 75), and never written. Errors name the
+field, never the value. `--config`, `--from` and the stored token must be
+regular files of at most 64 KiB. Each is opened with `O_NONBLOCK`, so a FIFO
+cannot block the open, and its type is then checked on the open file
+(`fstat`): a FIFO, a device or a directory is refused. `auth import` also
+checks `--from` with `stat` before it takes the lock, so a wrong path never
+holds the lock at all.
+
+- `auth import --from <file>` copies a token file the SDK wrote for the
+  configured client id. It refuses a file for another client id and a
+  malformed one (the error names only the JSON category and position), and
+  never writes the source file. Without `--force` it also refuses to replace
+  a stored token that expires later, and refuses a token that is unusable:
+  no refresh token and expiring within the SDK's five-minute refresh margin.
+- `auth login` runs the SDK's browser login on `callback_port`, the redirect
+  port registered for the client, printing the URL on stderr. It is the only
+  path that runs the browser flow; a capture that would need it exits
+  `AUTH_UNAVAILABLE` instead. The whole login ends within six minutes (the
+  SDK's five-minute wait for the browser plus a minute for the code
+  exchange, which has no timeout of its own); past that it exits
+  `AUTH_UNAVAILABLE`, has saved nothing, and has released the lock. On a
+  headless host the browser runs elsewhere and redirects to
+  `localhost:<callback_port>`, so forward that port to the server first, for
+  example `ssh -L <callback_port>:localhost:<callback_port> <host>`, then
+  open the printed URL on the machine running ssh.
+- `auth status` prints the stored token's expiry and whether it has a
+  refresh token, and exits `AUTH_UNAVAILABLE` when the token is unusable.
+
+**Exit codes** (`src/exit.rs`). `OK`, `BUSY` and `NO_WINDOW` are 0;
+`PARTIAL` is 3, `LOCKED` 4, `FATAL` 70 and `AUTH_UNAVAILABLE` 75.
+
+**Logs** go to stderr, and only this crate's target is emitted. Every
+third-party target is off: the SDK logs full response bodies at `info` and
+the OAuth callback's attacker-chosen `error` parameter at `warn`. SDK
+errors are rendered only as a fixed variant name (`src/sdk_error.rs`),
+never as their text.
+
+**Source.** `LongbridgeSource::fetch` sends one catalog request at a paced
+start (`rps`) and returns the Store's `Response`: the envelope's exact
+`data` bytes as `Body`, or `Failed` classified as below. The Store, not the
+source, judges a membership body. A `fetch` runs in this order:
+
+1. It resolves the access token, a refresh included, within 30 s. A
+   failure is `auth_unavailable` and sends nothing; like every auth pause
+   it does not count toward the attempt cap.
+2. It takes its rate-limit slot, so callers that waited behind a refresh
+   are paced, not released together.
+3. It sends within 60 s, the SDK's own retries included, through an HTTP
+   client built on a snapshot of that token, which can never refresh. The
+   token is resolved in exactly one place: a token that crosses the SDK's
+   five-minute refresh margin while a fetch waits for its slot is still
+   sent (it is valid until it expires), and the next fetch refreshes in
+   step 1. The snapshot client is cached per token value.
+
+A deadline can drop a refresh that the server has already committed. If
+Longbridge rotates refresh tokens on use, the stored one is then spent and
+the login is lost; `auth login` restores it.
+
+- **Exact bytes hold for UTF-8.** The SDK reads the body with reqwest's
+  `text()`, which replaces invalid UTF-8 with U+FFFD before the envelope is
+  parsed. JSON is UTF-8 by specification, so a valid body is kept byte for
+  byte; an invalid one would not be. A `charset` in `Content-Type` is
+  ignored: reqwest transcodes only with its `charset` feature, which
+  nothing in this build enables (a test pins it).
+- **The limiter cannot pace SDK retries.** The SDK retries a bare HTTP 429
+  up to five times inside one request, outside the limiter. The server
+  throttles with envelope `429002` instead, which the SDK does not retry,
+  and the probe saw no bare 429.
+
+| upstream result | status | `error_class` | `error_code` |
+|---|---|---|---|
+| envelope `429002` | `throttled` (retry after the message's "retry after: Xs", at most 60 s, else 1 s) | `envelope` | `429002` |
+| other non-zero envelope code, at any HTTP status | `permanent` | `envelope` | the code |
+| `code: 0` with `data` absent or `null` | `permanent` | `unexpected_response` | `unexpected_response` |
+| HTTP 200 that is not an envelope | `transient` | `unexpected_response` | `deserialize_response_body` |
+| other non-envelope 1xx–3xx | `transient` | `unexpected_response` | `unexpected_http_response` |
+| non-envelope 429, after the SDK's five retries | `throttled` (retry after 1 s) | `http_status` | `429` |
+| non-envelope 401, 403 | `auth_unavailable` | `http_status` | the status |
+| non-envelope 408, 5xx | `transient` | `http_status` | the status |
+| other non-envelope 4xx | `permanent` | `http_status` | the status |
+| request timeout, or the fetch timeout | `transient` | `transport` | `request_timeout` |
+| connection or body error | `transient` | `transport` | `http` |
+| token resolution failed, before any request | `auth_unavailable` | `auth` | the OAuth error variant (`no_refresh_token`, `refresh_token_failed`, …) |
+| token resolution past its 30 s bound | `auth_unavailable` | `auth` | `refresh_timeout` |
+| the SDK's own token or key check inside the request | `auth_unavailable` | `auth` | `oauth`, `invalid_access_token`, `invalid_api_key` |
+| the SDK's data-center guard | `region_restricted` | `dc_region_restricted` | `dc_region_restricted` |
+| the SDK could not build the request | `permanent` | `client` | the SDK variant |
+
 ## Tests
 
-Run `cargo nextest run -p research-archive`.
+Run `cargo nextest run -p research-archive`. The source and CLI tests use a
+local fake HTTP server and fabricated tokens; none reaches a real host.
+
+Two integration binaries:
+
+- **`suite`** drives the Store and the binary as a subprocess.
+- **`net`** holds every test that builds an SDK `OAuth` or a
+  `LongbridgeSource` in process. Its harness serializes them, refuses a
+  `.env` in reach, and pins the proxies to a local black hole, `NO_PROXY`
+  to loopback, `LONGBRIDGE_ENV` and `LONGBRIDGE_REGION`. A source scan
+  (`net::scan`) fails if any other test code names the SDK or builds a
+  client: every file under `tests/` but `tests/net/`, every `src/**/tests.rs`
+  and every `#[cfg(test)]` item in `src/`. Production code is not scanned.
+  Its patterns are regexes over whole files, comments included. The scan
+  catches a test that builds an SDK client accidentally placed outside the
+  hermetic harness; it is not a defence against deliberate evasion.
+- **Harness note.** `hermetic::pinned` sets process-wide environment once;
+  its `SAFETY` argument assumes nextest's one-process-per-test model. Under
+  `cargo test` the binary's tests share a process and are serialized by a
+  lock, but they do not isolate the environment from each other.
 
 | test module | covers |
 |---|---|
@@ -343,3 +501,10 @@ Run `cargo nextest run -p research-archive`.
 | `freeze` | the derived freeze, Store-classified membership bodies, I5, atomicity, carry vs `read_at` |
 | `reads` | I6, the universe, read order and coverage |
 | `send` | every public async method returns a `Send` future |
+| `cli` | the environment guard, the lock (`LOCKED`), `auth import`, `status` and `login` as subprocesses |
+| `net::source` | I3 through the Store (also under a misleading charset), the request of every catalog entry, the classification table |
+| `net::crossing` | a token crossing the refresh margin during the slot wait: no refresh inside a send, never `transient` |
+| `net::refresh`, `net::login` | a hung token refresh is bounded and releases the `OAuth` lock; a hung code exchange ends `login` by its deadline |
+| `net::logs` | only our own log target is emitted |
+| `net::secrets` | I11 for the binary's output, our logs, the archive file, `Debug`, and a login callback carrying a canary |
+| `net::dotenv`, `net::scan` | a `.env` in reach is refused and cannot override the pins; no SDK client is built outside the harness |
