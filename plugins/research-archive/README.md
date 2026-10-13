@@ -17,8 +17,8 @@ The package has two layers:
   trading calendar and run phases, the `notify` alert, and the systemd unit
   templates; see [The capture job](#the-capture-job).
 - **Status plugin (S1b).** The read-only `research-archive-plugin` binary,
-  a Neige plugin that reports the archive's health; see
-  [Status plugin (S1b)](#status-plugin-s1b).
+  a Neige plugin that reports the archive's health and reads archived values
+  as of a past moment; see [Status plugin (S1b)](#status-plugin-s1b).
 
 ## Schema
 
@@ -805,8 +805,9 @@ systemctl --user enable --now research-archive-capture.timer
 
 `research-archive-plugin` is a Neige plugin (`manifest.json`, plugin id
 `archive`: an installable id is one word, `^[a-z0-9]{2,32}$`) that reports
-the archive's health to Planners and Reports. The capture stays the systemd
-timer's; the plugin captures nothing and changes nothing.
+the archive's health to Planners and Reports, and reads archived values as
+of a past moment. The capture stays the systemd timer's; the plugin captures
+nothing and changes nothing.
 
 **What it reads.** Two files in the configured data dir, and nothing else:
 
@@ -876,10 +877,46 @@ about 45.
   names only the calling Track, so by clearing the plugin's KV). Each key
   is about 40 bytes of the 16 KiB quota.
 
+- `read_at {at, reads}` (#2597) answers what the archive held at `at`, an
+  RFC 3339 time with an offset. Each of 1 to 12 reads names a `symbol`, one
+  of the catalog's six security `endpoint`s (the manifest's enum is pinned to
+  the catalog by a test; `index_constituents` is not readable here) and an
+  RFC 6901 `pointer` into the body (`""` is the whole body). Each read is
+  [`read_at`](#read-contract) through `ReadOnlyStore`, the same query, and
+  answers one `result`:
+
+  | `result` | when | fields beyond `symbol`, `endpoint`, `pointer` |
+  |---|---|---|
+  | `value` | an `ok` row with `fetched_at ≤ at`, and the pointer resolves | `as_of`, `fetched_at` (RFC 3339 UTC), `value` |
+  | `pointer_missing` | that row's body has nothing at the pointer | `as_of`, `fetched_at` |
+  | `no_value` | the pair was planned in some run, but no `ok` row is at or before `at` | none |
+  | `not_archived` | no run ever planned the pair (`PLANNED_PAIRS`; an index symbol is planned only for the index endpoint) | none |
+
+  The first data was fetched 2026-10-13 (UTC), for trading day 2026-10-12;
+  visibility is by `fetched_at`, so an earlier `at` gives `no_value`
+  (`not_archived` for a pair never planned). A stored body that is not JSON
+  fails the call naming the read; the capture stores the envelope's `data`
+  JSON as is, so it never happens. A pointer with a `~` not followed by `0`
+  or `1` is refused with the arguments. The answer (`{at, reads}`, as
+  compact JSON in the text and the same object in `structuredContent`) is
+  capped at 40 KiB: over it the call fails with each read's size, and
+  nothing is truncated. Codex binds the cap: it shows the model only
+  `structuredContent` and middle-truncates a tool output over 10,000 tokens
+  × 1.2 × 4 bytes ≈ 48,000 bytes, so 40 KiB keeps a margin (Claude Code's
+  MCP cap, 25,000 tokens, is higher).
+
+  Bodies are large: in production consensus averages about 20 KB,
+  forecast_eps 26 KB (up to 271 KB), rating_detail 51 KB and valuation 14 KB,
+  as valuation and rating_detail carry the vendor's own long time series. The
+  top-level shape of each endpoint's body, for picking pointers, is in the
+  tool's description in `manifest.json` (the SDK's types at v5.2.0, checked
+  against NVDA.US in production), where the Planner reads it.
+
 The manifest's `planner_instructions` tell the Planner to ask the owner with
 `neige_user_ask` on `failing` (again only when the reasons change) and to
-report `attention` in the Report without asking. The plugin itself sends no
-alert anywhere.
+report `attention` in the Report without asking, and name `read_at` for
+where consensus, ratings or target prices stood at a time. The plugin itself
+sends no alert anywhere.
 
 **Report block.** A Report of a watching Track shows the live table with
 
@@ -967,3 +1004,4 @@ Two integration binaries:
 | `read_only` | `ReadOnlyStore`: never creates or changes the file, refuses what `Store::open` refuses, reads while the capture writes |
 | `status` | the health rules over a real archive and `last_exit.json` |
 | `plugin` | the plugin binary against a fake kernel: `capture_status`, `capture_watch` and its overlay pushes (only on change), the config, re-`initialize`, the lock held during reads, and the source scan of what it reaches |
+| `plugin_read_at` | `read_at` through the plugin binary over a real archive: the row visible at a time, the four results, pointers, the size cap, the argument checks, and the manifest schema against the catalog |
