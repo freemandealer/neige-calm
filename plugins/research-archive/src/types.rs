@@ -368,10 +368,14 @@ pub enum Membership {
 impl Membership {
     /// The `run_membership.mode` value.
     pub fn mode(&self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    pub fn kind(&self) -> MembershipMode {
         match self {
-            Membership::Observed { .. } => "observed",
-            Membership::Carried { .. } => "carried",
-            Membership::None => "none",
+            Membership::Observed { .. } => MembershipMode::Observed,
+            Membership::Carried { .. } => MembershipMode::Carried,
+            Membership::None => MembershipMode::None,
         }
     }
 
@@ -379,6 +383,45 @@ impl Membership {
         match self {
             Membership::Observed { members } | Membership::Carried { members, .. } => members,
             Membership::None => &[],
+        }
+    }
+}
+
+/// A run that ends `complete` with fewer than this share of its planned
+/// pairs having an `ok` is degraded: the capture exits `DEGRADED` (non-zero),
+/// so the alert fires, and the status says `failing` until a later day ends
+/// `complete`. Ordinary losses (a few delisted symbols, a few capped pairs)
+/// stay above it and exit 0 as `complete_with_failures`.
+pub const DEGRADED_BELOW: f64 = 0.5;
+
+/// Whether `ok` of `planned` pairs is below [`DEGRADED_BELOW`].
+pub fn degraded(ok: usize, planned: usize) -> bool {
+    planned > 0 && (ok as f64) < DEGRADED_BELOW * planned as f64
+}
+
+/// `run_membership.mode`: how a frozen index membership was derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MembershipMode {
+    Observed,
+    Carried,
+    None,
+}
+
+impl MembershipMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MembershipMode::Observed => "observed",
+            MembershipMode::Carried => "carried",
+            MembershipMode::None => "none",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<MembershipMode, InvalidValue> {
+        match s {
+            "observed" => Ok(MembershipMode::Observed),
+            "carried" => Ok(MembershipMode::Carried),
+            "none" => Ok(MembershipMode::None),
+            other => Err(invalid("mode", other)),
         }
     }
 }
@@ -421,6 +464,15 @@ mod tests {
         for s in ["complete", "partial", "missed"] {
             assert_eq!(RunOutcome::parse(s).unwrap().as_str(), s);
         }
+        for s in ["observed", "carried", "none"] {
+            assert_eq!(MembershipMode::parse(s).unwrap().as_str(), s);
+        }
+        assert!(MembershipMode::parse("Observed").is_err());
+        assert!(degraded(2, 6));
+        assert!(!degraded(3, 6));
+        assert!(degraded(0, 1));
+        assert!(!degraded(1, 1));
+        assert!(!degraded(0, 0));
         assert!(Key::new("").is_err());
         assert!(Key::new("A B").is_err());
         assert!(Window::new(UnixMs(2), UnixMs(2)).is_err());

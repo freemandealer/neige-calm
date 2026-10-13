@@ -16,6 +16,9 @@ The package has two layers:
 - **Capture job, second half (S1-2b).** The `capture` command with its
   trading calendar and run phases, the `notify` alert, and the systemd unit
   templates; see [The capture job](#the-capture-job).
+- **Status plugin (S1b).** The read-only `research-archive-plugin` binary,
+  a Neige plugin that reports the archive's health; see
+  [Status plugin (S1b)](#status-plugin-s1b).
 
 ## Schema
 
@@ -796,6 +799,119 @@ systemctl --user enable --now research-archive-capture.timer
 
 `systemd-analyze verify` on rendered copies reports no problem.
 
+## Status plugin (S1b)
+
+`research-archive-plugin` is a Neige plugin (`manifest.json`) that reports
+the archive's health to Planners and Reports. The capture stays the systemd
+timer's; the plugin captures nothing and changes nothing.
+
+**What it reads.** Two files in the configured data dir, and nothing else:
+
+- `archive.sqlite3`, through `ReadOnlyStore`: opened `SQLITE_OPEN_READONLY`,
+  never created, with a busy timeout, and refused on the same `user_version`,
+  schema and catalog checks as `Store::open`. Like any WAL reader it may
+  create the `-wal` and `-shm` sidecars when they are missing, so it runs as
+  the capture's user, which can write the data dir (see
+  [Importing read-only](#importing-read-only)).
+- `last_exit.json`, how the last capture start ended.
+
+It never takes `archive.lock`, never reads `oauth/` or any token, and calls
+no host. It works while a capture holds the lock and writes. A source scan
+(`plugin::the_plugin_reaches_only_the_read_side`) pins the modules it can
+reach.
+
+**Configuration** (`PATCH /api/plugins/research-archive/config`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `data_dir` | required | absolute path of the capture's data dir (its config's `data_dir`) |
+| `poll_seconds` | 60 | seconds between status reads for watching Tracks (10 to 3600) |
+| `stale_after_minutes` | 90 | minutes after the last recorded exit at which the timer counts as stopped (60 to 2880); see below |
+
+A missing or out-of-range key fails every tool call with the reason. The
+plugin checks the ranges itself: the kernel's `config_schema` subset has no
+`minimum`/`maximum`. `stale_after_minutes` must exceed 30 (the timer's
+interval) plus the capture's `attempt_timeout_minutes`, with a margin: a
+start can hold the lock that long, and a start that finds the lock held
+records nothing. The default 90 fits an `attempt_timeout_minutes` up to
+about 45.
+
+**Tools.**
+
+- `archive_status` answers `ok`, `attention` or `failing`, every finding, the last
+  exit and the last 7 runs with their pair counts (ok, tried with no ok, not
+  tried, planned) and frozen membership. One source per fact:
+  - **The runs** record data loss for good. A run that ended `partial`, or
+    `complete` but degraded (fewer than [`DEGRADED_BELOW`](src/types.rs) of
+    its pairs `ok`, the capture's own `DEGRADED` rule), is `failing` until a
+    later day ends `complete`, which demotes it to `attention`. A later
+    `missed` or open run does not, so an outage across several windows (a
+    day closed `partial` at the next start, the days after it `missed`)
+    stays `failing`. A `missed` day is `attention`, and so is a run
+    `complete` with pairs that have no `ok`. An open run is not judged.
+  - **`last_exit.json`** tells only what the runs cannot: it is `failing`
+    when it is missing or older than `stale_after_minutes`, or when the last
+    start had no usable token (`auth_unavailable`) or stopped on `fatal`;
+    an incomplete missed-day scan is `attention`. The capture overwrites
+    the file on every start, so a `partial` or `degraded` exit read from it
+    would turn healthy 30 minutes later.
+  - An archive that is missing or refused is `failing`.
+
+  No finding names the exit's time (the staleness finding names it, as it
+  is fixed while stale), so the findings change only when the state does.
+  The tool's text adds when the last start ended and when it checked.
+- `archive_watch {on}` acts on the calling Track, which the kernel names in
+  `params._meta["dev.neige/track"].id`. `on: true` stores `watch/<track>` in
+  the plugin's KV; the poller then pushes the `archive.status` table overlay
+  to that Track, and later only when the table changes. `on: false` deletes
+  the key and the overlay.
+
+  A Track deleted while watching keeps its `watch/<track>` key: the plugin
+  is not told of the deletion. Each change of the table is still pushed to
+  it, and the kernel's `neige.overlay.set` stores it without checking that
+  the Track exists, until the key is removed (`archive_watch` with `on: false`
+  names only the calling Track, so by clearing the plugin's KV). Each key
+  is about 40 bytes of the 16 KiB quota.
+
+The manifest's `planner_instructions` tell the Planner to ask the owner with
+`neige_user_ask` on `failing` (again only when the reasons change) and to
+report `attention` in the Report without asking. The plugin itself sends no
+alert anywhere.
+
+**Report block.** A Report of a watching Track shows the live table with
+
+````markdown
+```neige-block table
+{ "source": "neige://plugin/research-archive/archive.status" }
+```
+````
+
+The table has one row per recent run, and the verdict with its findings in
+the caption (capped at the block's 2048 characters). It holds no check or
+exit time, so it is pushed only when the status changes.
+
+**Install.** Build the binary and stage the manifest next to it:
+
+```sh
+cargo build --release --locked -p research-archive --bin research-archive-plugin
+dir=<plugins_dir>/research-archive
+mkdir -p "$dir/bin"
+cp plugins/research-archive/manifest.json "$dir/"
+cp "${CARGO_TARGET_DIR:-target}/release/research-archive-plugin" "$dir/bin/"
+```
+
+Then, against the server:
+
+```sh
+curl -X POST "$CALM/api/plugins/install" -H 'content-type: application/json' \
+  -d "{\"source\":{\"kind\":\"local_path\",\"path\":\"$dir\"}}"
+curl -X PATCH "$CALM/api/plugins/research-archive/config" -H 'content-type: application/json' \
+  -d '{"data_dir":"<the capture config'"'"'s data_dir>"}'
+curl -X POST "$CALM/api/plugins/research-archive/enable"
+```
+
+A config change takes effect after `POST /api/plugins/research-archive/reload`.
+
 ## Tests
 
 Run `cargo nextest run -p research-archive`. The source and CLI tests use a
@@ -845,3 +961,6 @@ Two integration binaries:
 | `capture_cli` | `capture` as a subprocess: a kill during the fetch (I4), I9, a hanging token refresh, I10, the calendar refresh. The membership phase cannot be reached in real time at every hour, so its kill and I12 run in `net::interrupt` |
 | `capture_secrets` | I11 for `capture` and `notify`; the alert's dedupe and environment; `notify` alerting when `capture` refused its environment; `notify` trusting only the failed start's own state (`$INVOCATION_ID` / `$MONITOR_INVOCATION_ID`) |
 | `units` | the systemd templates' directives and placeholders |
+| `read_only` | `ReadOnlyStore`: never creates or changes the file, refuses what `Store::open` refuses, reads while the capture writes |
+| `status` | the health rules over a real archive and `last_exit.json` |
+| `plugin` | the plugin binary against a fake kernel: `archive_status`, `archive_watch` and its overlay pushes (only on change), the config, re-`initialize`, the lock held during reads, and the source scan of what it reaches |
