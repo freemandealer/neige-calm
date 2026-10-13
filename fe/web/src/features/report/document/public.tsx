@@ -22,6 +22,7 @@ import { ReportDetails } from './details.tsx';
 import { revealReportAnchor } from '../anchor/public.ts';
 import { ReportAppBlock } from '../app/public.tsx';
 import { ReportWindowBlock } from '../window/public.tsx';
+import { ReportHtmlBlock } from '../html/public.tsx';
 import { ReportCandlesBlock } from '../candles/public.tsx';
 import { ReportPreviewBlock, type PreviewViewportStore } from '../preview/public.tsx';
 import { ReportSeriesBlock } from '../series/public.tsx';
@@ -273,6 +274,9 @@ function BlockBody({
     case 'preview': return <ReportPreviewBlock payload={block.payload} resolve={resolvePreview}
       viewports={previewViewports} />;
     case 'window': return <ReportWindowBlock payload={block.payload} />;
+    /* The page is read through the same Track file port as prose links and images. */
+    case 'html': return <ReportHtmlBlock payload={block.payload} files={linkPreview?.files}
+      onOpen={onOpenFileLink === undefined ? undefined : (path) => { onOpenFileLink({ path }); }} />;
     case 'unsupported':
       return (
         <div className={styles.unsupported} role="note">
