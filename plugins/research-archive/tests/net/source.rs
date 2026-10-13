@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use longbridge::oauth::{OAuth, OAuthBuilder, OAuthResult, StoredToken, TokenStorage};
 use research_archive::StoreError;
 use research_archive::catalog::{Catalog, DcRegion, Endpoint, KeyKind, QueryValue};
-use research_archive::source::{Fetched, LongbridgeSource, RETRY_AFTER_FALLBACK, Rps, Timeouts};
+use research_archive::source::{
+    Fetched, LongbridgeSource, RETRY_AFTER_FALLBACK, RETRY_AFTER_MAX, Rps, Timeouts,
+};
 use research_archive::store::RunPlan;
 use research_archive::types::{ErrorClass, ErrorDetail, FailureClass, Response, Status, UnixMs};
 
@@ -239,6 +241,35 @@ fn http_failures_are_classified_into_stored_failures() {
                 E::Envelope,
                 "429002",
             ),
+            // Every 429xxx envelope is a throttle. One that names no wait,
+            // other than the 1-second limit, waits the longest wait.
+            Case {
+                retry_after: Some(RETRY_AFTER_MAX),
+                ..case(
+                    200,
+                    r#"{"code":429003,"message":"api request is limited"}"#,
+                    F::Throttled,
+                    E::Envelope,
+                    "429003",
+                )
+            },
+            Case {
+                retry_after: Some(Duration::from_secs(5)),
+                ..case(
+                    429,
+                    r#"{"code":429001,"message":"please retry after: 5s"}"#,
+                    F::Throttled,
+                    E::Envelope,
+                    "429001",
+                )
+            },
+            case(
+                200,
+                r#"{"code":430000,"message":"retry after: 1s"}"#,
+                F::Permanent,
+                E::Envelope,
+                "430000",
+            ),
             case(
                 200,
                 r#"{"code":2601400,"message":"internal server error","data":null}"#,
@@ -345,7 +376,8 @@ async fn assert_stored(f: &Fixture, plan: &RunPlan, e: &Endpoint, t: UnixMs, fet
 
 /// SDK behaviour, pinned: a non-envelope 429 is retried five times inside
 /// one `send()`, outside our limiter (`request.rs:475-513`), then the attempt
-/// is throttled. The server's real throttle is envelope 429002 (see above).
+/// is throttled. The server throttles with `429xxx` envelope codes instead,
+/// which the SDK does not retry (see above).
 #[test]
 fn sdk_behaviour_a_bare_429_is_retried_five_times_outside_the_limiter() {
     hermetic::run(async {
