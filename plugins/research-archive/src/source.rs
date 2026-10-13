@@ -100,8 +100,10 @@ impl RateLimiter {
 /// The wait after a throttle when the server names none.
 pub const RETRY_AFTER_FALLBACK: Duration = Duration::from_secs(1);
 
-/// The longest server-named wait; a longer one is clamped to it.
-const RETRY_AFTER_MAX: Duration = Duration::from_secs(60);
+/// The longest server-named wait; a longer one is clamped to it. Also the
+/// wait a resumed start gives a pair whose last row is `throttled`: the
+/// named wait is not stored.
+pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(60);
 
 /// The bounds of one `fetch` (see [`LongbridgeSource::fetch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +202,22 @@ impl LongbridgeSource {
     ///    expired is still sent: the SDK checks expiry only to decide on a
     ///    refresh (`oauth/src/token.rs:59-66`), never before a request.
     pub async fn fetch(&self, endpoint: &Endpoint, key: &Key) -> Fetched {
+        self.fetch_if(endpoint, key, || true)
+            .await
+            .expect("an unconditional fetch always sends")
+    }
+
+    /// [`fetch`](Self::fetch), asking `may_send` once more at the actual
+    /// request start, after the rate-limit slot and right before the send.
+    /// `None` when it says no: nothing was sent, and there is nothing to
+    /// record. The capture runner passes its deadline check here, so no
+    /// request starts at or after the deadline, however long the slot took.
+    pub async fn fetch_if(
+        &self,
+        endpoint: &Endpoint,
+        key: &Key,
+        may_send: impl FnOnce() -> bool,
+    ) -> Option<Fetched> {
         let auth_failure = |code: &str| Fetched {
             response: failed(
                 FailureClass::AuthUnavailable,
@@ -211,14 +229,17 @@ impl LongbridgeSource {
         let token = match tokio::time::timeout(self.timeouts.token, self.oauth.access_token()).await
         {
             Ok(Ok(token)) => token,
-            Ok(Err(err)) => return auth_failure(sdk_error::oauth_kind(&err)),
-            Err(_elapsed) => return auth_failure("refresh_timeout"),
+            Ok(Err(err)) => return Some(auth_failure(sdk_error::oauth_kind(&err))),
+            Err(_elapsed) => return Some(auth_failure("refresh_timeout")),
         };
         let http = match self.snapshot_for(token).await {
             Ok(http) => http,
-            Err(err) => return auth_failure(sdk_error::oauth_kind(&err)),
+            Err(err) => return Some(auth_failure(sdk_error::oauth_kind(&err))),
         };
         self.limiter.acquire().await;
+        if !may_send() {
+            return None;
+        }
         let method = match endpoint.method {
             catalog::Method::Get => Method::GET,
         };
@@ -238,18 +259,20 @@ impl LongbridgeSource {
             })
             .response::<String>()
             .send();
-        match tokio::time::timeout(self.timeouts.fetch, send).await {
-            Ok(Ok(data)) => Fetched::body(data),
-            Ok(Err(err)) => classify(err),
-            Err(_elapsed) => Fetched {
-                response: failed(
-                    FailureClass::Transient,
-                    ErrorClass::Transport,
-                    "request_timeout".to_owned(),
-                ),
-                retry_after: None,
+        Some(
+            match tokio::time::timeout(self.timeouts.fetch, send).await {
+                Ok(Ok(data)) => Fetched::body(data),
+                Ok(Err(err)) => classify(err),
+                Err(_elapsed) => Fetched {
+                    response: failed(
+                        FailureClass::Transient,
+                        ErrorClass::Transport,
+                        "request_timeout".to_owned(),
+                    ),
+                    retry_after: None,
+                },
             },
-        }
+        )
     }
 
     /// The cached snapshot client for `token`, built when the token changed.

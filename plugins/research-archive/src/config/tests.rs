@@ -53,7 +53,7 @@ fn the_example_parses_into_the_typed_config() {
     let indexes: Vec<_> = config.indexes.iter().map(Key::as_str).collect();
     assert_eq!(indexes, [".SPX.US"]);
     assert_eq!(config.rps.get(), 2);
-    assert_eq!(config.attempt_cap, 5);
+    assert_eq!(config.attempt_cap, 6);
     assert_eq!(config.attempt_timeout, Duration::from_secs(25 * 60));
     assert_eq!(config.carry_deadline, Duration::from_secs(60 * 60));
     assert_eq!(
@@ -132,6 +132,10 @@ fn keys_must_have_their_form_and_be_unique() {
 fn urls_need_their_scheme_and_shape() {
     for (field, line) in [
         ("http_url", r#"http_url = "http://openapi.longbridge.cn""#),
+        // Plain http is for a loopback IP literal only.
+        ("http_url", r#"http_url = "http://localhost:8080""#),
+        ("http_url", r#"http_url = "http://10.0.0.1:8080""#),
+        ("http_url", r#"http_url = "http://127.0.0.1:8080/""#),
         ("http_url", r#"http_url = "https://openapi.longbridge.cn/""#),
         (
             "http_url",
@@ -158,6 +162,8 @@ fn urls_need_their_scheme_and_shape() {
         assert_eq!(field_of(&refused(&with(field, line))), field, "{line}");
     }
     Config::parse(&with("http_url", r#"http_url = "https://127.0.0.1:8443""#)).unwrap();
+    Config::parse(&with("http_url", r#"http_url = "http://127.0.0.1:8080""#)).unwrap();
+    Config::parse(&with("http_url", r#"http_url = "http://[::1]:8080""#)).unwrap();
 }
 
 #[test]
@@ -183,4 +189,28 @@ fn scalar_fields_are_range_checked() {
         refused(&with("access_region", r#"access_region = "hk""#)),
         ConfigError::Parse { .. }
     ));
+}
+
+/// The carry deadline must fall inside the shortest window the start time
+/// allows: 17:30 to 09:30 the next day is 16 hours, 15 across the spring
+/// DST change; 23:59 to 09:30 is 9 h 31 min, 8 h 31 min (511 minutes).
+#[test]
+fn the_carry_deadline_ends_before_the_shortest_window() {
+    let at = |ws: &str, carry: u32| {
+        with("window_start", &format!("window_start = \"{ws}\"")).replace(
+            "carry_deadline_minutes = 60",
+            &format!("carry_deadline_minutes = {carry}"),
+        )
+    };
+    assert_eq!(
+        shortest_window_minutes(NaiveTime::from_hms_opt(17, 30, 0).unwrap()),
+        15 * 60
+    );
+    Config::parse(&at("17:30", 600)).unwrap();
+    Config::parse(&at("23:59", 510)).unwrap();
+    for (ws, carry) in [("23:59", 511), ("23:59", 600)] {
+        let err = refused(&at(ws, carry));
+        assert_eq!(field_of(&err), "carry_deadline_minutes", "{ws} {carry}");
+        assert!(err.to_string().contains("at most 510"), "{err}");
+    }
 }

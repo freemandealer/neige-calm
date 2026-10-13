@@ -29,12 +29,14 @@ impl Seen {
     }
 }
 
-/// Status, extra headers, body, and how long to wait before replying.
+/// Status, extra headers, body, and what to wait for before replying: a
+/// delay, or a gate the test opens.
 pub struct Reply {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
     pub body: String,
     pub delay: Option<Duration>,
+    pub gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Reply {
@@ -44,7 +46,16 @@ impl Reply {
             headers: vec![],
             body: body.into(),
             delay: None,
+            gate: None,
         }
+    }
+
+    /// Reply only once `gate` has a permit for this request: the test opens
+    /// it with `add_permits`, and permits added before the request waits
+    /// still count.
+    pub fn gated(mut self, gate: &Arc<tokio::sync::Semaphore>) -> Self {
+        self.gate = Some(Arc::clone(gate));
+        self
     }
 
     /// Reply only after `delay` (on the tokio clock).
@@ -87,6 +98,9 @@ impl FakeServer {
                 };
                 let reply = respond(&request);
                 log.lock().unwrap().push(request);
+                if let Some(gate) = &reply.gate {
+                    gate.acquire().await.unwrap().forget();
+                }
                 if let Some(delay) = reply.delay {
                     tokio::time::sleep(delay).await;
                 }

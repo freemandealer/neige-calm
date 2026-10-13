@@ -176,6 +176,19 @@ impl RawConfig {
         if window_start < NaiveTime::from_hms_opt(16, 0, 0).expect("a valid time") {
             return Err(invalid("window_start", "must be at or after 16:00"));
         }
+        let shortest = shortest_window_minutes(window_start);
+        if u32::try_from(shortest).is_ok_and(|shortest| self.carry_deadline_minutes >= shortest) {
+            return Err(invalid(
+                "carry_deadline_minutes",
+                format!(
+                    "must end before the shortest window: at most {} for window_start {}, \
+                     which can close {shortest} minutes later (at 09:30 New York the next \
+                     day, one hour sooner across the spring DST change)",
+                    shortest - 1,
+                    self.window_start
+                ),
+            ));
+        }
         match self.notify_command.first() {
             Some(program) if Path::new(program).is_absolute() => {}
             _ => {
@@ -202,6 +215,15 @@ impl RawConfig {
             notify_command: self.notify_command,
         })
     }
+}
+
+/// The shortest window that opens at `window_start` (New York): to 09:30
+/// New York the next day, one hour shorter when the clocks spring forward
+/// in between. Longer windows (weekends, holidays) only start the same way.
+pub fn shortest_window_minutes(window_start: NaiveTime) -> i64 {
+    use chrono::Timelike;
+    let start = i64::from(window_start.hour() * 60 + window_start.minute());
+    24 * 60 + (9 * 60 + 30) - start - 60
 }
 
 fn in_range(
@@ -274,9 +296,18 @@ fn keys(field: &'static str, values: &[String], form: KeyForm) -> Result<Vec<Key
 }
 
 /// `scheme://host[:port]` with nothing after it: the SDK appends the request
-/// path to the string as is (`request.rs:353`).
+/// path to the string as is (`request.rs:353`). Plain `http` is accepted only
+/// for a loopback IP literal, a local test server.
 fn base_url(field: &'static str, value: &str, scheme: &str) -> Result<String, ConfigError> {
-    let url = parse_url(field, value, scheme)?;
+    let loopback = url::Url::parse(value).is_ok_and(|u| {
+        u.scheme() == "http"
+            && match u.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            }
+    });
+    let url = parse_url(field, value, if loopback { "http" } else { scheme })?;
     if url.path() != "/" || value.ends_with('/') {
         return Err(invalid(field, "must have no path and no trailing slash"));
     }
