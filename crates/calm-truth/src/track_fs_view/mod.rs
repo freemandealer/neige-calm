@@ -1300,19 +1300,7 @@ pub(crate) fn run_markdown(run: &RunProjection) -> String {
         ));
     }
 
-    if let Some(card) = run.worker_card.as_ref() {
-        append_payload_field(&mut out, &card.payload, "goal", "Goal");
-        append_payload_json_field(&mut out, &card.payload, "context", "Context");
-        append_payload_field(
-            &mut out,
-            &card.payload,
-            "acceptance_criteria",
-            "Acceptance Criteria",
-        );
-        append_payload_field(&mut out, &card.payload, "prompt", "Prompt");
-    }
-
-    out.push_str("\n## Final Event\n\n");
+    out.push_str("\n## Outcome\n\n");
     match latest_final_event(run.completed_event.as_ref(), run.failed_event.as_ref()) {
         Some(FinalRunEvent::Failed(event)) => {
             let reason = event
@@ -1320,7 +1308,8 @@ pub(crate) fn run_markdown(run: &RunProjection) -> String {
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown failure");
-            out.push_str(&format!("- TaskFailed: {}\n", reason));
+            out.push_str("- TaskFailed:\n");
+            append_text_block(&mut out, reason);
             if let Some(details) = event.payload.get("details") {
                 out.push_str("\n```json\n");
                 out.push_str(&pretty_json(details));
@@ -1328,12 +1317,26 @@ pub(crate) fn run_markdown(run: &RunProjection) -> String {
             }
         }
         Some(FinalRunEvent::Completed(event)) => {
-            out.push_str("- TaskCompleted:\n\n");
-            out.push_str("```json\n");
-            out.push_str(&final_result_summary(event));
-            out.push_str("\n```\n");
+            out.push_str("- TaskCompleted:\n");
+            append_completed_result(&mut out, event);
         }
         None => out.push_str("- No TaskCompleted or TaskFailed event has been recorded.\n"),
+    }
+
+    if let Some(card) = run.worker_card.as_ref() {
+        append_payload_field(&mut out, &card.payload, "goal", "Goal");
+        append_payload_field(
+            &mut out,
+            &card.payload,
+            "acceptance_criteria",
+            "Acceptance Criteria",
+        );
+        append_payload_json_field(&mut out, &card.payload, "context", "Context");
+        out.push_str(&format!(
+            "\nFull worker prompt (gate steps, checkout facts): \
+             [.payload.json](../cards/{}/.payload.json) field `prompt`\n",
+            card.id.as_str()
+        ));
     }
     out
 }
@@ -1352,15 +1355,36 @@ fn append_payload_json_field(out: &mut String, payload: &Value, key: &str, label
     }
 }
 
-fn final_result_summary(event: &RunEventProjection) -> String {
+/// The summary comes first, in a text block where a one-line summary is a line of its own (for a
+/// reader and an exact-line match); any other result field follows as the full result JSON.
+fn append_completed_result(out: &mut String, event: &RunEventProjection) {
     let result = event.payload.get("result").unwrap_or(&Value::Null);
-    if let Some(summary) = result.get("summary").and_then(Value::as_str) {
-        return summary.to_string();
-    }
     if let Some(summary) = result.as_str() {
-        return summary.to_string();
+        append_text_block(out, summary);
+        return;
     }
-    pretty_json(result)
+    let summary = result.get("summary").and_then(Value::as_str);
+    if let Some(summary) = summary {
+        append_text_block(out, summary);
+    }
+    let has_other_fields = result
+        .as_object()
+        .is_none_or(|fields| fields.keys().any(|key| key != "summary"));
+    if summary.is_none() || has_other_fields {
+        out.push_str("\n```json\n");
+        out.push_str(&pretty_json(result));
+        out.push_str("\n```\n");
+    }
+}
+
+/// Prints worker-written text verbatim in a fenced block. The fence is longer than every backtick
+/// run in the text, so by the CommonMark rule the text can neither close the block nor add
+/// headings or a verdict around it. JSON blocks need no such fence: serialized strings escape
+/// line breaks, so no JSON line can start with a fence.
+fn append_text_block(out: &mut String, text: &str) {
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    out.push_str(&format!("\n{fence}text\n{text}\n{fence}\n"));
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -1434,5 +1458,7 @@ fn path_not_available(path: &str) -> TrackFsError {
     ))
 }
 
+#[cfg(test)]
+mod run_markdown_tests;
 #[cfg(test)]
 mod tests;

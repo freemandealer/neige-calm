@@ -11,7 +11,7 @@ fn assert_same_json_bytes<T: Serialize>(new_value: &T, old_value: &Value) {
     assert_eq!(pretty_json(new_value), pretty_json(old_value));
 }
 
-fn test_card(id: &str, kind: &str, payload: Value) -> Card {
+pub(super) fn test_card(id: &str, kind: &str, payload: Value) -> Card {
     Card {
         id: CardId::from(id),
         track_id: TrackId::from("track-test"),
@@ -26,7 +26,12 @@ fn test_card(id: &str, kind: &str, payload: Value) -> Card {
     }
 }
 
-fn run_event(event_id: i64, at: i64, kind: &'static str, payload: Value) -> RunEventProjection {
+pub(super) fn run_event(
+    event_id: i64,
+    at: i64,
+    kind: &'static str,
+    payload: Value,
+) -> RunEventProjection {
     RunEventProjection {
         event_id,
         at,
@@ -127,7 +132,7 @@ fn old_hook_events_json(events: &[HookEventProjection]) -> Vec<Value> {
         .collect()
 }
 
-fn run_with_verdict_and_events() -> RunProjection {
+pub(super) fn run_with_verdict_and_events() -> RunProjection {
     let worker_card = test_card(
         "card-worker",
         "codex",
