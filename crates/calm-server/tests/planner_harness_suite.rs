@@ -117,3 +117,9 @@ mod track_mail_fixture;
 
 #[path = "cases/planner_compact.rs"]
 mod planner_compact;
+
+#[path = "cases/planner_turn_budget.rs"]
+mod planner_turn_budget;
+
+#[path = "cases/planner_timeout.rs"]
+mod planner_timeout;

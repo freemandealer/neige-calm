@@ -357,7 +357,7 @@ event_id: number | null, };
  * How one segment of a harness `userMessage` should be presented to a human. The rendered English
  * is not a protocol: wording changes must not turn a system update into something the UI attributes to the user.
  */
-export type HarnessInputPresentation = "user" | "system" | "system_worker_turn_finished" | "system_report_edited" | "system_task_completed" | "system_task_failed" | "system_mail";
+export type HarnessInputPresentation = "user" | "system" | "system_worker_turn_finished" | "system_report_edited" | "system_task_completed" | "system_task_failed" | "system_mail" | "system_planner_turn_budget";
 
 /**
  * One observation in the exact order and wording sent to `turn/start`.
@@ -371,9 +371,16 @@ attachments: Array<PlannerAttachment>,
  * The queue entry this segment was built from. Every segment a turn issues or a steer
  * delivers carries one. Absent only on rows written before #2206 and on the echo of a
  * turn an older binary had in flight (its segments were restored from that binary's
- * snapshot, which has no queue entry to name).
+ * snapshot, which has no queue entry to name). Trusted per-turn budget segments also
+ * have no queue entry: their owner is the persisted start attempt.
  */
 origin?: HarnessInputOrigin, };
+
+/**
+ * Kernel-owned cause recorded only for a confirmed interrupted turn.
+ * This metadata is separate from the provider's original error payload.
+ */
+export type HarnessInterruptionReason = "max_turn_duration";
 
 export type HarnessItem = { id: number, worker_session_id: string, card_id: CardId, track_id: TrackId, thread_id: string, turn_id: string | null, item_uuid: string | null, item_type: string | null, method: string, params: string, input_segments?: Array<HarnessInputSegment>, created_at_ms: number, 
 /**
@@ -412,6 +419,16 @@ export type HarnessPhaseTag = "pending_thread_start" | "idle" | "issuing_turn" |
  * What happened to one entry in the harness pending queue.
  */
 export type HarnessQueueChange = "edited" | "deleted" | "steered" | "restored" | "dropped";
+
+/**
+ * Written exclusively at the kernel terminal-outcome boundary after confirmation.
+ */
+export type HarnessTimeoutEvidence = { "version": "v1", request: HarnessTimeoutRequest, ended_at_ms: number, };
+
+/**
+ * All facts are sampled by the watchdog before issuing the interrupt.
+ */
+export type HarnessTimeoutRequest = { session_id: string, card_id: string, track_id: string, thread_id: string, turn_id: string, reason: HarnessInterruptionReason, requested_at_ms: number, effective_elapsed_ms: number, budget_ms: number, };
 
 /**
  * `POST /api/read-receipts/{kind}/{target_id}/read`: the activity instant the reader has seen.

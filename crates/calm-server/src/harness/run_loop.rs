@@ -37,7 +37,7 @@ use crate::harness::snapshot::{HarnessPhaseTag, HarnessSnapshot, IssuedInputSegm
 use crate::harness::state::{HarnessState, IssuingKind, RunningTurn, run_status_for};
 use crate::harness::token_usage::TokenUsage;
 use crate::ids::{ActorId, CardId, TrackId};
-use crate::model::HarnessInputSegment;
+use crate::model::{HarnessInputPresentation, HarnessInputSegment};
 use crate::planner_attachments::bind::BoundAttachment;
 use crate::planner_model::{FailureKind, TurnModelSelection};
 use crate::planner_permission_mode::PlannerPermissionMode;
@@ -268,6 +268,7 @@ pub(super) struct Inner {
     /// The last watchdog tick that saw the table hold a request; `None` while it holds none.
     watchdog_held_since: Mutex<Option<Instant>>,
     abort_handle: StdMutex<Option<AbortHandle>>,
+    turn_budget: Mutex<budget::FrozenBudget>,
     config: HarnessConfig,
 }
 
@@ -1277,6 +1278,7 @@ fn inner_from_params(
         held_request_sender,
         watchdog_held_since: Mutex::new(None),
         abort_handle: StdMutex::new(None),
+        turn_budget: Mutex::new(snapshot.turn_budget),
         config: params.config,
     });
     (inner, announce_first)
@@ -1758,6 +1760,7 @@ async fn restore_steered_entries_codex_dropped(
     inner: &Arc<Inner>,
     turn_id: &str,
 ) -> Vec<QueueEntryId> {
+    budget::settle_projection(inner).await;
     let steered = std::mem::take(&mut *inner.steered_into_running_turn.lock().await);
     if steered.is_empty() {
         return Vec::new();
@@ -3206,6 +3209,15 @@ async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         );
         return Ok(());
     }
+    // Refuse corrupt settings before transcript refresh/diff. Keep the queue intact and use
+    // the same visible, paced refusal as other issuance prerequisites.
+    let sampled_budget = match budget::sample(inner).await {
+        Ok(budget) => budget,
+        Err(failure) => {
+            apply_refusal(inner, &failure).await;
+            return Ok(());
+        }
+    };
     // Two independent per-turn decisions: `skip_transcript_refresh` skips the track-level WRITE
     // transaction; `skip_track_diff` issues with no since-last-turn block. An area chat skips both;
     // a track assistant skips only the refresh (it cannot read transcripts; the diff IS its context).
@@ -3333,6 +3345,7 @@ async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
     )
     .await?;
 
+    let timeout_notice = timeout_notice::previous(inner).await?;
     let prior_turn = {
         let mut state = inner.state.lock().await;
         if !state.can_issue_turn() {
@@ -3380,6 +3393,14 @@ async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         *slot = Some(key.clone());
         key
     };
+    *inner.turn_budget.lock().await = match sampled_budget {
+        Some(budget) => budget::FrozenBudget::Planner {
+            budget,
+            start_attempt: client_id.clone(),
+            warning_attempted: false,
+        },
+        None => budget::FrozenBudget::NotApplicable,
+    };
     persist_snapshot(inner).await?;
 
     let drained = {
@@ -3407,6 +3428,16 @@ async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         &mut segments,
     )
     .await;
+
+    // Entry-index consumers must finish before adding kernel-owned context.
+    if let Some(budget) = sampled_budget {
+        let mut context = budget::segment(budget.initial_input());
+        context.presentation = HarnessInputPresentation::SystemPlannerTurnBudget;
+        segments.insert(0, context);
+    }
+    if let Some(notice) = timeout_notice {
+        segments.insert(0, notice);
+    }
 
     // The channel statement is the batch's, appended once here; same flag as `report_patch`.
     append_report_edit_batch_channel_line(&mut segments, report_edits_carry_diffs);
@@ -3867,6 +3898,7 @@ async fn watchdog_tick(inner: &Arc<Inner>) -> Result<()> {
         return Ok(());
     }
 
+    let turn_limit = budget::limit(inner).await;
     let should_interrupt = {
         let state = inner.state.lock().await;
         match &*state {
@@ -3874,9 +3906,7 @@ async fn watchdog_tick(inner: &Arc<Inner>) -> Result<()> {
                 turn_id,
                 watchdog_from,
                 ..
-            } if Instant::now().duration_since(*watchdog_from)
-                >= inner.config.max_turn_duration =>
-            {
+            } if Instant::now().duration_since(*watchdog_from) >= turn_limit => {
                 Some(turn_id.clone())
             }
             _ => None,
@@ -3884,6 +3914,8 @@ async fn watchdog_tick(inner: &Arc<Inner>) -> Result<()> {
     };
     if let Some(turn_id) = should_interrupt {
         issue_interrupt_for_turn(inner, turn_id, "max_turn_duration".into()).await?;
+    } else {
+        budget::warn(inner).await?;
     }
     Ok(())
 }
@@ -3942,10 +3974,44 @@ async fn issue_interrupt_for_turn(
             return Ok(());
         }
         *inner.issued_turn_id.lock().await = None;
-        if let Some(intent) =
-            calm_types::harness::HarnessInterruptionIntent::from_request(&target_turn_id, &reason)
-        {
-            *inner.interruption_intent.lock().await = Some(intent);
+        if reason == "max_turn_duration" {
+            use calm_types::harness::{
+                HarnessInterruptionIntent, HarnessInterruptionReason, HarnessTimeoutIntent,
+                HarnessTimeoutRequest,
+            };
+            if let HarnessState::TurnRunning {
+                turn_id,
+                watchdog_from,
+                ..
+            } = &*state
+                && turn_id == &target_turn_id
+            {
+                let request = HarnessTimeoutRequest {
+                    session_id: inner.worker_session_id.clone(),
+                    card_id: inner.card_id.to_string(),
+                    track_id: inner.track_id.to_string(),
+                    thread_id: thread_id.clone(),
+                    turn_id: target_turn_id.clone(),
+                    reason: HarnessInterruptionReason::MaxTurnDuration,
+                    requested_at_ms: crate::model::now_ms(),
+                    effective_elapsed_ms: watchdog_from
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .expect("elapsed fits u64"),
+                    budget_ms: budget::limit(inner)
+                        .await
+                        .as_millis()
+                        .try_into()
+                        .expect("budget fits u64"),
+                };
+                *inner.interruption_intent.lock().await = Some(
+                    HarnessInterruptionIntent::Versioned(HarnessTimeoutIntent::V1(request)),
+                );
+            }
+        } else {
+            // A later manual stop supersedes any earlier unconfirmed timeout request.
+            *inner.interruption_intent.lock().await = None;
         }
         *state = HarnessState::Issuing {
             since: Instant::now(),
@@ -3993,6 +4059,7 @@ async fn snapshot_from_state(inner: &Arc<Inner>, state: &HarnessState) -> Harnes
     let token_usage = inner.token_usage.lock().await.clone();
     let mut snapshot = HarnessSnapshot::from_state(
         state,
+        inner.turn_budget.lock().await.clone(),
         push_watermark,
         entries,
         last_thread_id,
@@ -4076,7 +4143,7 @@ async fn clear_interruption_intent(inner: &Arc<Inner>, turn_id: &str) {
     let mut intent = inner.interruption_intent.lock().await;
     if intent
         .as_ref()
-        .is_some_and(|intent| intent.turn_id == turn_id)
+        .is_some_and(|intent| intent.turn_id() == turn_id)
     {
         *intent = None;
     }
@@ -4105,6 +4172,11 @@ async fn persist_turn_outcome(inner: &Arc<Inner>, turn_id: &str, turn: &Value) -
         &thread_id,
         turn_id,
         turn,
+        if inner.backend.terminal_event_confirms_stop() {
+            crate::harness::turn_outcome::Confirmation::ProviderTerminal
+        } else {
+            crate::harness::turn_outcome::Confirmation::Unconfirmed
+        },
     )
     .await
     {
@@ -4592,6 +4664,7 @@ mod tests {
     }
 }
 
+pub(crate) mod budget;
 mod compact_command;
 #[cfg(test)]
 mod compact_tests;
@@ -4599,6 +4672,7 @@ mod held;
 mod live_reply;
 mod native_ask;
 mod replace_command;
+mod timeout_notice;
 mod turn_permission;
 
 #[cfg(test)]

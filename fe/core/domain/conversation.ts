@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import type {
   AgentProvider, HarnessInputPresentation, HarnessInputSegment, HarnessItem, HarnessPhaseTag,
+  HarnessInterruptionReason, HarnessTimeoutEvidence,
   PlannerAttachment, PlannerPermissionMode, TrackConversationSummary, UploadAttachmentResponse,
 } from '../api/generated/wire.js';
 import type { ApiFailure, ApiOperation } from '../api/types.js';
@@ -138,8 +139,8 @@ export type ConversationSystemEntry = Readonly<{
   text: string;
   atMs: number;
   /**
-   * Set when this report-edit observation was the WHOLE of its batch (the kernel's definition of a
-   * background sync). Never `false`.
+   * Set on every segment of a report-only batch, including its regenerable budget context.
+   * A budget alone is not a background sync. Never `false`.
    */
   quiet?: true;
 }>;
@@ -154,6 +155,7 @@ const harnessInputPresentationSchema: z.ZodType<HarnessInputPresentation> = z.en
   'system_task_completed',
   'system_task_failed',
   'system_mail',
+  'system_planner_turn_budget',
 ]);
 
 const plannerAttachmentSchema: z.ZodType<PlannerAttachment> = z.object({
@@ -853,6 +855,7 @@ Record<Exclude<HarnessInputPresentation, 'user'>, string>
   system_task_completed: 'Task completed',
   system_task_failed: 'Task failed',
   system_mail: 'Mail',
+  system_planner_turn_budget: 'Planner turn budget',
 });
 
 /* Live data uses the camelCase spellings; snake_case is accepted as a precaution since the kernel
@@ -950,9 +953,10 @@ export function harnessItemToTurns(item: HarnessItem): readonly ConversationMess
     }
     const atMs = typeof completedAtMs === 'number' && Number.isFinite(completedAtMs)
       ? completedAtMs : item.created_at_ms;
-    /* A background sync only when the batch is nothing but report edits — a fact about the batch,
-       not any one segment. */
-    const quiet = segments.every((segment) => segment.presentation === 'system_report_edited');
+    /* Regenerable context is not a wakeup. At least one real report edit must remain. */
+    const observations = segments.filter((segment) => segment.presentation !== 'system_planner_turn_budget');
+    const quiet = observations.length > 0
+      && observations.every((segment) => segment.presentation === 'system_report_edited');
     return segments.flatMap<ConversationMessage>((segment, index) => {
       const text = inputSegmentText(segment);
       const attachments = segment.attachments;
@@ -999,6 +1003,11 @@ export function harnessItemToTurns(item: HarnessItem): readonly ConversationMess
   }];
 }
 
+/** The decoder's exact structured presentation label, never inferred from input text. */
+export function isPlannerBudgetContext(entry: TranscriptEntry): entry is ConversationSystemEntry {
+  return entry.author === 'system' && entry.label === SYSTEM_PRESENTATION_LABELS.system_planner_turn_budget;
+}
+
 /* What the agent did between two things it said: one line each, a verb and its target.
    The kernel persists both `item/started` and `item/completed`, so the running state is real data. */
 export type ActivityState = 'running' | 'done' | 'failed';
@@ -1039,6 +1048,8 @@ export type ConversationTurnOutcome = Readonly<{
   text?: string;
   /** `error.codexErrorInfo` as one token: the bare enum string or, for the object form, its single key. */
   code?: string;
+  /** Protected kernel metadata, separate from provider error/code. Unknown shapes are ignored without losing the outcome. */
+  harnessInterruption?: HarnessInterruptionReason | HarnessTimeoutEvidence;
   /**
    * The wire `status` when it was not one of the three above; such a row is surfaced as `failed`
    * rather than dropped.
@@ -1241,7 +1252,22 @@ const turnOutcomeParamsSchema = z.object({
     codexErrorInfo: z.union([z.string(), z.record(z.string(), z.unknown())]).nullish().catch(undefined),
   }).nullish().catch(undefined),
   durationMs: z.unknown().optional(),
+  harness_interruption_reason: z.unknown().optional(),
 });
+
+/** The released cause-only string and complete v1 proof; never read unprotected `harness_timeout`. */
+const harnessInterruptionSchema = z.union([
+  z.literal('max_turn_duration'),
+  z.object({
+    version: z.literal('v1'),
+    request: z.strictObject({
+      session_id: z.string(), card_id: z.string(), track_id: z.string(), thread_id: z.string(), turn_id: z.string(),
+      reason: z.literal('max_turn_duration'), requested_at_ms: z.number().int(),
+      effective_elapsed_ms: z.number().int().nonnegative(), budget_ms: z.number().int().nonnegative(),
+    }),
+    ended_at_ms: z.number().int(),
+  }),
+]);
 
 /** A recorded duration only when it is a finite, non-negative integer; anything else is unknown, not 0. */
 function recordedDurationMs(value: unknown): number | null {
@@ -1272,12 +1298,15 @@ export function transcriptRowToTurnOutcome(item: HarnessItem): ConversationTurnO
   if (turnId === undefined) return null;
   const message = error?.message;
   const code = codexErrorCode(error?.codexErrorInfo);
+  const interruption = wireStatus === 'interrupted'
+    ? harnessInterruptionSchema.safeParse(result.data.harness_interruption_reason) : null;
   const base = {
     id: `outcome-${item.id}`, author: 'turn' as const, turnId, atMs: item.created_at_ms,
     elapsedMs: recordedDurationMs(durationMs),
     ...(message === undefined ? {} : { message }),
     ...(item.turn_error_text === null ? {} : { text: item.turn_error_text }),
     ...(code === undefined ? {} : { code }),
+    ...(interruption?.success ? { harnessInterruption: interruption.data } : {}),
   };
   if (wireStatus === 'completed' || wireStatus === 'interrupted' || wireStatus === 'failed') {
     return { ...base, status: wireStatus };
