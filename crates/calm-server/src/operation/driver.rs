@@ -347,6 +347,20 @@ impl OperationRuntime {
         self.repo.operation_result(op_id).await
     }
 
+    /// The `kind` operation `op_id` when its stored target is `track_id`; `None` alike for an
+    /// unknown id, another kind and another Track, so a caller cannot tell them apart. The scope
+    /// is applied in the query, so an out-of-scope row is never decoded.
+    pub async fn operation_on_track(
+        &self,
+        op_id: &str,
+        kind: &str,
+        track_id: &str,
+    ) -> Result<Option<Operation>> {
+        self.repo
+            .get_operation_on_track(op_id, kind, track_id)
+            .await
+    }
+
     pub async fn cancel_parked(&self, op_id: &OperationId, reason: &str) -> Result<bool> {
         let Some(op) = self.repo.claim_parked(op_id).await? else {
             return Ok(false);
