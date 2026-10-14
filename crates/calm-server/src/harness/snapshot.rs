@@ -131,6 +131,15 @@ pub struct HarnessSnapshot {
     /// whereas a bump would turn a lossless rollback into a boot panic.
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// Additive maintenance facts; historical snapshots have no confirmed operation.
+    #[serde(default)]
+    pub compact_outcome: Option<super::compact_outcome::CompactOutcome>,
+    /// Preserve lifetime totals internally, but do not expose this reading as current occupancy.
+    #[serde(default)]
+    pub context_usage_invalidated: bool,
+    /// Latest user turn at invalidation; maintenance ids must never be used as this watermark.
+    #[serde(default)]
+    pub context_usage_invalidated_turn: Option<String>,
     /// A rewind (#1923) the provider applies when the next turn starts, cleared once a turn has
     /// started. Additive and defaulted with no `schema_version` bump, for `token_usage`'s reason: a
     /// rolled-back binary ignores the key (its next turn keeps the removed turn in the provider's
@@ -151,6 +160,25 @@ pub struct TurnBase {
 }
 
 impl HarnessSnapshot {
+    /// Loading cannot confirm a maintenance operation whose provider completion was not observed.
+    pub fn restore_context_feedback(&mut self) {
+        if let Some(outcome) = self.compact_outcome.as_mut()
+            && outcome.status == super::compact_outcome::CompactStatus::Started
+        {
+            outcome.status = super::compact_outcome::CompactStatus::Unconfirmed;
+        }
+    }
+
+    pub fn has_context_feedback(&self) -> bool {
+        self.compact_outcome.is_some() || self.context_usage_invalidated
+    }
+
+    pub fn visible_context_usage(&self) -> Option<&TokenUsage> {
+        self.token_usage
+            .as_ref()
+            .filter(|_| !self.context_usage_invalidated)
+    }
+
     pub fn initial(push_watermark: i64, entries: Vec<QueueEntry>) -> Self {
         let mut snapshot = Self {
             schema_version: HARNESS_SNAPSHOT_SCHEMA_VERSION,
@@ -171,6 +199,9 @@ impl HarnessSnapshot {
             wedged_reason: None,
             interruption_intent: None,
             token_usage: None,
+            compact_outcome: None,
+            context_usage_invalidated: false,
+            context_usage_invalidated_turn: None,
             pending_rewind: None,
             last_turn_base: None,
         };
@@ -209,6 +240,9 @@ impl HarnessSnapshot {
             projection_client_id: None,
             // Set by `snapshot_for` from `Inner`; `from_state` sees only `HarnessState`.
             token_usage: None,
+            compact_outcome: None,
+            context_usage_invalidated: false,
+            context_usage_invalidated_turn: None,
             pending_rewind: None,
             last_turn_base: None,
             wedged_reason,

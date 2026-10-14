@@ -186,6 +186,10 @@ pub(super) struct Inner {
     observations: ObservationIngress,
     state: Mutex<HarnessState>,
     last_phase: Mutex<HarnessPhaseTag>,
+    last_context_feedback: Mutex<(
+        Option<crate::harness::compact_outcome::CompactOutcome>,
+        bool,
+    )>,
     pending_queue: Mutex<VecDeque<QueueEntry>>,
     recent_hook_keys: Mutex<VecDeque<String>>,
     recent_hook_key_set: Mutex<HashSet<String>>,
@@ -203,6 +207,9 @@ pub(super) struct Inner {
     last_seen_head: Mutex<Option<track_vcs::CommitHash>>,
     /// Latest context-window reading from `thread/tokenUsage/updated`; latest-wins.
     token_usage: Mutex<Option<TokenUsage>>,
+    compact_outcome: Mutex<Option<crate::harness::compact_outcome::CompactOutcome>>,
+    maintenance_turns: Mutex<HashSet<String>>,
+    context_usage_invalidation: Mutex<Option<compact_command::UsageInvalidation>>,
     /// See `HarnessSnapshot::pending_rewind`; `maybe_issue_turn` hands it to the next `turn/start`
     /// and clears it once that returns `Ok`.
     pending_rewind: Mutex<Option<BackendRewind>>,
@@ -1191,6 +1198,7 @@ fn inner_from_params(
     let announce_first = !dropped_on_load.is_empty();
     let pending_queue: VecDeque<_> = snapshot.pending_entries().into_iter().collect();
     let debounce = debounce_from_initial_queue(&pending_queue);
+    snapshot.restore_context_feedback();
     let state = state_from_snapshot(&snapshot);
     let last_phase = snapshot.phase;
     let (recent_hook_keys, recent_hook_key_set) =
@@ -1212,6 +1220,10 @@ fn inner_from_params(
         observations,
         state: Mutex::new(state),
         last_phase: Mutex::new(last_phase),
+        last_context_feedback: Mutex::new((
+            snapshot.compact_outcome.clone(),
+            snapshot.context_usage_invalidated,
+        )),
         pending_queue: Mutex::new(pending_queue),
         recent_hook_keys: Mutex::new(recent_hook_keys),
         recent_hook_key_set: Mutex::new(recent_hook_key_set),
@@ -1227,6 +1239,20 @@ fn inner_from_params(
         // Round-trips through the snapshot: codex only re-pushes it on the next model response, so a
         // resumed-but-idle thread would otherwise read as having no context usage.
         token_usage: Mutex::new(snapshot.token_usage),
+        maintenance_turns: Mutex::new(
+            snapshot
+                .compact_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.turn_id.clone())
+                .into_iter()
+                .collect(),
+        ),
+        compact_outcome: Mutex::new(snapshot.compact_outcome),
+        context_usage_invalidation: Mutex::new(snapshot.context_usage_invalidated.then_some(
+            compact_command::UsageInvalidation {
+                user_turn_id: snapshot.context_usage_invalidated_turn,
+            },
+        )),
         pending_rewind: Mutex::new(snapshot.pending_rewind),
         last_turn_base: Mutex::new(snapshot.last_turn_base),
         rewound_turns: Mutex::new(HashSet::new()),
@@ -2029,14 +2055,14 @@ async fn on_notification(
         return Ok(());
     }
 
-    let maintenance_turn = match &*inner.state.lock().await {
-        HarnessState::CompactionRunning { turn_id, .. } => Some(turn_id.clone()),
-        _ => None,
+    let maintenance_item = match &kind {
+        PlannerEventKind::Item { params, .. } | PlannerEventKind::PlanUpdated { params } => {
+            let turns = inner.maintenance_turns.lock().await;
+            item_turn_id(params).is_some_and(|turn| turns.contains(turn))
+        }
+        _ => false,
     };
-    if let Some(turn_id) = maintenance_turn
-        && matches!(&kind, PlannerEventKind::Item { params, .. } | PlannerEventKind::PlanUpdated { params }
-            if item_turn_id(params) == Some(turn_id.as_str()))
-    {
+    if maintenance_item {
         // Maintenance items are not conversational history. Recording them would put another
         // turn after the latest user reply and prevent that reply's normal edit/rewind.
         return persist_snapshot(inner).await;
@@ -2062,6 +2088,11 @@ async fn on_notification(
             }
         }
         PlannerEventKind::ThreadSystemError => {
+            compact_command::settle(
+                inner,
+                crate::harness::compact_outcome::CompactStatus::Unconfirmed,
+            )
+            .await;
             *inner.state.lock().await = HarnessState::Wedged {
                 since: Instant::now(),
                 reason: HARNESS_SYSTEM_ERROR_REASON.into(),
@@ -2087,7 +2118,22 @@ async fn on_notification(
                 HarnessState::TurnRunning {
                     turn_id: active, ..
                 } => active == &turn_id,
-                HarnessState::Compacting { .. } => last_seen.as_deref() != Some(turn_id.as_str()),
+                HarnessState::Compacting { .. } => {
+                    // Fresh provider streams deliver one ordered start per operation, before
+                    // completion. Only an unbound current intent may accept that start.
+                    last_seen.as_deref() != Some(turn_id.as_str())
+                        && !inner.maintenance_turns.lock().await.contains(&turn_id)
+                        && inner
+                            .compact_outcome
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_some_and(|outcome| {
+                                outcome.status
+                                    == crate::harness::compact_outcome::CompactStatus::Started
+                                    && outcome.turn_id.is_none()
+                            })
+                }
                 HarnessState::Idle => last_seen.is_none(),
                 HarnessState::Resumed { .. } => last_seen.as_deref() == Some(turn_id.as_str()),
                 _ => false,
@@ -2105,6 +2151,10 @@ async fn on_notification(
             }
             if matches!(state_snap, HarnessState::Compacting { .. }) {
                 // Compaction has no user message: retain the user's latest turn for editing.
+                inner.maintenance_turns.lock().await.insert(turn_id.clone());
+                if let Some(outcome) = inner.compact_outcome.lock().await.as_mut() {
+                    outcome.turn_id = Some(turn_id.clone());
+                }
                 *inner.state.lock().await = HarnessState::CompactionRunning {
                     turn_id,
                     started_at: Instant::now(),
@@ -2115,6 +2165,16 @@ async fn on_notification(
                 &state_snap,
                 HarnessState::TurnRunning { turn_id: active, .. } if active == &turn_id
             );
+            let new_user_start = matches!(
+                state_snap,
+                HarnessState::Issuing {
+                    kind: IssuingKind::TurnStart,
+                    ..
+                }
+            ) || last_seen.as_deref() != Some(turn_id.as_str());
+            if !already_running_same && new_user_start {
+                *inner.compact_outcome.lock().await = None;
+            }
             *inner.last_turn_id.lock().await = Some(turn_id.clone());
             live.turn_started(&turn_id);
             if !already_running_same {
@@ -2130,6 +2190,21 @@ async fn on_notification(
                 if turn.get("id").and_then(Value::as_str) != Some(turn_id.as_str()) {
                     return Ok(());
                 }
+                use crate::harness::compact_outcome::CompactStatus;
+                let status = match turn.get("status").and_then(Value::as_str) {
+                    Some("completed") => CompactStatus::Completed,
+                    Some("interrupted") => CompactStatus::Interrupted,
+                    Some("failed") => CompactStatus::Failed,
+                    _ => CompactStatus::Unconfirmed,
+                };
+                if status == CompactStatus::Completed {
+                    compact_command::invalidate_usage(
+                        inner,
+                        inner.last_turn_id.lock().await.clone(),
+                    )
+                    .await;
+                }
+                compact_command::settle(inner, status).await;
                 *inner.state.lock().await = match turn.get("status").and_then(Value::as_str) {
                     Some("completed" | "interrupted") => HarnessState::TurnCompleted {
                         last_turn_id: inner
@@ -2147,6 +2222,11 @@ async fn on_notification(
                 };
                 // A provider maintenance turn must not become the result of the user's previous prompt.
                 return persist_snapshot(inner).await;
+            }
+            if let Some(turn) = turn.get("id").and_then(Value::as_str)
+                && inner.maintenance_turns.lock().await.contains(turn)
+            {
+                return Ok(());
             }
             let fallback_turn_id = inner.last_turn_id.lock().await.clone();
             let turn_id = turn
@@ -2246,6 +2326,23 @@ async fn on_notification(
         PlannerEventKind::TurnAborted {
             turn_id: aborted_turn_id,
         } => {
+            if matches!(&*inner.state.lock().await, HarnessState::CompactionRunning { turn_id, .. } if turn_id == &aborted_turn_id)
+            {
+                compact_command::settle(
+                    inner,
+                    crate::harness::compact_outcome::CompactStatus::Interrupted,
+                )
+                .await;
+                *inner.state.lock().await = HarnessState::TurnCompleted {
+                    last_turn_id: inner
+                        .last_turn_id
+                        .lock()
+                        .await
+                        .clone()
+                        .expect("compaction requires history"),
+                };
+                return persist_snapshot(inner).await;
+            }
             let interrupt_target = {
                 let state = inner.state.lock().await;
                 match &*state {
@@ -2463,10 +2560,46 @@ async fn on_notification(
             // event would append a track-vcs commit per plan frame. `harness_items` is out-of-domain
             // storage, so a row without an event is legal here.
         }
-        // `thread/tokenUsage/updated`: `tokenUsage.total` is a LIFETIME sum and routinely exceeds the
-        // window; `tokenUsage.last` is the occupancy proxy. Storage is the runtime snapshot (latest-wins).
-        // The prologue's thread-id check is the only thing keeping card A's meter from showing card B's.
+        PlannerEventKind::ContextReplaced { turn_id } => {
+            let last_user = inner.last_turn_id.lock().await.clone();
+            let maintenance = inner
+                .compact_outcome
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|outcome| outcome.turn_id.clone());
+            if inner.state.lock().await.accepts_context_boundary(
+                &turn_id,
+                last_user.as_deref(),
+                maintenance.as_deref(),
+            ) {
+                compact_command::invalidate_usage(inner, last_user).await;
+            }
+        }
+        // Lifetime billing is retained even when same-turn occupancy is invalid.
         PlannerEventKind::TokenUsage { params } => {
+            let reading_turn = item_turn_id(&params);
+            if matches!(
+                &*inner.state.lock().await,
+                HarnessState::Compacting { .. } | HarnessState::CompactionRunning { .. }
+            ) {
+                return Ok(());
+            }
+            let mut preserve_invalidation = false;
+            if let Some(invalidation) = inner.context_usage_invalidation.lock().await.as_ref() {
+                let last = inner.last_turn_id.lock().await.clone();
+                if reading_turn.is_none() || reading_turn != last.as_deref() {
+                    return Ok(());
+                }
+                // A normal turn's result after an automatic boundary still carries its billed
+                // lifetime total. Keep that for restart, without treating its occupancy proxy as
+                // retained context. Manual maintenance usage never reaches this branch.
+                preserve_invalidation = reading_turn == invalidation.user_turn_id.as_deref();
+            } else if reading_turn.is_none()
+                || reading_turn != inner.last_turn_id.lock().await.as_deref()
+            {
+                return Ok(());
+            }
             match TokenUsage::from_params(&params, crate::model::now_ms()) {
                 Some(incoming) => {
                     let mut slot = inner.token_usage.lock().await;
@@ -2486,6 +2619,9 @@ async fn on_notification(
                         );
                     }
                     *slot = Some(merged);
+                    if !preserve_invalidation {
+                        *inner.context_usage_invalidation.lock().await = None;
+                    }
                 }
                 // A frame without a usable `last.totalTokens` yields no reading; storing a zero would claim
                 // an empty context, so the previous reading is left in place.
@@ -3685,6 +3821,11 @@ async fn watchdog_tick(inner: &Arc<Inner>) -> Result<()> {
         HarnessState::Compacting { since } if since.elapsed() >= inner.config.interrupt_completion_budget)
         || matches!(&*inner.state.lock().await, HarnessState::CompactionRunning { started_at, .. } if started_at.elapsed() >= inner.config.max_turn_duration);
     if compact_timed_out {
+        compact_command::settle(
+            inner,
+            crate::harness::compact_outcome::CompactStatus::Unconfirmed,
+        )
+        .await;
         *inner.state.lock().await = HarnessState::Wedged {
             since: Instant::now(),
             reason: "Compaction did not report a start; reset the conversation to continue.".into(),
@@ -3862,6 +4003,12 @@ async fn snapshot_from_state(inner: &Arc<Inner>, state: &HarnessState) -> Harnes
     snapshot.issued_turn_head = issued_turn_head;
     snapshot.projection_client_id = projection_client_id;
     snapshot.token_usage = token_usage;
+    snapshot.compact_outcome = inner.compact_outcome.lock().await.clone();
+    let invalidation = inner.context_usage_invalidation.lock().await;
+    snapshot.context_usage_invalidated = invalidation.is_some();
+    snapshot.context_usage_invalidated_turn = invalidation
+        .as_ref()
+        .and_then(|fact| fact.user_turn_id.clone());
     snapshot.interruption_intent = inner.interruption_intent.lock().await.clone();
     snapshot.pending_rewind = inner.pending_rewind.lock().await.clone();
     snapshot.last_turn_base = inner.last_turn_base.lock().await.clone();
@@ -4121,8 +4268,14 @@ async fn persist_snapshot_inner(
     })
     .await?;
 
+    let feedback = (
+        inner.compact_outcome.lock().await.clone(),
+        inner.context_usage_invalidation.lock().await.is_some(),
+    );
+    let mut last_feedback = inner.last_context_feedback.lock().await;
     let mut last_phase = inner.last_phase.lock().await;
-    if *last_phase != new_phase {
+    // Reuse the run-refresh event for changed maintenance facts, including a boundary within a turn.
+    if *last_phase != new_phase || *last_feedback != feedback {
         let old_phase = *last_phase;
         let scope = harness_event_scope(inner, "harness.phase.changed");
         if let Err(e) = inner
@@ -4158,6 +4311,7 @@ async fn persist_snapshot_inner(
             return Ok(written);
         }
         *last_phase = new_phase;
+        *last_feedback = feedback;
     }
     Ok(written)
 }
