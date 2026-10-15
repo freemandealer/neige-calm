@@ -400,25 +400,17 @@ fn lowers_gh_pr_checks() {
                     "false"
                 ]
             },
-            "parked": true
+            "parked": true,
+            "replay_any_version": true
         })
     };
-    let mut payload = payload;
-    let mut attempt_payload = attempt_payload;
-    for value in [&mut payload, &mut attempt_payload] {
-        assert_eq!(
-            value["compatible_payload_hashes"].as_array().unwrap().len(),
-            2
-        );
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("compatible_payload_hashes");
-    }
-    assert_eq!(payload, expected_payload("gh.pr.checks:owner/repo:42"));
+    assert_eq!(
+        payload,
+        expected_payload(r#"gh_pr_checks:v2:["owner/repo",42,null]"#)
+    );
     assert_eq!(
         attempt_payload,
-        expected_payload("gh.pr.checks:owner/repo:42:7")
+        expected_payload(r#"gh_pr_checks:v2:["owner/repo",42,"7"]"#)
     );
     assert!(
         payload["argv"][8] == PR_CHECKS_READ_SCRIPT,

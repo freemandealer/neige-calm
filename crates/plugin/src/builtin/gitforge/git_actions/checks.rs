@@ -132,16 +132,16 @@ pub(super) fn lower_gh_pr_checks(args: &Value) -> Result<Value, String> {
         Some(Value::Bool(value)) => *value,
         Some(_) => return Err("wait_for_all must be a boolean".into()),
     };
-    let mut idem_key = match attempt.as_deref() {
-        Some(attempt) => format!("gh.pr.checks:{repo}:{pr}:{attempt}"),
-        None => format!("gh.pr.checks:{repo}:{pr}"),
+    // `replay_any_version` replays by this key alone, so the key encodes every argument
+    // injectively in a versioned namespace no released version wrote. A row stored under a
+    // released key (`gh.pr.checks:{repo}:{pr}[:{attempt}]`, which is ambiguous, or
+    // `gh_pr_checks_all:[…]`) is never replayed.
+    let arguments = serde_json::to_string(&json!([repo, pr, attempt])).unwrap();
+    let idem_key = if wait_for_all {
+        format!("gh_pr_checks_all:v2:{arguments}")
+    } else {
+        format!("gh_pr_checks:v2:{arguments}")
     };
-    if wait_for_all {
-        idem_key = format!(
-            "gh_pr_checks_all:{}",
-            serde_json::to_string(&json!([repo, pr, attempt])).unwrap()
-        );
-    }
     let wait = vec![
         "sh".into(),
         "-c".into(),
@@ -203,12 +203,8 @@ pub(super) fn lower_gh_pr_checks(args: &Value) -> Result<Value, String> {
         })),
         true,
     )?;
-    if !wait_for_all {
-        payload["compatible_payload_hashes"] = json!([
-            checks_compat::predecessor_hash(&payload, &repo, pr)?,
-            checks_pre2363::hash(&payload, &repo, pr)?,
-        ]);
-    }
+    // An idempotent read: a same-key retry spanning a program change replays the stored operation.
+    payload["replay_any_version"] = json!(true);
     Ok(payload)
 }
 
