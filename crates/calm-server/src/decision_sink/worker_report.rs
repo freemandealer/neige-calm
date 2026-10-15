@@ -2,7 +2,7 @@
 use crate::db::sqlite::{TaskReporter, status_detail_class, task_get_tx, task_result_contract_tx};
 use crate::error::{CalmError, Result};
 use crate::event::{ArtifactRef, Event};
-use crate::git_candidate::commit_message::DeliveryMessage;
+use crate::git_candidate::commit_message::CommitMessage;
 use crate::git_candidate::delivery::AttemptOutcome;
 use crate::ids::TrackId;
 use crate::mcp_server::registry::ToolCallIdentity;
@@ -105,7 +105,7 @@ pub enum WorkerTaskReport {
         attempt_id: String,
         result: serde_json::Value,
         artifacts: Vec<ArtifactRef>,
-        commit_message: DeliveryMessage,
+        commit_message: Option<CommitMessage>,
     },
     /// `neige_task_fail`.
     Failed { attempt_id: String, reason: String },
@@ -142,18 +142,15 @@ impl WorkerTaskReport {
         }
     }
 
-    /// How the release in the report transaction commits the attempt (#1830 S2 D7).
+    /// Done's explicit input applies to a delivery commit; existing run commits keep their text.
     pub(super) fn release_delivery(&self) -> ReleaseDelivery {
         match self {
-            WorkerTaskReport::Completed {
-                commit_message: DeliveryMessage::Kernel,
-                ..
-            } => ReleaseDelivery::Commit(AttemptOutcome::Completed),
-            WorkerTaskReport::Completed {
-                commit_message: DeliveryMessage::Worker(message),
+            Self::Completed {
+                commit_message: Some(message),
                 ..
             } => ReleaseDelivery::CommitWorkerMessage(message.clone()),
-            WorkerTaskReport::Failed { .. } => ReleaseDelivery::Commit(AttemptOutcome::Failed),
+            Self::Completed { .. } => ReleaseDelivery::Commit(AttemptOutcome::Completed),
+            Self::Failed { .. } => ReleaseDelivery::Commit(AttemptOutcome::Failed),
         }
     }
 }
