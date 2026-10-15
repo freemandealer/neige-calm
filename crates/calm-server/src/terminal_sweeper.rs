@@ -1,5 +1,5 @@
 //! The terminal sweeper: one 30 s tick, four independent arms — the orphan arm reaps terminal rows whose card
-//! has no active worker session; the completed-track arm ends worker sessions still running on a closed track;
+//! has no active worker session; the settled-worker arm ends task-owned sessions after their attempts settle or their track closes;
 //! the Planner arm hibernates idle harnesses on closed tracks;
 //! the thread arm releases shared codex threads whose session ended (#1853).
 
@@ -69,19 +69,32 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// terminal-card create race; err on the side of "never reap a live terminal mid-create".
 const ORPHAN_GRACE_SECONDS: i64 = 60;
 
+/// Let a settled worker's reporting turn finish before ending its PTY.
+pub const SETTLED_WORKER_GRACE_MS: i64 = 60_000;
+
 /// Maximum time we wait for the daemon to accept a `Kill`; if it's hung, fall through to SIGTERM
 /// rather than block the sweep tick.
 const GRACEFUL_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The set the closed-track arm ends. `created_at_ms <=` keeps a session opened on an already-closed
-/// track out of the set; harness rows are outside structurally (never `running`, no `terminal_run_id`).
-pub const COMPLETED_TRACK_LIVE_SESSIONS_SQL: &str = "SELECT ws.id, ws.provider, ws.card_id, te.id AS terminal_id, ws.thread_id \
-       FROM worker_sessions ws JOIN tracks t ON t.id = ws.track_id \
-       JOIN terminals te ON te.id = ws.terminal_run_id AND te.exit_code IS NULL AND te.signal_killed = 0 \
-      WHERE ws.state = 'running' \
-        AND t.closed_at IS NOT NULL AND ws.created_at_ms <= t.closed_at \
-        AND NOT EXISTS (SELECT 1 FROM current_tasks ct WHERE ct.track_id = t.id AND ct.worker_card_id = ws.card_id \
-                          AND ct.status IN ('dispatched','running','verifying'))";
+/// Settled task-owned PTY workers, including resumable rows whose PTY already exited.
+/// Sixty seconds from the persisted task finish lets the reporting turn/response unwind;
+/// the 30 s tick then ends workers within 60–90 s. Missing finish timestamps fail closed.
+/// All attempts matter: a retry can supersede the owning attempt on another card.
+/// Also end pre-close PTYs on closed tracks; user PTYs on open tracks are excluded.
+/// Worker role excludes Planner sessions from both terms.
+pub const SETTLED_WORKER_SESSIONS_SQL: &str = "SELECT ws.id, ws.provider, ws.card_id, te.id AS terminal_id, ws.thread_id \
+       FROM worker_sessions ws JOIN cards c ON c.id = ws.card_id AND c.track_id = ws.track_id \
+       JOIN terminals te ON te.id = ws.terminal_run_id AND te.card_id = c.id \
+       JOIN tracks t ON t.id = ws.track_id \
+      WHERE ws.state = 'running' AND c.role = 'worker' \
+        AND ((t.closed_at IS NOT NULL AND ws.created_at_ms <= t.closed_at) \
+          OR EXISTS (SELECT 1 FROM tasks owner WHERE owner.track_id = ws.track_id AND owner.worker_card_id = ws.card_id \
+                      AND owner.status IN ('done','failed','canceled') \
+                      AND ws.created_at_ms <= owner.finished_at_ms \
+                      AND owner.finished_at_ms <= (CAST(strftime('%s','now') AS INTEGER) * 1000 \
+                          + CAST(substr(strftime('%f','now'),4,3) AS INTEGER)) - ?1)) \
+        AND NOT EXISTS (SELECT 1 FROM tasks active WHERE active.worker_card_id = ws.card_id \
+                          AND active.status IN ('dispatched','running','verifying'))";
 
 /// Spawn the sweeper task. Subscribes to no events; purely time-driven.
 pub fn spawn(state: AppState) {
@@ -98,7 +111,7 @@ pub fn spawn(state: AppState) {
     });
 }
 
-/// One sweep pass: the orphan arm, the completed-track arm, the Planner arm, then the thread arm; integration tests drive it without the interval task.
+/// One sweep pass: the orphan arm, the settled-worker arm, the Planner arm, then the thread arm; integration tests drive it without the interval task.
 pub async fn sweep(state: &AppState) -> Result<()> {
     let orphans = state.repo.terminals_orphaned(ORPHAN_GRACE_SECONDS).await?;
     if !orphans.is_empty() {
@@ -114,20 +127,20 @@ pub async fn sweep(state: &AppState) -> Result<()> {
         }
     }
 
-    let completed = completed_track_live_sessions(state).await?;
+    let completed = settled_worker_sessions(state).await?;
     if !completed.is_empty() {
         tracing::info!(
             count = completed.len(),
-            "terminal_sweeper: ending sessions left running on completed tracks"
+            "terminal_sweeper: ending sessions left running after task settlement"
         );
     }
     for session in completed {
-        if let Err(e) = end_completed_track_session(state, &session).await {
+        if let Err(e) = end_settled_worker_session(state, &session).await {
             tracing::warn!(
                 worker_session_id = %session.id,
                 terminal_id = %session.terminal_id,
                 error = %e,
-                "terminal_sweeper: ending a completed-track session failed (before the \
+                "terminal_sweeper: ending a settled-worker session failed (before the \
                  exited write: retried next tick; after it: the orphan arm converges)"
             );
         }
@@ -150,10 +163,10 @@ pub async fn sweep(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-/// One row of [`COMPLETED_TRACK_LIVE_SESSIONS_SQL`]. `pub` (fields too) so
-/// the test suite can hand [`end_completed_track_session`] a candidate that
+/// One row of [`SETTLED_WORKER_SESSIONS_SQL`]. `pub` (fields too) so
+/// the test suite can hand [`end_settled_worker_session`] a candidate that
 /// went stale between the set read and the action.
-pub struct CompletedTrackSession {
+pub struct SettledWorkerSession {
     pub id: String,
     pub provider: String,
     pub card_id: String,
@@ -163,16 +176,17 @@ pub struct CompletedTrackSession {
     pub thread_id: Option<String>,
 }
 
-async fn completed_track_live_sessions(state: &AppState) -> Result<Vec<CompletedTrackSession>> {
+async fn settled_worker_sessions(state: &AppState) -> Result<Vec<SettledWorkerSession>> {
     let Some(pool) = state.sqlite_pool() else {
         return Ok(Vec::new());
     };
-    let rows = sqlx::query(COMPLETED_TRACK_LIVE_SESSIONS_SQL)
+    let rows = sqlx::query(SETTLED_WORKER_SESSIONS_SQL)
+        .bind(SETTLED_WORKER_GRACE_MS)
         .fetch_all(&pool)
         .await?;
     Ok(rows
         .iter()
-        .map(|r| CompletedTrackSession {
+        .map(|r| SettledWorkerSession {
             id: r.get("id"),
             provider: r.get("provider"),
             card_id: r.get("card_id"),
@@ -182,34 +196,34 @@ async fn completed_track_live_sessions(state: &AppState) -> Result<Vec<Completed
         .collect())
 }
 
-/// End one session of the completed-track set. The claim runs first on an IMMEDIATE transaction: a reopen
-/// or dispatch since the candidate was read takes the row out of the set, and nothing is written or signalled.
-pub async fn end_completed_track_session(
+/// End one settled worker. The IMMEDIATE claim rechecks task ownership, finish grace and
+/// in-flight attempts: a regate/dispatch before the claim prevents writes and signals.
+pub async fn end_settled_worker_session(
     state: &AppState,
-    session: &CompletedTrackSession,
+    session: &SettledWorkerSession,
 ) -> Result<()> {
-    end_completed_track_session_impl(state, session, || async {}).await
+    end_settled_worker_session_impl(state, session, || async {}).await
 }
 
 /// Fixtures-only seam: `before_write` runs after the guard, immediately before the claiming
-/// write — the window a reopen can land in.
+/// write — the window a regate/dispatch can land in.
 #[cfg(feature = "fixtures")]
 #[doc(hidden)]
-pub async fn end_completed_track_session_before_write_for_test<F, Fut>(
+pub async fn end_settled_worker_session_before_write_for_test<F, Fut>(
     state: &AppState,
-    session: &CompletedTrackSession,
+    session: &SettledWorkerSession,
     before_write: F,
 ) -> Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    end_completed_track_session_impl(state, session, before_write).await
+    end_settled_worker_session_impl(state, session, before_write).await
 }
 
-async fn end_completed_track_session_impl<F, Fut>(
+async fn end_settled_worker_session_impl<F, Fut>(
     state: &AppState,
-    session: &CompletedTrackSession,
+    session: &SettledWorkerSession,
     before_write: F,
 ) -> Result<()>
 where
@@ -229,9 +243,9 @@ where
     let session_id = session.id.clone();
     let claimed = write_in_tx_typed(state.repo.as_ref(), move |tx| {
         Box::pin(async move {
-            // A reopen (`track_update_tx`) either committed before this BEGIN — the row is not returned and
-            // nothing is written — or waits behind this IMMEDIATE transaction.
-            if !in_completed_track_set(tx, &session_id).await? {
+            // A regate/dispatch either committed before this BEGIN and excludes the row,
+            // or waits behind this IMMEDIATE transaction.
+            if !in_settled_worker_set(tx, &session_id).await? {
                 return Ok(false);
             }
             crate::db::sqlite::session_complete_tx(tx, &session_id, WorkerSessionState::Exited)
@@ -244,7 +258,7 @@ where
         tracing::debug!(
             worker_session_id = %session.id,
             terminal_id = %session.terminal_id,
-            "terminal_sweeper: completed-track candidate left the set before the write; skipped"
+            "terminal_sweeper: settled-worker candidate left the set before the write; skipped"
         );
         return Ok(());
     }
@@ -252,7 +266,7 @@ where
         worker_session_id = %session.id,
         terminal_id = %session.terminal_id,
         provider = %session.provider,
-        "terminal_sweeper: session left running on a completed track written exited"
+        "terminal_sweeper: settled task worker session written exited"
     );
 
     if session.provider == "codex"
@@ -268,7 +282,7 @@ where
             card_id = %session.card_id,
             thread_id = %thread_id,
             error = %e,
-            "failed to interrupt active shared codex turn while ending a completed-track session"
+            "failed to interrupt active shared codex turn while ending a settled-worker session"
         );
     }
 
@@ -278,7 +292,8 @@ where
     if !reap_live_terminal(state, &term).await? {
         tracing::info!(
             terminal_id = %term.id,
-            "terminal_sweeper: no renderer obtained for a completed-track session; \
+            "terminal_sweeper: settled-worker exit persistence unconfirmed; \
+             no renderer was obtained or stopping its child was unverified; \
              left to the orphan arm / boot reconcile"
         );
     }
@@ -287,15 +302,17 @@ where
 
 /// Stop the live child of `term`: its renderer, or a reattach to the child the supervisor runs,
 /// then the reap (TERM, bounded wait, KILL), whose reader persists the exit and ends an ephemeral
-/// runtime. `false` when no renderer could be obtained: no running child to stop.
+/// runtime. Retain its final screen for later viewers. `false` if no renderer was obtained
+/// or the reader did not confirm exit persistence.
 pub(crate) async fn reap_live_terminal(state: &AppState, term: &Terminal) -> Result<bool> {
     let live =
         crate::ws::terminal::resolve_live_renderer_from_terminal(state, term.clone()).await?;
-    reap_resolved(state, term, live).await
+    reap_resolved(state, term, live, true).await
 }
 
 /// [`reap_live_terminal`] for a caller holding the terminal's track entry in
 /// `track_delete_locks` (`track_id`) across the stop: no viewer can reattach meanwhile.
+/// This restart path removes the old entry so ensure can establish the replacement child.
 pub(crate) async fn reap_live_terminal_under_track_fence(
     state: &AppState,
     term: &Terminal,
@@ -304,15 +321,21 @@ pub(crate) async fn reap_live_terminal_under_track_fence(
     let live =
         crate::ws::terminal::resolve_live_renderer_under_track_fence(state, term.clone(), track_id)
             .await?;
-    reap_resolved(state, term, live).await
+    reap_resolved(state, term, live, false).await
 }
 
 async fn reap_resolved(
     state: &AppState,
     term: &Terminal,
     live: crate::ws::terminal::LiveRenderer,
+    retain_screen: bool,
 ) -> Result<bool> {
     match live {
+        crate::ws::terminal::LiveRenderer::Alive(entry) if retain_screen => {
+            // Keep the final screen available to later WS viewers, like a natural exit.
+            let outcome = state.terminal_renderer.stop_child(&entry).await;
+            Ok(outcome == RendererDropOutcome::ExitPersisted)
+        }
         crate::ws::terminal::LiveRenderer::Alive(_) => {
             reap_terminal_artifacts_with_renderer(Some(state.terminal_renderer.as_ref()), term)
                 .await;
@@ -331,12 +354,13 @@ async fn reap_resolved(
 
 /// The set narrowed to one session, built from the same text so the set and the claim cannot drift.
 /// Runs on the claiming transaction's own connection, never on the pool.
-async fn in_completed_track_set(
+async fn in_settled_worker_set(
     conn: &mut sqlx::SqliteConnection,
     session_id: &str,
 ) -> Result<bool> {
-    let sql = format!("{COMPLETED_TRACK_LIVE_SESSIONS_SQL} AND ws.id = ?1");
+    let sql = format!("{SETTLED_WORKER_SESSIONS_SQL} AND ws.id = ?2");
     let row = sqlx::query(&sql)
+        .bind(SETTLED_WORKER_GRACE_MS)
         .bind(session_id)
         .fetch_optional(conn)
         .await?;
