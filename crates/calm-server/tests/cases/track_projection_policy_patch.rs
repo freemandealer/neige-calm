@@ -187,6 +187,7 @@ const TRACK_PERSISTENT_COLUMNS: &[&str] = &[
     "closed_at",
     "creator_track_id",
     "creator_key",
+    "admin_granted_at",
 ];
 
 type PersistedTrackEvent = (
@@ -1043,3 +1044,6 @@ async fn tightening_planner_ceiling_below_inflight_inventory_commits_degraded_st
     );
     tx.rollback().await.unwrap();
 }
+
+#[path = "track_projection_policy_patch/admin.rs"]
+mod admin;
