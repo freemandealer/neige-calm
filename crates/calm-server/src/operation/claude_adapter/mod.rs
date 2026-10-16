@@ -781,6 +781,11 @@ impl ProviderAdapter for ClaudeAdapter {
 
 #[async_trait]
 impl ProviderAdapter for ClaudeWorkerAdapter {
+    async fn prepare_external(&self, input: &Value, ctx: &SpawnCtx) -> Result<()> {
+        let payload: ClaudeWorkerOperationPayload = serde_json::from_value(input.clone())?;
+        super::workspace_lease::worker::observe_worker_checkout(ctx, &payload.track_id).await
+    }
+
     fn kind(&self) -> &'static str {
         "claude-worker"
     }
