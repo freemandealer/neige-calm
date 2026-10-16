@@ -431,9 +431,9 @@ describe('the report-to-Planner entry', () => {
     const onReply = vi.fn();
     const start = vi.fn();
     renderPage({ track: track({ title: 'A long-running report '.repeat(20) }), onReply, onStartConversation: start });
-    const button = browserPage.getByRole('button', { name: 'Planner', exact: true }).element();
+    const button = browserPage.getByRole('button', { name: '讨论这项工作', exact: true }).element();
     const box = button.getBoundingClientRect();
-    expect(box.width).toBe(28);
+    expect(box.width).toBeGreaterThan(100);
     expect(button.querySelector('svg')).not.toBeNull();
     expect(browserPage.getByRole('button', { name: 'Chat', exact: true }).query()).toBeNull();
     expect(box.right).toBeLessThanOrEqual(window.innerWidth);
@@ -463,24 +463,34 @@ describe('the Track conversation entry', () => {
     const start = vi.fn();
     await browserPage.viewport(1200, 800);
     renderPage({ onStartConversation: start });
-    const chat = browserPage.getByRole('button', { name: 'Chat', exact: true });
+    const chat = browserPage.getByRole('button', { name: '讨论这项工作', exact: true });
     await expect.element(chat).toBeVisible();
+    await userEvent.hover(document.querySelector<HTMLElement>('[data-nc-page-title]')!);
+    const pixel = document.createElement('canvas');
+    pixel.width = 1; pixel.height = 1;
+    const context = pixel.getContext('2d')!;
     for (const theme of ['light', 'dark']) {
       document.documentElement.dataset.theme = theme;
       const button = [...document.querySelectorAll('button')].find((element) =>
-        element.getAttribute('aria-label') === 'Chat' && element.getBoundingClientRect().width > 0);
+        element.textContent?.includes('讨论这项工作') && element.getBoundingClientRect().width > 0);
       if (button === undefined) throw new Error('the desktop Chat action is missing');
       await waitFor(() => {
         const style = getComputedStyle(button);
-        expect(contrast(paintedRgb(style.color), paintedRgb(getComputedStyle(button.closest('header')!).backgroundColor))).toBeGreaterThanOrEqual(4.5);
+        // This action paints its own opaque card surface above the page ground.
+        context.clearRect(0, 0, 1, 1);
+        context.fillStyle = style.backgroundColor;
+        context.fillRect(0, 0, 1, 1);
+        expect(context.getImageData(0, 0, 1, 1).data[3]).toBe(255);
+        expect(contrast(paintedRgb(style.color), paintedRgb(style.backgroundColor))).toBeGreaterThanOrEqual(4.5);
       });
     }
     await userEvent.click(chat);
     expect(start).toHaveBeenCalledTimes(1);
 
     await browserPage.viewport(390, 844);
-    await expect.element(chat).toBeVisible();
-    await userEvent.click(chat);
+    const mobileChat = browserPage.getByRole('button', { name: 'Chat', exact: true });
+    await expect.element(mobileChat).toBeVisible();
+    await userEvent.click(mobileChat);
     expect(start).toHaveBeenCalledTimes(2);
   });
 });
@@ -505,3 +515,24 @@ for (const width of [1200, 390]) {
     await browserPage.screenshot({ path: `../../../../../test-results/timeout-${width}-${matchMedia('(pointer: coarse)').matches ? 'coarse' : 'desktop'}.png` });
   });
 }
+
+it('uses the generic navigation header contract without an app host', async () => {
+  await browserPage.viewport(1200, 800);
+  renderPage();
+  const trackPage = document.querySelector<HTMLElement>('[data-nc-track-page]')!;
+  const header = trackPage.querySelector<HTMLElement>(':scope > header')!;
+  const reference = document.createElement('div');
+  reference.style.position = 'absolute';
+  reference.style.height = 'var(--navigation-header-height)';
+  trackPage.append(reference);
+  try {
+    for (const height of ['52px', '64px']) {
+      trackPage.style.setProperty('--navigation-header-height', height);
+      expect(header.getBoundingClientRect().height).toBe(reference.getBoundingClientRect().height);
+      expect(header.getBoundingClientRect().height).toBeGreaterThan(0);
+    }
+  } finally {
+    reference.remove();
+    trackPage.style.removeProperty('--navigation-header-height');
+  }
+});

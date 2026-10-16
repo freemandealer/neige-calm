@@ -1,3 +1,4 @@
+import { withFontRoleProbe } from '../../../../../tools/styles/font-role-fixture.ts';
 /* The composer, the exchange rail and the reply's type, measured against a real rendering engine. */
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { page, userEvent } from 'vitest/browser';
@@ -1694,11 +1695,13 @@ describe('the reply’s type, through Astryx’s markdown', () => {
   });
 
   /* Headings take `--font-family-heading`, which the app-wide bridge maps to the display sans. */
-  it('paints the reply’s own headings in the same serif, not the display sans', () => {
+  it.each([390, 1440])('paints reply text and headings in the same serif at %ipx', async (width) => {
+    await page.viewport(width, 900);
     render(<RailPane turns={MARKDOWN_REPLY} />);
     const heading = getComputedStyle(paintedHeading());
 
     expect(heading.fontFamily).toBe(probe({ fontFamily: 'var(--font-serif)' }).fontFamily);
+    expect(getComputedStyle(paintedParagraph()).fontFamily).toBe(heading.fontFamily);
     expect(heading.fontFamily).not.toBe(probe({ fontFamily: 'var(--font-display)' }).fontFamily);
   });
 });
@@ -1834,7 +1837,9 @@ describe('Mobile conversation contours', () => {
     expect(getComputedStyle(composer).backgroundColor).not.toBe(getComputedStyle(drawer).backgroundColor);
     expect(getComputedStyle(drawer).getPropertyValue('--radius-chat').trim()).toBe('16px');
     const heading = await page.getByRole('heading', { name: /^A very long conversation/ }).findElement();
-    expect(getComputedStyle(heading).fontSize).toBe('14px');
+    withFontRoleProbe('--type-page-title', heading.closest('header')!, expected => {
+      expect(getComputedStyle(heading)).toMatchObject(expected);
+    });
     expect(heading.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     expect(drawer.getBoundingClientRect().height).toBe(window.innerHeight);
   });

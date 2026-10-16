@@ -1,3 +1,4 @@
+import { withFontRoleProbe } from '../../../../tools/styles/font-role-fixture.ts';
 import '../../styles/entry.css';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createMemoryHistory } from '@tanstack/react-router';
@@ -416,7 +417,7 @@ describe('Unified mobile headers', () => {
     await page.viewport(width, 844);
     const router = setup('/track/w1');
     const frames: Array<{ name: string; x: number; y: number; width: number; height: number; left: number; top: number }> = [];
-    const record = async (name: string, header: Element) => {
+    const record = async (name: string, header: HTMLElement) => {
       await expect.poll(() => header.closest('#mobile-workspace-navigation')?.getAnimations({ subtree: true })
         .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
         .every((animation) => animation.playState !== 'running') ?? true).toBe(true);
@@ -433,7 +434,6 @@ describe('Unified mobile headers', () => {
         expect(box.y).toBeGreaterThan(80);
         expect(hit.width).toBe(44); expect(hit.height).toBe(44);
         expect(hit.right).toBe(width - 16);
-        expect(getComputedStyle(header.querySelector('h2')!).fontSize).toBe('16px');
         await page.screenshot({ path: `../../../../test-results/unified-${width}-${name}.png` });
         return;
       }
@@ -450,8 +450,14 @@ describe('Unified mobile headers', () => {
       const title = header.querySelector<HTMLElement>('[aria-label^="Switch track,"]')
         ?? header.querySelector<HTMLElement>('[aria-label^="Switch area,"]')
         ?? header.querySelector<HTMLElement>('h1, h2')!;
-      expect(getComputedStyle(title).fontSize).toBe(root || workspace ? '17px' : '14px');
-      expect(getComputedStyle(title).fontWeight).toBe(root || workspace ? '500' : '600');
+      if (root || workspace) {
+        expect(getComputedStyle(title).fontSize).toBe('17px');
+        expect(getComputedStyle(title).fontWeight).toBe('500');
+      } else {
+        withFontRoleProbe('--type-page-title', header, expected => {
+          expect(getComputedStyle(title)).toMatchObject(expected);
+        });
+      }
       expect(title.getBoundingClientRect().right).toBeLessThanOrEqual(width - (root ? 16 : 64));
       const right = header.querySelector<HTMLElement>(':scope > :last-child button:not([role="menuitem"])');
       if (right !== null && right.getClientRects().length > 0) {
@@ -471,7 +477,7 @@ describe('Unified mobile headers', () => {
       await page.screenshot({ path: `../../../../test-results/unified-${width}-${name}.png` });
     };
     await page.getByRole('button', { name: /^Switch track,/ }).findElement();
-    await record('track', document.querySelector('[data-nc-workspace-header] header')!);
+    await record('track', document.querySelector<HTMLElement>('[data-nc-workspace-header] header')!);
     const selector = await page.getByRole('button', { name: 'Switch track, Responsive mobile UI', exact: true }).findElement();
     const history = await page.getByRole('button', { name: 'Open conversation history', exact: true }).findElement();
     expect(selector.getBoundingClientRect().left).toBeGreaterThanOrEqual(history.getBoundingClientRect().right + 8);
@@ -585,13 +591,14 @@ describe('shared desktop primary header', () => {
     const centre = (element: HTMLElement) => { const box = element.getBoundingClientRect(); return box.top + box.height / 2; };
     expect(centre(title) - centre(today)).toBeCloseTo(0, 0);
     expect(centre(title) - centre(collapse)).toBeCloseTo(0, 0);
-    expect(header.getBoundingClientRect().height).toBe(40);
-    expect(today.parentElement!.getBoundingClientRect().height).toBe(40);
-    expect(getComputedStyle(header).borderBlockEndColor).toBe('rgba(0, 0, 0, 0)');
-    expect(getComputedStyle(today.parentElement!).borderBlockEndColor).toBe('rgba(0, 0, 0, 0)');
+    const firstCategory = rail.querySelector('h2')!;
+    expect(today.parentElement!.getBoundingClientRect().bottom).toBeCloseTo(firstCategory.getBoundingClientRect().top, 0);
+    const dividerColor = getComputedStyle(header).borderBlockEndColor;
+    expect(dividerColor).not.toBe('rgba(0, 0, 0, 0)');
+    expect(getComputedStyle(today.parentElement!).borderBlockEndWidth).toBe('0px');
     header.parentElement!.setAttribute('data-nc-scrolled', '');
     await settlePaint();
-    expect(getComputedStyle(header).borderBlockEndColor).toBe('rgba(0, 0, 0, 0)');
+    expect(getComputedStyle(header).borderBlockEndColor).toBe(dividerColor);
     const scroller = document.querySelector<HTMLElement>('[data-nc-track-page]')!;
     expect(scroller.scrollHeight).toBeGreaterThan(scroller.clientHeight);
     expect(rail.scrollHeight).toBeGreaterThan(rail.clientHeight);
@@ -606,21 +613,18 @@ describe('shared desktop primary header', () => {
     expect(centre(title) - centre(collapse)).toBeCloseTo(0, 0);
   });
 
-  it('uses the same navigation height and title alignment on Today', async () => {
+  it('keeps Today and reading titles aligned when text scales', async () => {
     await page.viewport(1440, 900);
     setup('/', AREA.name, () => undefined, 'Responsive mobile UI', { viewportRoot: true });
     await waitFor(() => expect(document.querySelector('[data-nc-header-rows]')).not.toBeNull());
-    const header = document.querySelector<HTMLElement>('[data-nc-header-rows]')!;
-    expect(header.getBoundingClientRect().height).toBe(40);
     const title = document.querySelector<HTMLElement>('[aria-label="Rename track"]')!;
     const today = document.querySelector<HTMLElement>('[aria-label="Go to Today"]')!;
     const centre = (element: HTMLElement) => { const box = element.getBoundingClientRect(); return box.top + box.height / 2; };
     expect(centre(title)).toBeCloseTo(centre(today), 0);
-    // A relative scale change must move both headers together.
+    // Font scaling preserves the shared title alignment.
     const previousSize = document.documentElement.style.fontSize;
     try {
       document.documentElement.style.fontSize = '20px';
-      expect(header.getBoundingClientRect().height).toBe(50);
       expect(centre(title)).toBeCloseTo(centre(today), 0);
     } finally { document.documentElement.style.fontSize = previousSize; }
     await page.screenshot({ path: './__screenshots__/header-alignment-fixed.png' });
