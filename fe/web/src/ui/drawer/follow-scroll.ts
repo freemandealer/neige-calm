@@ -114,6 +114,18 @@ export function createScrollFollower(options: Readonly<{
         if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) || (event.key === ' ' && event.shiftKey)) begin(event, 'up');
         else if (['ArrowDown', 'PageDown', 'End', ' '].includes(event.key)) begin(event, 'down');
       };
+      // Unbracketed content focus is a reading request. Automatic restoration
+      // declares its different intent through the existing restoration fence.
+      const onFocus = (event: FocusEvent) => {
+        if (restoring !== 0 || !(event.target instanceof Element) || !content.contains(event.target)) return;
+        const box = event.target.getBoundingClientRect();
+        const viewport = target.getBoundingClientRect();
+        // Covers engines that reveal before focus and those that reveal after.
+        if (distance() > options.bottomSlack || box.bottom <= viewport.top || box.top >= viewport.bottom) {
+          gesture = null;
+          following = false;
+        }
+      };
       const onPointerDown = (event: PointerEvent) => {
         if (event.defaultPrevented || event.button !== 0 || event.pointerType === 'touch' || event.target !== target) return;
         pointer = event.pointerId;
@@ -168,6 +180,7 @@ export function createScrollFollower(options: Readonly<{
         }
       };
       target.addEventListener('wheel', onWheel, { passive: true });
+      content.addEventListener('focusin', onFocus);
       target.ownerDocument.addEventListener('keydown', onKey);
       target.addEventListener('pointerdown', onPointerDown);
       target.addEventListener('pointermove', onPointerMove, { passive: true });
@@ -191,6 +204,7 @@ export function createScrollFollower(options: Readonly<{
         for (const id of frames) cancelAnimationFrame(id);
         observer.disconnect();
         target.removeEventListener('wheel', onWheel);
+        content.removeEventListener('focusin', onFocus);
         target.ownerDocument.removeEventListener('keydown', onKey);
         target.removeEventListener('pointerdown', onPointerDown);
         target.removeEventListener('pointermove', onPointerMove);

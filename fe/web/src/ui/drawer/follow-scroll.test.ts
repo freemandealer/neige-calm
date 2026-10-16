@@ -23,6 +23,33 @@ function mounted() {
 afterEach(() => { document.body.replaceChildren(); vi.useRealTimers(); });
 
 describe('drawer scroll intent', () => {
+  it('does not treat focused content inside restoration as new reader intent', () => {
+    const x = mounted();
+    withScrollRestoration([x.pane], () => {
+      x.pane.scrollTop = 100;
+      fireEvent.focusIn(x.content);
+    });
+    x.grow(); x.follower.followGrowth();
+    expect(x.pane.scrollTop).toBe(700);
+    x.detach();
+  });
+
+  it('removes old focus listeners when attached to a new pane', () => {
+    const x = mounted();
+    x.detach();
+    const nextPane = document.createElement('div');
+    const nextContent = document.createElement('div'); nextPane.append(nextContent); document.body.append(nextPane);
+    let top = 600;
+    Object.defineProperties(nextPane, { scrollHeight: { value: 1000 }, clientHeight: { value: 400 },
+      scrollTop: { get: () => top, set: (value: number) => { top = Math.max(0, Math.min(value, 600)); } } });
+    const detach = x.follower.attach(nextPane, nextContent);
+    top = 100;
+    fireEvent.focusIn(x.content);
+    x.follower.followGrowth();
+    expect(top).toBe(600);
+    detach();
+  });
+
   it('ignores position changes with no input provenance', () => {
     const x = mounted();
     x.pane.scrollTop = 100;
