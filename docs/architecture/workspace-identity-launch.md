@@ -5,6 +5,20 @@ review channels on 2026-10-16. The parent contract is
 [track-workspace.md](track-workspace.md). This document does not claim an
 implemented capability. S1 remains a separate behavior-preserving delivery.
 
+The next real kernel launch/admission implementation is specified in
+[workspace-launch-admission.md](workspace-launch-admission.md). Its foundation
+boundary is deliberately narrower than this complete protocol: logical
+selection IDs and Pending/Observed facts are not canonical resource identity,
+WorkspaceRef or runtime authority. Canonical binding/Ready requires a live-object
+proof and materialization/adoption receipt; persisted path/dev/inode cannot
+stand in for object lifetime. The new bridge defines the exact executor and
+legacy-owner cutover dependencies before those capabilities can be delivered.
+Before the first typed Ready/PreparedLaunch, its RuntimeSafety receipt must
+close necessary active/pending legacy source bindings and all retained new
+ingress/cleanup effects under the same resource fence. Task scheduling can
+remain Legacy until its separate atomic cutover; permanent Done audit and
+unrelated explicit ExternalDir/fresh-owned targets are not global blockers.
+
 ## Outcome
 
 Worktree execution and file access use a persistent `WorkspaceRef` and kernel
