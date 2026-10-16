@@ -126,7 +126,8 @@ pub(crate) async fn retry_codex_authentication(
     actor: Actor,
     JsonBody(request): JsonBody<AuthenticationRetryRequest>,
 ) -> Result<Response> {
-    if principal.role != OWNER_ROLE || actor.as_str() != "user" {
+    if !principal.is_deployment_owner() || principal.role != OWNER_ROLE || actor.as_str() != "user"
+    {
         return Err(CalmError::Forbidden(
             "Only the owner can retry the server's queued messages.".into(),
         ));
