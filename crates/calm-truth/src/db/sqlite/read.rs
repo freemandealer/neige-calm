@@ -72,6 +72,31 @@ impl SqlxRepo {
 
 #[async_trait]
 impl RepoRead for SqlxRepo {
+    async fn application_user_require_registered(&self, user_id: &str) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        super::area_membership::application_user_require_registered(&mut connection, user_id).await
+    }
+
+    async fn areas_list_for_member(&self, user_id: &str) -> Result<Vec<Area>> {
+        let mut tx = super::begin_immediate_tx(&self.pool).await?;
+        let areas = super::area_membership::areas_list_for_member(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(areas)
+    }
+
+    async fn area_require_access(
+        &self,
+        area_id: &str,
+        user_id: &str,
+        access: calm_types::organization::AreaAccess,
+    ) -> Result<Area> {
+        let mut tx = super::begin_immediate_tx(&self.pool).await?;
+        let area =
+            super::area_membership::area_require_access(&mut tx, area_id, user_id, access).await?;
+        tx.commit().await?;
+        Ok(area)
+    }
+
     async fn harness_latest_terminal(
         &self,
         card: &str,
