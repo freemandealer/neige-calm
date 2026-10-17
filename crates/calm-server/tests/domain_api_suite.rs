@@ -98,6 +98,8 @@ mod tool_verbs_migration;
 
 #[path = "cases/today_summary.rs"]
 mod today_summary;
+#[path = "cases/track_access.rs"]
+mod track_access;
 #[path = "cases/track_activity_fixture.rs"]
 mod track_activity_fixture;
 #[path = "cases/track_activity_projection.rs"]
