@@ -15,14 +15,14 @@
     inline-size: 100%;
     min-block-size: var(--row-h);
     padding-block: 0;
-    padding-inline-end: var(--space-3);
+    padding-inline-end: var(--space-2);
     border-radius: var(--radius-sm);
-    font-size: var(--text-base);
-    line-height: var(--leading-tight);
     color: var(--text-3);
     text-align: start;
     cursor: pointer;
   }
+
+  .showMoreLabel { color: inherit; }
 
   .showMore:hover,
   .showMore:focus-visible {
