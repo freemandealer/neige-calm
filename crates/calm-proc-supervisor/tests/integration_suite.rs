@@ -1,3 +1,10 @@
+#[path = "execution_attachment.rs"]
+mod execution_attachment;
+#[path = "execution_contract.rs"]
+mod execution_contract;
+#[path = "execution_registration.rs"]
+mod execution_registration;
+mod execution_support;
 mod proc_probe;
 
 // pin_lost_on_autoreap changes SIGCHLD for the entire process; keep it separate.

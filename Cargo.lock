@@ -487,10 +487,14 @@ dependencies = [
  "clap",
  "libc",
  "portable-pty",
+ "proc-macro2",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "workspace",
 ]
 
 [[package]]
@@ -580,6 +584,7 @@ name = "calm-session"
 version = "0.1.0"
 dependencies = [
  "bincode 2.0.1",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -588,6 +593,7 @@ dependencies = [
  "ts-rs",
  "uuid",
  "vte",
+ "workspace",
 ]
 
 [[package]]
@@ -3175,6 +3181,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "calm-exec",
+ "calm-proc-supervisor",
  "calm-session",
  "calm-types",
  "futures-util",
