@@ -68,3 +68,34 @@ position cache or history windowing. Gap and compact timestamps share one locale
 formatter per style and thread timezone. Its stable identity lets unchanged rows
 skip formatting during live updates; browser timezone changes are observed on
 render and invalidate the formatters.
+
+`ChatThread` uses React's default prop memoization. The app supplies committed,
+view-scoped action callbacks and stable history inputs; it never suppresses a
+changed callback or reading-state update with a custom comparator. Composer
+updates therefore leave an unchanged thread alone. An empty/nonempty draft may
+still change whether Edit is available, and real history/live/status changes
+still update the thread immediately.
+
+Outgoing messages are readable immediately, including the first draft and its
+handoff to canonical history. Their opacity and position do not depend on the
+network answer or physical DOM identity. Sending feedback uses the existing
+busy composer control, with a local status when needed. Running requires the
+existing run query or kernel activity. Stop remains available during a send to
+an already running conversation. No DOM windowing or delayed network dispatch
+is involved.
+
+The native Send/Stop control stays mounted through dispatch. Its public icon
+slot carries a decorative spinner for a pending Send while the control remains
+disabled through the vendor's authoritative composer context. The local status
+announces Sending; Stop keeps its own label/icon and action. No hidden vendor
+props or alternate admission policy are used. Replacement uses the existing
+Button loading contract while Edit remains displayed.
+
+The named Message composer group declares `aria-busy` for local dispatch, so a
+standalone composer exposes the pending fact even without a transcript status.
+Its Send purpose stays named Send; visual progress does not replace the control.
+
+The Send arrow and waiting ring remain mounted in one grid slot. Dispatch only
+changes visibility and pauses or runs the ring, avoiding glyph resource mounts
+during the send commit. The ring shares the UI
+indicator's reduced-motion contract and carries no model activity marker.

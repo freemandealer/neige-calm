@@ -86,6 +86,7 @@ import {
   trackConversationCardId,
   FOLLOW_INSTALLATION_DEFAULT,
   type Conversation,
+  type ConversationTurn,
   type PendingQueueEntry,
   type TranscriptEntry,
 } from '../../../../core/domain/conversation.ts';
@@ -526,6 +527,10 @@ function useConversationPane(
   const setPermissionMode = useCommittedCallback(existingId, store.setPermissionMode);
   const sendText = useCommittedCallback(existingId, (text: string) => open !== null
     && store.send(open.id, text, attachments.items, true, edit.replacesIn(open.id)) !== null);
+  const regenerateMessage = useCommittedCallback(existingId, async (message: ConversationTurn) => {
+    if (open !== null) await store.send(open.id, message.text, message.attachments ?? [], false, null);
+  });
+  const editMessage = useCommittedCallback(existingId, edit.start);
   const sideQuestion = useCommittedCallback(existingId, (question: string) => {
     if (open === null || options?.onSide === undefined || !sideSourceReady) return false;
     return options.onSide(open, store.turnsOf(open.id), question);
@@ -580,7 +585,7 @@ function useConversationPane(
               draft={{ text: composer.text, onChange: setComposerText }}
               disabled={composerView.sendBlocked || !composerView.historyReady || replacing}
               onCompact={composerView.manualCompactSupported && composerView.historyReady && editingBar === undefined ? composerView.compact : undefined}
-              sendWaiting={replacing} {...(editingBar === undefined ? {} : { editing: editingBar })}
+              sendWaiting={composerView.sending} {...(editingBar === undefined ? {} : { editing: editingBar })}
               /* The images stay with the composer until the store reports them delivered; the press waits out its Edit. */
               showSideCommand={(options?.showSideCommand ?? true) && sideSourceReady}
               onSideConversation={!hasSideConversation || !composerView.historyReady ? undefined : sideQuestion}
@@ -691,7 +696,7 @@ function useConversationPane(
                 )}
               </ChatFooterNotice>
             )}
-            <ChatComposer layout={compactComposer ? 'mobile' : 'standard'} disabled={creating} onSend={sendDraft} onNewConversation={options?.inline === true ? undefined : startAnother}
+            <ChatComposer layout={compactComposer ? 'mobile' : 'standard'} disabled={creating} sendWaiting={creating} onSend={sendDraft} onNewConversation={options?.inline === true ? undefined : startAnother}
               mentionTrigger={mentionTrigger}
               draft={{ text: newConversationText, onChange: setNewConversationText }}
               /* Menu membership and readiness come from the managed backend declarations. */
@@ -703,6 +708,7 @@ function useConversationPane(
           </>
         ) : open === null ? undefined : (
           <>
+            {store.sending && !threadPresented && <ChatFooterNotice tone="neutral">Sending…</ChatFooterNotice>}
             {/* Each query owns its read retry; accepted sends keep their reconciliation fence (#2068). */}
             {(store.historyError !== null || store.runError !== null) && (
               <ErrorBox
@@ -808,18 +814,19 @@ function useConversationPane(
                 conversation={open}
                 imageFiles={imageFiles}
                 turns={store.turnsOf(open.id)} editing={edit.marked}
+                sending={store.sending}
                 replacement={store.failedSend?.replaces == null ? null : store.failedSend.echo.id}
-                pending={store.pending.has(open.id)}
+                pending={store.working}
                 cards={source.cards}
                 stalled={store.stalled}
                 statusUnconfirmed={!store.runReady || store.runError !== null}
                 statusLoading={store.runLoading}
                 copyText={edit.held === null ? writeClipboardText : undefined}
                 regenerateMessage={respondable
-                  ? async (message) => { await store.send(open.id, message.text, message.attachments ?? [], false, null); }
+                  ? regenerateMessage
                   : undefined}
                 editMessage={respondable && store.historyReplacementSupported && store.pendingQueue.length === 0 && store.pendingQueueOverflow === 0
-                  && isComposerEmpty(composer) && !attachments.busy ? edit.start : undefined}
+                  && isComposerEmpty(composer) && !attachments.busy ? editMessage : undefined}
                 canContinue={canContinue}
                 stalledReason={store.blockedReason}
                 stopFeedback={store.stopFeedback}

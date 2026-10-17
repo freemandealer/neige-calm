@@ -175,14 +175,24 @@ describe('the / command menu, as the engine lays it out', () => {
   it('turns Send into a spinner on the same round chip while a pressed message waits to go', async () => {
     await page.viewport(1400, 900);
     /* The same composer, disabled as it is while the message waits, showing Send. */
-    const { unmount } = render(<ImageOnlyCard disabled />);
-    const send = document.querySelector<HTMLElement>('button[aria-label="Send"]')!.getBoundingClientRect();
-    unmount();
-    render(<ImageOnlyCard sendWaiting />);
-    const waiting = screen.getByRole('button', { name: 'Sending…' });
+    const view = render(<ImageOnlyCard disabled />);
+    const control = screen.getByRole('button', { name: 'Send' });
+    const send = control.getBoundingClientRect();
+    const glyphNodes = [...control.querySelectorAll('*')];
+    expect(control.getAnimations({ subtree: true }).filter(animation => animation.effect?.getTiming().iterations === Infinity)
+      .every(animation => animation.playState === 'paused')).toBe(true);
+    view.rerender(<ImageOnlyCard sendWaiting />);
+    const waiting = screen.getByRole('button', { name: 'Send' });
+    expect(waiting).toBe(control);
+    // Starting feedback must not mount new glyph resources in the send commit.
+    const waitingNodes = [...waiting.querySelectorAll('*')];
+    expect(waitingNodes).toHaveLength(glyphNodes.length);
+    waitingNodes.forEach((node, index) => expect(node).toBe(glyphNodes[index]));
     expect(waiting.hasAttribute('disabled')).toBe(true);
-    expect(waiting.getAttribute('aria-busy')).toBe('true');
-    expect(document.querySelector('button[aria-label="Send"], [data-nc-send-attachment]')).toBeNull();
+    expect(screen.getByRole('group', { name: 'Message composer' }).getAttribute('aria-busy')).toBe('true');
+    expect(document.querySelector('[data-nc-send-attachment]')).toBeNull();
+    await expect.poll(() => waiting.getAnimations({ subtree: true })
+      .some(animation => animation.effect?.getTiming().iterations === Infinity && animation.playState === 'running')).toBe(true);
     const box = waiting.getBoundingClientRect();
     expect([box.width, box.height, box.right, box.bottom]).toEqual([send.width, send.height, send.right, send.bottom]);
     expect(parseFloat(getComputedStyle(waiting).borderTopLeftRadius)).toBeGreaterThanOrEqual(box.height / 2);
@@ -191,6 +201,12 @@ describe('the / command menu, as the engine lays it out', () => {
     document.body.append(probe);
     expect(getComputedStyle(waiting).backgroundColor).toBe(getComputedStyle(probe).backgroundColor);
     probe.remove();
+    view.rerender(<ImageOnlyCard disabled />);
+    const settledNodes = [...control.querySelectorAll('*')];
+    expect(settledNodes).toHaveLength(glyphNodes.length);
+    settledNodes.forEach((node, index) => expect(node).toBe(glyphNodes[index]));
+    expect(control.getAnimations({ subtree: true }).filter(animation => animation.effect?.getTiming().iterations === Infinity)
+      .every(animation => animation.playState === 'paused')).toBe(true);
   });
 
   it('shows edit mode as one bar above the field and Replace on Send\'s round chip, at phone width too', async () => {

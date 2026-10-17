@@ -6,7 +6,7 @@ import { markdownExcerpt } from '../../../../../core/markdown/public.ts';
 // The conversation itself: a transcript and the box you write into. The unit is the
 // exchange — one thing you said and everything that came back.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode, type Dispatch, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import {
   ChatComposer as AstryxChatComposer,
@@ -23,6 +23,7 @@ import { useIcon } from '@astryxdesign/core/Icon';
 import { VisuallyHidden } from '@astryxdesign/core/VisuallyHidden';
 
 import { ActivityIndicator } from '../../../ui/activity-indicator/public.tsx';
+import { LoadingIndicator } from '../../../ui/activity-indicator/loading-indicator.tsx';
 import { EdgeNavigator } from '../../../ui/edge-navigation/public.tsx';
 import { observeResize } from '../../../ui/edge-navigation/resize.ts';
 import { createScrollFollower } from '../../../ui/drawer/follow-scroll.ts';
@@ -61,8 +62,10 @@ export type ChatThreadProps = Readonly<{
   conversation: Conversation;
   /** Messages and the actions between them, in the order they happened. */
   turns: readonly TranscriptEntry[];
-  /** The sender's own turn in flight, shown before the kernel's next tick can say so. */
+  /** Current work confirmed by the run query while the activity overlay catches up. */
   pending?: boolean;
+  /** Local dispatch is pending, independently of model execution and the displayed message. */
+  sending?: boolean;
   /** The kernel's per-card verdicts for this conversation's track; a caller with no overlay passes `{}`. */
   cards: Readonly<Record<string, CardActivity>>;
   /** The drawer's local wedge fact. A wedged planner's kernel verdict is still `working`, so a thread that did not know it was stuck would spin beside "This conversation is stuck". */
@@ -90,7 +93,7 @@ export type ChatThreadProps = Readonly<{
   imageFiles?: ReplyImageFiles | null;
 }>;
 
-export function ChatThread({ conversation, turns, pending = false, cards, stalled, stalledReason, statusUnconfirmed = false, statusLoading = false, stopFeedback = null, canContinue, copyText, regenerateMessage, editMessage, editing = null, replacement = null, runningAnchor = null, imageFiles = null, readingView }: ChatThreadProps) {
+export const ChatThread = memo(function ChatThread({ conversation, turns, pending = false, sending = false, cards, stalled, stalledReason, statusUnconfirmed = false, statusLoading = false, stopFeedback = null, canContinue, copyText, regenerateMessage, editMessage, editing = null, replacement = null, runningAnchor = null, imageFiles = null, readingView }: ChatThreadProps) {
   const compactViewport = useCompactViewport();
   // Observe the browser timezone on render; keep formatters stable for memoized rows.
   const timeZone = new Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -102,7 +105,8 @@ export function ChatThread({ conversation, turns, pending = false, cards, stalle
   }) : null, [compactViewport, timeZone]);
   const localReading = useThreadReadingView(conversation.id);
   const reading = readingView ?? localReading;
-  /* The live mark is the sender's pending send or the kernel's verdict — never `conversation.state`, which sits at `turn_pending`/`running` long after a turn ended. The local wedge outranks both. */
+  /* Only run/activity evidence claims execution. A local outgoing message has its own sending feedback.
+     Never use `conversation.state`, which can stay at `turn_pending`/`running` after a turn ended. */
   const live = !statusUnconfirmed && !stalled && (pending || cardActivityOf({ cards }, conversation.id) === 'working');
   const lastTurn = turns[turns.length - 1];
   const currentOutcome = lastTurn?.author === 'turn' ? lastTurn : null;
@@ -120,7 +124,7 @@ export function ChatThread({ conversation, turns, pending = false, cards, stalle
       editMessage(currentOutcome);
     } };
   const currentMeta = <CurrentStatusNotice detailsExpanded={reading.expanded.get('current-status') ?? false}
-    onDetailsExpandedChange={expanded => reading.setExpanded('current-status', expanded)} outcome={currentOutcome} canContinue={canContinue && !statusUnconfirmed} live={live} statusUnconfirmed={statusUnconfirmed} statusLoading={statusLoading}
+    onDetailsExpandedChange={expanded => reading.setExpanded('current-status', expanded)} outcome={currentOutcome} canContinue={canContinue && !statusUnconfirmed} live={live} sending={sending} statusUnconfirmed={statusUnconfirmed} statusLoading={statusLoading}
     stalled={stalled} stalledReason={stalledReason ?? null} feedback={stopFeedback} copyAction={copyAction} editAction={editAction} regenerateAction={regenerateAction} runningAnchor={runningAnchor} />;
   const endRef = useRef<HTMLDivElement | null>(null);
   /** The box every marker lookup starts from. Not `.thread` itself: the stylesheet's `> * + *` rules space that element's children. */
@@ -380,7 +384,7 @@ export function ChatThread({ conversation, turns, pending = false, cards, stalle
     </div>
   );
 
-}
+});
 
 /** One thing you said and everything that came back — as far as the rail needs
  *  it: something to point at, and the words to call it by. */
@@ -496,7 +500,7 @@ export function ChatComposer({
   /** Hide this command on surfaces that cannot open a second card. */
   showSideCommand?: boolean;
   disabled?: boolean;
-  /** A send was taken and waits for its answer (an Edit's replace is still out): Send turns into a spinner that takes no press. */
+  /** A local send waits for its answer. Show a busy Send while preserving an existing Stop. */
   sendWaiting?: boolean;
   /** Edit mode: a bar names the message being replaced, ✕ or Esc leaves the mode, and Send is "Replace message". */
   editing?: Readonly<{ preview: string; onCancel: () => void }>;
@@ -651,6 +655,7 @@ export function ChatComposer({
       /* Named, because focus is parked here during a send and a screen reader announces it; `group` rather than a landmark, and a name that builds on the field's `Message` rather than repeating it. */
       role="group"
       aria-label="Message composer"
+      aria-busy={sendWaiting || undefined}
       onKeyDownCapture={(event) => {
         /* Astryx clears its input after Enter even when its parent refuses
            submission. Keep unsent words while disabled, and
@@ -738,11 +743,17 @@ export function ChatComposer({
             /></div>
           )}
           /* Send's availability is Astryx's own (`canSend`). Astryx renders `aria-disabled` only with a `tooltip`, which `ChatSendButton` does not take, so this is a native `disabled` that drops focus to `<body>` — the focus effect above moves it back into the field first. */
-          /* `ChatSendButton` has no busy state and a fixed label; in those two states this is its button under the name it then has. */
-          sendButton={sendWaiting ? <Button label="Sending…" variant="primary" isIconOnly isLoading icon={sendIcon} className={styles.sendOwn} />
-            : editing === undefined ? <ChatSendButton sendIcon={layout === 'mobile' ? <Icon name="arrow-up" /> : undefined} />
-              : <Button label="Replace message" variant="primary" isIconOnly icon={sendIcon} className={styles.sendOwn}
-                isDisabled={disabled || (draft.trim() === '' && !allowEmptyText)} onClick={() => { submit(draft); }} />}
+          /* Keep the native Send/Stop control mounted. Its public icon slot gives
+             immediate decorative feedback; the local status names Sending. */
+          sendButton={editing === undefined ? <ChatSendButton sendIcon={
+            <span className={styles.sendGlyph} data-nc-waiting={sendWaiting && !stopShown} aria-hidden="true">
+              <span className={styles.sendArrow}>{layout === 'mobile' ? <Icon name="arrow-up" /> : sendIcon}</span>
+              <span className={styles.sendWait}><LoadingIndicator active={sendWaiting && !stopShown} /></span>
+            </span>
+          } />
+            : <Button label={sendWaiting ? 'Sending…' : 'Replace message'} variant="primary" isIconOnly icon={sendIcon} className={styles.sendOwn}
+              isLoading={sendWaiting} isDisabled={disabled || (draft.trim() === '' && !allowEmptyText)}
+              onClick={() => { submit(draft); }} />}
         />
       </SizeMotion>
     </div>

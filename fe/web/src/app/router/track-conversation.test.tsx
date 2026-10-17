@@ -1917,7 +1917,8 @@ describe('track conversations', () => {
       .toEqual([{ text: 'Revised prompt', attachments: [ATTACHMENT_ID], replaces_turn: 'turn' }]));
     expect(requests.find(replacesTurn)?.headers?.['Idempotency-Key']).toMatch(/.+/);
     expect(rewindRequests(requests)).toEqual([]);
-    expect(screen.getByRole('button', { name: 'Sending…' }).hasAttribute('disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Send' }).hasAttribute('disabled')).toBe(true);
+    expect(screen.getByRole('group', { name: 'Message composer' }).getAttribute('aria-busy')).toBe('true');
     expect(messageField().getAttribute('contenteditable')).toBe('false');
     /* Only the server knows whether the turn can go: it stays, marked, and nothing pretends the new message is in. */
     expect(screen.getByText('Original answer', { exact: true })).toBeTruthy();
@@ -1932,7 +1933,7 @@ describe('track conversations', () => {
     await settleFor(20);
     expect(inputBodies(requests)).toHaveLength(1);
     expect(rewindRequests(requests)).toEqual([]);
-    expect(screen.queryByRole('button', { name: 'Sending…' })).toBeNull();
+    expect(screen.getByRole('group', { name: 'Message composer' }).getAttribute('aria-busy')).not.toBe('true');
   });
 
   it('sends outside edit mode with no turn to replace', async () => {
@@ -2120,7 +2121,7 @@ describe('track conversations', () => {
     await submit();
     await pickPlanner();
     await waitFor(() => expect(messageField().getAttribute('contenteditable')).toBe('true'));
-    expect(screen.queryByRole('button', { name: 'Sending…' })).toBeNull();
+    expect(screen.getByRole('group', { name: 'Message composer' }).getAttribute('aria-busy')).not.toBe('true');
     await answer.answer(inputAccepted());
     await waitFor(() => expect(requests.filter((request) => request.path.endsWith('/planner/input'))
       .map((request) => [pathCardId(request.path), request.body]))
@@ -2860,7 +2861,7 @@ describe('track conversations', () => {
     expect(requests.filter((request) => request.path.endsWith('/planner/input'))).toHaveLength(1);
   });
 
-  it('[F6] stops claiming Working when the runtime wedges during an unanswered send', async () => {
+  it('[F6] keeps dispatch distinct from Working when the runtime wedges during an unanswered send', async () => {
     let phase = 'idle';
     let release!: (value: ApiTransportResponse) => void;
     const held = new Promise<ApiTransportResponse>((resolve) => { release = resolve; });
@@ -2872,7 +2873,8 @@ describe('track conversations', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Conversation Assistant' }));
     await waitFor(() => expect(messageField().getAttribute('contenteditable')).toBe('true'));
     await write('Keep the pending message');
-    expect(drawerWorkingMark()).not.toBeNull();
+    expect(drawerWorkingMark()).toBeNull();
+    expect(screen.getByText('Sending…')).toBeTruthy();
     phase = 'wedged';
     await act(async () => { await client.invalidateQueries({ queryKey: ['planner-run', ASSISTANT_CARD.id] }); });
     expect(await screen.findByRole('button', { name: 'Paused', expanded: false })).toBeTruthy();
