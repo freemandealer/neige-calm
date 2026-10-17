@@ -5,6 +5,7 @@ import { afterEach, expect, it } from 'vitest';
 import type { ApiTransportResponse } from '../../../../core/api/types.ts';
 import { trackConversationCardId } from '../../../../core/domain/conversation.ts';
 import { WEB_COMPAT_VERSION } from '../providers/public.tsx';
+import { initialReceiptFor } from './initial-input-fixture.ts';
 import { renderDailyFixture } from './daily-planner-fixture.tsx';
 
 const ok = (body: unknown): ApiTransportResponse => ({ status: 200, statusText: 'OK', body });
@@ -28,13 +29,14 @@ function mount({ persistSent = false, running = false, message = text }: { persi
     }
     return replies[index];
   };
-  const userRow = (cardId: string, body: string) => ({
+  const userRow = (cardId: string, body: string, turnId: string | null, queueEntry: { id: string; rev: number } | null) => ({
     id: 2, worker_session_id: 'runtime', card_id: cardId, track_id: 'daily', thread_id: 'thread',
-    turn_id: null, turn_error_text: null, item_uuid: null, item_type: 'userMessage', method: 'item/completed',
+    turn_id: turnId, turn_error_text: null, item_uuid: null, item_type: 'userMessage', method: 'item/completed',
+    input_segments: [{ presentation: 'user', text: body, attachments: [], origin: { observation: 'user_message', event_id: null, queue_entry: queueEntry } }],
     params: JSON.stringify({ item: { type: 'userMessage', content: [{ text: body }] } }), created_at_ms: Date.now(),
   });
   const view = renderDailyFixture({ initial: '/track/daily?panel=conversations', extraPlanner: true, reply: request => {
-    if (request.path === '/api/version') return ok({ assistantProviders: true, conversationCreateModel: true,
+    if (request.path === '/api/version') return ok({ assistantProviders: true, conversationInitialInput: true, conversationCreateModel: true,
       webCompatVersion: WEB_COMPAT_VERSION, minWebCompatVersion: WEB_COMPAT_VERSION, syncEventVersion: 29, dbInstanceId: 'send-feedback' });
     if (request.path.startsWith('/api/agent-providers/managed')) return ok([{
       availability: { provider: 'codex', status: 'ready', reason: null, checked_at_ms: 1, authentication_notice: null },
@@ -50,12 +52,18 @@ function mount({ persistSent = false, running = false, message = text }: { persi
       id: 1, worker_session_id: 'runtime', card_id: 'second-planner', track_id: 'daily', thread_id: 'thread',
       turn_id: null, turn_error_text: null, item_uuid: null, item_type: 'agentMessage', method: 'item/completed',
       params: JSON.stringify({ item: { text: 'Stored history remains still.' } }), created_at_ms: 1,
-    }, ...(storedText === null ? [] : [userRow('second-planner', storedText)])]);
+    }, ...(storedText === null ? [] : [userRow('second-planner', storedText, null, null)])]);
     }
     if (created !== null && request.path === '/api/tracks/daily/conversations') return ok([created]);
+    if (created !== null && request.path.endsWith('/initial-input')) {
+      const post = view.requests.find(candidate => candidate.method === 'POST' && candidate.path.endsWith('/conversations')
+        && candidate.headers?.['Idempotency-Key'] === request.headers?.['Idempotency-Key']);
+      if (post === undefined) throw new Error('No original creation request');
+      return ok({ kind: 'projected', entryRev: 0, receipt: initialReceiptFor(post, 'first-entry', 0), runtimeId: 'runtime', itemId: 2, segmentIndex: 0 });
+    }
     if (created !== null && request.path.includes(`/${created.id}/harness/items`)) {
       canonicalReads++;
-      return ok([userRow(created.id, message)]);
+      return ok([userRow(created.id, message, 'accepted-initial-turn', { id: 'first-entry', rev: 0 })]);
     }
     if (request.method === 'POST' && (request.path.endsWith('/planner/input') || request.path.endsWith('/conversations'))) {
       return responseAt(posts++).promise.then(result => {
@@ -64,7 +72,8 @@ function mount({ persistSent = false, running = false, message = text }: { persi
           const key = request.headers?.['Idempotency-Key'];
           if (key === undefined) throw new Error('The create request must carry its key.');
           created = { id: trackConversationCardId('daily', key), trackId: 'daily', title: null, kind: 'track-assistant', provider: 'codex', state: null, updatedAt: 2, lastTurnCompletedAt: null };
-          return { status: 201, statusText: 'Created', body: created };
+          return { status: 201, statusText: 'Created', body: { ...created,
+            initialInput: { kind: 'known', receipt: initialReceiptFor(request, 'first-entry', 0) } } };
         }
         if (persistSent) {
           const body = request.body as { text: string };

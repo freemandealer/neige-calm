@@ -329,6 +329,10 @@ pub struct HarnessObservationDelivery {
 }
 
 enum HarnessObservationCommand {
+    InspectInput {
+        entry_id: QueueEntryId,
+        answer: oneshot::Sender<Result<input_inspection::InputInspection>>,
+    },
     Hibernate {
         done: oneshot::Sender<Result<bool>>,
     },
@@ -1422,6 +1426,9 @@ async fn run_loop(
                         };
                         let _ = persisted.send(result);
                     }
+                    HarnessObservationCommand::InspectInput { entry_id, answer } => {
+                        let _ = answer.send(input_inspection::inspect(&inner, &entry_id).await);
+                    }
                     HarnessObservationCommand::Mutate { mutation, actor, applied } => {
                         let outcome = handle_queue_mutation(&inner, &mutation, &actor).await;
                         let _ = applied.send(outcome);
@@ -1856,7 +1863,12 @@ async fn restore_steered_entries_codex_dropped(
     // One rev up before it goes back, so the client hiding the entry can tell the restored page
     // from the one it read before the steer.
     for entry in &mut restored {
-        entry.bump_rev_for_restore();
+        // Accepted steers reserve this increment in apply_mutation. A retained
+        // historical edge must still preserve its input if that proof is absent.
+        if !entry.bump_rev_for_restore() && entry.user_view().is_some() {
+            tracing::error!(card_id = %inner.card_id, entry_id = ?entry.id(),
+                "restored input has no revision capacity; preserving its unchanged body");
+        }
     }
     rebuffer_head(inner, restored).await;
     ids
@@ -4686,6 +4698,13 @@ mod compact_command;
 mod compact_tests;
 mod held;
 mod hibernation;
+pub(crate) mod input_inspection;
+#[cfg(test)]
+mod input_inspection_recovery_tests;
+#[cfg(test)]
+mod input_inspection_tests;
+#[cfg(test)]
+mod input_version_tests;
 mod live_reply;
 mod native_ask;
 mod replace_command;
