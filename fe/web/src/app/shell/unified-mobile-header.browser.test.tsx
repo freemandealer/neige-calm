@@ -1,3 +1,4 @@
+import { prepareReportDocument } from '../../features/report/document/preparation.ts';
 import { withFontRoleProbe } from '../../../../tools/styles/font-role-fixture.ts';
 import '../../styles/entry.css';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -60,7 +61,7 @@ function setup(path: string, areaName = AREA.name, onRequest: (request: ApiReque
     return ok([]);
   }
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const router = createAppRouter({ transport: withReadReceipts(transport), unauthorized: createUnauthorizedChannel({ enqueue: (task) => task() }),
+  const router = createAppRouter({ prepareReport: prepareReportDocument, transport: withReadReceipts(transport), unauthorized: createUnauthorizedChannel({ enqueue: (task) => task() }),
     client, cards: bootTestCardRuntime(), onSignOut: vi.fn() });
   router.update({ history: createMemoryHistory({ initialEntries: [path] }) });
   const view = render(<QueryClientProvider client={client}><ThemeProvider storage={{ getItem: () => null, setItem: () => undefined }}>
@@ -583,6 +584,7 @@ describe('shared desktop primary header', () => {
     await page.viewport(1440, 600);
     setup('/track/w1', AREA.name, () => undefined, 'Responsive mobile UI', { longLists: true, longReport: true, viewportRoot: true });
     await page.getByRole('button', { name: 'Rename track', exact: true }).findElement();
+    await expect.poll(() => document.querySelector('[data-nc-report]')).not.toBeNull();
     const rail = document.querySelector<HTMLElement>('nav[aria-label="Workspace"]')!;
     const today = rail.querySelector<HTMLElement>('[aria-label="Go to Today"]')!;
     const collapse = rail.querySelector<HTMLElement>('[aria-label="Collapse sidebar"]')!;
