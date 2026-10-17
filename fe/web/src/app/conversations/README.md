@@ -41,16 +41,17 @@ retain their original scope/key/text and settle through the Registry, including
 unknown-result rereads and refused-before-dispatch restoration. Navigation
 destinations remain chosen by the route through its injected signals.
 
-`pane-lifecycle.ts` owns the mounted pane's draft retention cleanup, delayed
-adoption, requested-open consumption, scoped Escape interruption and one-shot
-side-draft auto-send. The router invokes each Hook at its original position;
-Registry remains the owner of cross-mount drafts and open requests. Adoption and
+`pane-lifecycle.ts` owns the mounted pane's draft retention cleanup, selected-target
+resolution, requested-open consumption, scoped Escape interruption and one-shot
+side-draft auto-send. Main and side panels resolve their existing view target here
+before deriving parent/child ownership and presentation gates. Registry remains
+the owner of cross-mount drafts and open requests. Adoption and
 open requests wait until their row belongs to this pane, inline panes do not
 consume a shared open request, and auto-send consumes its intent before delivery.
 Escape belongs to the focused conversation region and yields to source panels,
 composer menus and native overlays. Cleanup removes only undispatched drafts.
 
-Pane still observes capabilities and holds selection/layout/focus. Those remaining
+Pane still observes capabilities and holds layout/focus. Those remaining
 responsibilities are tracked in #2083; loaded DOM and streaming display work remain
 under #2235.
 
@@ -70,3 +71,28 @@ value. Typing still updates the one retained composer; it does not invalidate
 unchanged history. Outbox operations remain authoritative for dispatch, keyed
 retry, queue visibility, refusal/unknown restoration and attachments. The app
 keeps local Sending feedback separate from run/activity evidence of execution.
+
+The outbox's `awaitingReconciliation` shares the existing input-blocking predicate;
+the app declares waiting feedback from that fact and leaves read errors on their
+existing retry surface. The sentence does not claim an active fetch or delivery
+after an ambiguous replay, and successful POST handling still does not await reads.
+
+Recovery methods return whether the local owner took the recovery intent, never
+whether the server accepted it. Only a taken action requests composer focus.
+The existing parking contract stops restoration when the user moves elsewhere.
+Draft adoption probes current field/parking ownership through a UI-only handle
+bound to that draft key. It never requests focus from cleanup, a capability read's
+completion or a late result in another view. A selected adopted draft resolves its
+real row directly for both panel ownership and rendering; there is no intermediate
+closed drawer or second selection state. Normalizing the target
+is conditional on that draft still being selected, while Registry adoption and
+the created row remain authoritative even after the user closes or switches.
+
+A legal retry rekey reports its actual scope/key at adoption. The scope's callback
+checks that identity against the current draft before probing its current UI
+handle; an old attempt cannot hand focus to another draft. Initial composer submit
+keeps the original void handoff into the held draft, including local refusals.
+Only recovery commands consume the local-takeover boolean, so a private retry
+cannot leave an extra restored copy in the next new-conversation composer.
+Initial admission also passes its actual text to the held-draft owner: recovery
+capture can refuse the POST without erasing the first sentence or inventing a send.
