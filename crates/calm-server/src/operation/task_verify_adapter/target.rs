@@ -1038,6 +1038,7 @@ mod tests {
     use super::*;
     use crate::model::now_ms;
     use serde_json::json;
+    #[cfg(target_os = "linux")]
     use std::process::Stdio;
 
     fn sample_of(head: &str, dirty: &[&str], holds: bool) -> Sampled {

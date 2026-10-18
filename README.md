@@ -128,24 +128,33 @@ This is a limited local-development path, not Linux feature parity. The Tailnet
 helper and the `make prod` build path remain Linux-only. Configure a local
 `neige-app` installation with Tailnet disabled and `child.fe_dist` pointing to
 the absolute `fe/web/dist` path; the frontend is served at `/next/`.
-Secure workspace file access requiring `openat2` and `/proc`-based process
-recovery are not ported. Unsupported file operations fail closed; they never
-fall back to less restrictive filesystem access. This build does not change Codex sandbox
-permissions or grant access to the user's home directory.
+Secure workspace file access requiring `openat2` and `/proc`-based process-group
+enumeration and descendant cleanup are not ported. Unsupported file operations
+fail closed; they never fall back to less restrictive filesystem access. This
+build does not change Codex sandbox permissions or grant access to the user's
+home directory.
 
-Shared Codex daemon supervision on macOS is socket-driven only. A persisted
-daemon record always resolves as absent (the `/proc` identity probes return
-`false` without `/proc`), so reaping the live listener behind a stale socket
-before a respawn is the only protection against a still-running daemon. Stops
-of a child this process spawned (a settings-triggered replacement, failed-launch
-cleanup) observe the exit through `proc_pidinfo` zombie state and do not wait
-the full stop grace. The stale-socket reap observes the listener's exit through
-a kqueue `NOTE_EXIT` watch: it signals the listener's process group while the
-leader is alive, but there is no per-member straggler sweep afterwards (macOS
-has no `/proc` identity to sweep by). A group member that ignores SIGTERM and
-outlives a leader that exited on SIGTERM is left running; if it inherited the
-listening socket, the next daemon start can fail closed (the reap finds no live
-owner it can verify) until that process and the socket are removed by hand.
+Shared Codex daemon supervision on macOS reads native process start time through
+`proc_pidinfo` and the boot UUID through `kern.bootsessionuuid`. A complete
+persisted identity that verifies against the live process can enter
+`try_takeover_live`: an eligible daemon with a successful handshake is adopted;
+a verified daemon whose handshake fails is reaped before relaunch. Unreadable
+or mismatched identity is not proof of ownership. Stale-socket listener reaping
+remains a separate recovery path, observing exit through a kqueue `NOTE_EXIT`
+watch.
+
+Stops of a child this process spawned (a settings-triggered replacement or
+failed-launch cleanup) observe exit through `proc_pidinfo` zombie state without
+waiting the full stop grace. An owned, unreaped child pins its process group
+for final cleanup. For an adopted daemon or stale-socket listener, once the
+leader exits there is no per-member straggler sweep: macOS has no `/proc`
+process-group enumeration. A member that ignores SIGTERM and outlives that
+leader can remain running; if it inherited the listening socket, the next
+daemon start can fail closed until that process and the socket are removed by
+hand. Gate execution (`task-verify` and `task-gate-run`) still requires Linux
+`/proc` to prove descendant cleanup. Native process identity does not provide
+that capability: macOS and other unsupported platforms return `gate-infra`
+before spawning a gate wrapper or executing any gate step.
 
 `cargo test -p calm-server --lib` as a whole is not expected to pass on macOS:
 some Linux-only fixtures are not `cfg`-gated. Only filtered subsets were run
