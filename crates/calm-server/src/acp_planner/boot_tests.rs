@@ -436,6 +436,9 @@ async fn acp_boot_turn_refuses_before_spawn_and_revokes_minted_token() {
     let state = AppState::boot(&cfg).await.unwrap();
     let repo = Arc::new(SqlxRepo::open(&cfg.db_url).await.unwrap());
     let row = owner(&repo, &root, AgentProvider::OpenCode).await;
+    // This test isolates the macOS launch scanner before any child can start. Use the
+    // existing crate-private managed ACP entry: HTTP readiness rejects earlier and
+    // would never exercise managed registration, token minting and revocation here.
     let session = super::session::AcpPlannerSession::open(super::session::SessionParams {
         host: host(&state),
         provider: AgentProvider::OpenCode,
@@ -445,19 +448,22 @@ async fn acp_boot_turn_refuses_before_spawn_and_revokes_minted_token() {
         card_id: row.card.clone(),
         track_id: row.track.clone(),
         cwd: root.clone(),
-        instructions: "Fixture".into(),
+        instructions: String::new(),
     });
-    let (held, _messages) = crate::harness::held_requests::channel();
+    let (held, _receiver) = crate::harness::held_requests::channel();
     session.mark_installed(held);
     let result = session
-        .turn_start(
+        .start_turn(
             &row.thread,
-            vec![provider::InputItem::Text {
-                text: "test".into(),
-            }],
-            &provider::TurnModelSelection::default(),
-            crate::planner_permission_mode::PlannerPermissionMode::Never,
-            &new_id(),
+            provider::control::TurnRequest {
+                input: provider::control::InputRequest {
+                    items: vec![provider::InputItem::text("test")],
+                    correlation: provider::control::CorrelationKey(new_id()),
+                },
+                selection: provider::TurnModelSelection::inherit(),
+                permission: crate::planner_permission_mode::PlannerPermissionMode::Never,
+                edit: provider::control::TurnEdit::NoEdit,
+            },
             &[],
         )
         .await;
@@ -511,3 +517,7 @@ async fn acp_boot_track_sweep_still_propagates_cleanup_error() {
     // Boot alone may degrade; the shared scanner and destructive lifecycle remain strict.
     boot(&repo, &host).await.unwrap();
 }
+
+#[cfg(all(target_os = "linux", feature = "fixtures"))]
+#[cfg(test)]
+mod receipt_tests;
