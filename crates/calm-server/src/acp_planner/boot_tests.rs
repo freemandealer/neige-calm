@@ -144,7 +144,7 @@ async fn http_available(state: &AppState) {
 
 #[cfg(target_os = "macos")]
 fn host(state: &AppState) -> Arc<AcpPlannerHost> {
-    use axum::extract::FromRef as _;
+    use axum::extract::FromRef;
     crate::state::RouteState::from_ref(state).acp_planner
 }
 
