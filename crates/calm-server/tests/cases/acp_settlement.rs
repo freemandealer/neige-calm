@@ -10,13 +10,13 @@ async fn acp_settlement_receipt_write_failure_cannot_publish_success() {
     let (status, body) = stack.post_input(&card, "settle once").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     wait_file(&root, "before-settlement").await;
-    let pool = stack.repo().sqlite_pool().unwrap();
+    let pool = stack.repo().sqlite_db().unwrap();
     sqlx::query(concat!(
         "CREATE TRIGGER refuse_acp_settlement BEFORE UPDATE ON acp_submissions ",
         "WHEN NEW.state='completed' BEGIN ",
         "SELECT RAISE(ABORT,'fixture receipt write failure'); END"
     ))
-    .execute(&pool)
+    .execute(pool.writer_pool())
     .await
     .unwrap();
     std::fs::write(root.path().join("release-settlement"), "").unwrap();
@@ -33,12 +33,12 @@ async fn acp_settlement_receipt_write_failure_cannot_publish_success() {
     assert!(!message.contains("reset"));
     let runtime = stack.runtime(&card).await;
     assert!(
-        calm_server::db::sqlite::acp_submission_unresolved(&pool, &runtime.id)
+        calm_server::db::sqlite::acp_submission_unresolved(pool.read_pool(), &runtime.id)
             .await
             .unwrap()
     );
     sqlx::query("DROP TRIGGER refuse_acp_settlement")
-        .execute(&pool)
+        .execute(pool.writer_pool())
         .await
         .unwrap();
     stack.shutdown().await;
@@ -61,9 +61,27 @@ async fn contention(exhaust: bool) {
     tokio::time::timeout(Duration::from_secs(20), pause.entered.notified())
         .await
         .unwrap();
-    let pool = stack.repo().sqlite_pool().unwrap();
+    // The drive's settlement pause does not acknowledge Harness persistence. Fence the
+    // early completed items before injecting receipt contention; the final reply's
+    // completion is published only after settlement and remains checked below.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let items =
+                claude_planner_session_fixture::card_rows(stack.repo(), &card, "item/completed")
+                    .await;
+            if items.iter().any(|frame| {
+                frame["item"]["type"] == "dynamicToolCall" && frame["item"]["status"] == "completed"
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the early native tool completion must be persisted before receipt contention");
+    let pool = stack.repo().sqlite_db().unwrap();
     let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
-        .fetch_one(&pool)
+        .fetch_one(pool.read_pool())
         .await
         .unwrap();
     assert_eq!(mode, "wal");
@@ -71,8 +89,8 @@ async fn contention(exhaust: bool) {
         .await
         .unwrap();
     pause.release.notify_one();
-    // A retry signal proves the real settlement exhausted write admission, including
-    // at least one production busy_timeout. Keep the writer until that observed signal.
+    // A retry signal proves real settlement exhausted write admission. Within this
+    // shared handle it waits on the writer pool; keep ownership until that signal.
     let first = tokio::time::timeout(Duration::from_secs(50), notes.recv())
         .await
         .unwrap();
@@ -104,7 +122,7 @@ async fn contention(exhaust: bool) {
                 .contains("unknown")
         );
         assert!(
-            calm_server::db::sqlite::acp_submission_unresolved(&pool, &runtime.id)
+            calm_server::db::sqlite::acp_submission_unresolved(pool.read_pool(), &runtime.id)
                 .await
                 .unwrap()
         );
@@ -134,7 +152,7 @@ async fn contention(exhaust: bool) {
             "SELECT state,outcome_json FROM acp_submissions WHERE worker_session_id=?1",
         )
         .bind(&runtime.id)
-        .fetch_one(&pool)
+        .fetch_one(pool.read_pool())
         .await
         .unwrap();
         assert_eq!(state, "completed");
@@ -188,7 +206,7 @@ async fn contention(exhaust: bool) {
         let state: String =
             sqlx::query_scalar("SELECT state FROM acp_submissions WHERE worker_session_id=?1")
                 .bind(&runtime.id)
-                .fetch_one(&pool)
+                .fetch_one(pool.read_pool())
                 .await
                 .unwrap();
         assert_eq!(
