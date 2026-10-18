@@ -1,5 +1,6 @@
 //! Boot degradation must not weaken credential revocation or the launch fence.
-//! Compiled as an ACP owner unit-test module, separate from production call-site scans.
+//! Compiled as an ACP owner unit-test module; Rust excludes this file from production.
+#![cfg(test)]
 #[cfg(target_os = "macos")]
 use super::config::{AcpPlannerHost, boot};
 use crate::config::Config;

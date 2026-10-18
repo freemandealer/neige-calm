@@ -58,8 +58,10 @@ revocation. Operators must resolve that process cleanup separately.
 Regression checks use isolated real boot/HTTP and ACP launch entry points to
 cover configured and unconfigured startup, historical token revocation and
 instance/provider isolation, revocation failure before listening, and refusal
-before agent spawn. The ACP owner compiles `tests/unit/acp_boot.rs` only under
-`cfg(all(test, unix))`, outside the production turn-call scan. The `acp_boot_`
+before agent spawn. The ACP owner compiles `src/acp_planner/boot_tests.rs` only under
+`cfg(all(test, unix))`. Its file-level `#![cfg(test)]` also prevents production
+compilation. The production turn-call scan recognizes that Rust-enforced
+file-level condition; the extractor scan still covers the test source. The `acp_boot_`
 filter is unchanged; adding or renaming a test needs no central list. The worker
 runs focused red/green and safety mutations; the gate owns quick/text/contract
 checks and one intentional focused replay. Broad suites remain CI's job.
