@@ -7,6 +7,14 @@ pub fn terminal_alias(id: &str) -> String {
 }
 pub const TERMINAL_ALIAS_SQL: &str = "'term:' || terminals.id";
 
+/// Whether an alias has any execution history, including retired and finished rows.
+pub async fn alias_has_execution(pool: &SqlitePool, alias: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_executions WHERE alias = ?)")
+        .bind(alias)
+        .fetch_one(pool)
+        .await
+}
+
 #[derive(sqlx::FromRow)]
 pub struct ExecutionRow {
     pub intent_json: String,
@@ -97,4 +105,85 @@ pub async fn pending(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     )
     .fetch_all(pool)
     .await
+}
+
+/// Occupancy scopes; lifecycle policy belongs to callers.
+pub enum Scope<'a> {
+    Track(&'a str),
+    Area(&'a str),
+    Alias(&'a str),
+}
+
+pub async fn unsettled_executions(
+    conn: &mut sqlx::SqliteConnection,
+    scope: Scope<'_>,
+) -> crate::error::Result<Vec<workspace::execution::ExecutionId>> {
+    let (predicate, value) = match scope {
+        Scope::Track(id) => ("e.track_id = ?", id),
+        Scope::Area(id) => (
+            "e.track_id IN (SELECT id FROM tracks WHERE area_id = ?)",
+            id,
+        ),
+        Scope::Alias(alias) => ("e.alias = ?", alias),
+    };
+    let query = format!(
+        "SELECT e.execution_id FROM workspace_executions e WHERE e.settled_at_ms IS NULL AND {predicate} ORDER BY e.execution_id"
+    );
+    let ids: Vec<String> = sqlx::query_scalar(&query)
+        .bind(value)
+        .fetch_all(conn)
+        .await?;
+    ids.into_iter()
+        .map(|id| id.try_into().map_err(crate::error::CalmError::Internal))
+        .collect()
+}
+
+/// Current alias slot, excluding historical retired executions.
+pub async fn current(
+    tx: &mut Transaction<'_, Sqlite>,
+    alias: &str,
+) -> crate::error::Result<Option<workspace::execution::ExecutionId>> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT execution_id FROM workspace_executions WHERE alias = ? AND desired <> 'retire'",
+    )
+    .bind(alias)
+    .fetch_optional(&mut **tx)
+    .await?;
+    id.map(|id| id.try_into().map_err(crate::error::CalmError::Internal))
+        .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::sqlite::SqlxRepo;
+
+    #[tokio::test]
+    async fn alias_has_execution_includes_retired() {
+        let repo = SqlxRepo::open("sqlite::memory:").await.unwrap();
+        let pool = repo.pool();
+        let alias = terminal_alias("history");
+        assert!(!alias_has_execution(pool, &alias).await.unwrap());
+
+        let mut tx = pool.begin().await.unwrap();
+        insert(&mut tx, "history-id", "track", &alias, "{}", "{}")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(alias_has_execution(pool, &alias).await.unwrap());
+        assert!(
+            !alias_has_execution(pool, &terminal_alias("missing"))
+                .await
+                .unwrap()
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        request(&mut tx, "history-id", "retire").await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(alias_has_execution(pool, &alias).await.unwrap());
+
+        settle(pool, "history-id", "{}", 1).await.unwrap();
+        finish(pool, "history-id").await.unwrap();
+        assert!(alias_has_execution(pool, &alias).await.unwrap());
+    }
 }
