@@ -74,17 +74,14 @@ mod gated {
     }
 
     /// Run the role gate against the caller's write-through caches (the `RepoEventWrite` wrappers' entrance), and mint the capability on success.
-    pub(in crate::db::sqlite::events) async fn authorize_with_caches<'a, T>(
-        tx: &mut T,
+    pub(in crate::db::sqlite::events) async fn authorize_with_caches<'a>(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         actor: &'a ActorId,
         scope: &'a EventScope,
         event: &'a Event,
         card_role_cache: &crate::card_role_cache::CardRoleCache,
         track_area_cache: &crate::track_area_cache::TrackAreaCache,
-    ) -> Result<Authorized<'a>>
-    where
-        T: crate::decision_gate::WriteTx + ?Sized + Send,
-    {
+    ) -> Result<Authorized<'a>> {
         crate::decision_gate::enforce_role_resolving_session(
             tx,
             actor,
