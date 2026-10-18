@@ -4,7 +4,8 @@ pub use plugin::proc_identity::{
     ProcStatFields, parse_proc_stat_fields, parse_starttime_from_stat, read_proc_start_time,
 };
 
-/// Read the kernel's per-boot UUID (`/proc/sys/kernel/random/boot_id`); every reboot rerolls it. `None` on non-Linux or a read failure, which callers treat as 'can't prove identity → skip the kill'.
+/// Read Linux's per-boot UUID from `/proc/sys/kernel/random/boot_id`.
+/// A read failure cannot prove identity, so callers skip the kill.
 #[cfg(target_os = "linux")]
 pub fn read_boot_id() -> Option<String> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
@@ -15,15 +16,61 @@ pub fn read_boot_id() -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Non-Linux stub for [`read_boot_id`]; off-Linux cross-boot reclaim is a no-op.
-#[cfg(not(target_os = "linux"))]
+/// Read macOS's per-boot UUID from `kern.bootsessionuuid`.
+/// Require a complete, nonempty NUL-terminated UUID; access denied means unknown.
+#[cfg(target_os = "macos")]
+pub fn read_boot_id() -> Option<String> {
+    let mut len = 0;
+    // SAFETY: a null output buffer queries the required length; newp=null and
+    // newlen=0 make this read-only. The name is a static NUL-terminated string.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len <= 1 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    bytes.resize(len, 0u8);
+    // SAFETY: bytes is writable for len bytes, and len points to the capacity
+    // passed to the kernel. This call also supplies no new value to write.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != bytes.len() {
+        return None;
+    }
+    let boot = std::ffi::CStr::from_bytes_with_nul(&bytes)
+        .ok()?
+        .to_str()
+        .ok()?;
+    uuid::Uuid::parse_str(boot).ok()?;
+    Some(boot.to_owned())
+}
+
+/// Unsupported platforms cannot prove cross-boot process identity.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_boot_id() -> Option<String> {
     None
 }
 
-/// Verify that the live process at `pid` is the SAME process whose `(start_time, boot_id)` we captured at spawn: no reboot since, `/proc/<pid>/stat` exists, and its `starttime` matches.
-/// Needed on top of the socket probe because of the TOCTOU between probe and signal: a recycled pid has a strictly later `start_time`, and a cross-reboot recycle has a different `boot_id`.
-/// Returns `false` unconditionally on non-Linux.
+/// Verify the platform-native `(start_time, boot_id)` captured at spawn.
+/// A different start identifier rejects a recycled pid; a different boot UUID
+/// rejects cross-reboot reuse. Read failures and unsupported platforms fail closed.
+/// The caller's verify-then-signal window still exists; a socket probe alone
+/// cannot establish this identity either.
 pub fn verify_owned_pid(pid: i32, expected_start_time: u64, expected_boot_id: &str) -> bool {
     // Reboot check FIRST: cheapest, and the whole prior boot's pid namespace is dead regardless of stamp.
     let Some(live_boot) = read_boot_id() else {
@@ -230,6 +277,74 @@ pub fn sigkill_verified_members(members: &[GroupMember]) -> GroupSweepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn boot_id_is_stable_nonempty_uuid() {
+        let boot = read_boot_id().expect("kernel boot id");
+        uuid::Uuid::parse_str(&boot).expect("boot id is a UUID");
+        assert_eq!(read_boot_id(), Some(boot));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn verify_owned_pid_rejects_wrong_start_time() {
+        let pid = std::process::id() as i32;
+        let start = read_proc_start_time(pid).expect("own start time");
+        let boot = read_boot_id().expect("kernel boot id");
+        assert!(verify_owned_pid(pid, start, &boot));
+        assert!(!verify_owned_pid(pid, start ^ 1, &boot));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn verify_owned_pid_rejects_wrong_boot_id() {
+        let pid = std::process::id() as i32;
+        let start = read_proc_start_time(pid).expect("own start time");
+        let boot = read_boot_id().expect("kernel boot id");
+        assert!(verify_owned_pid(pid, start, &boot));
+        assert!(!verify_owned_pid(pid, start, &format!("{boot}-stale")));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn verify_owned_pid_rejects_invalid_pids() {
+        let boot = read_boot_id().expect("kernel boot id");
+        for pid in [i32::MIN, -1, 0, i32::MAX] {
+            assert!(!verify_owned_pid(pid, 1, &boot), "pid {pid}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn verify_owned_pid_accepts_live_child_and_rejects_reaped_child() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let status = self.0.wait().expect("reap identity test child");
+                eprintln!("identity test child {} reaped: {status}", self.0.id());
+            }
+        }
+        let mut child = ChildGuard(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn identity test child"),
+        );
+        let pid = i32::try_from(child.0.id()).expect("pid fits i32");
+        let start = read_proc_start_time(pid).expect("live child start time");
+        let boot = read_boot_id().expect("kernel boot id");
+        assert_ne!(start, 0);
+        assert_eq!(read_proc_start_time(pid), Some(start));
+        assert!(verify_owned_pid(pid, start, &boot));
+        child.0.kill().expect("kill owned test child");
+        child.0.wait().expect("reap owned test child");
+        assert!(!verify_owned_pid(pid, start, &boot));
+    }
 
     #[test]
     fn parse_proc_stat_fields_handles_paren_comm() {

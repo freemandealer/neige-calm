@@ -3,7 +3,10 @@
 
 #[cfg(target_os = "macos")]
 mod macos_process;
+
 mod preserving_recovery;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod termination_identity_tests;
 mod thread_release;
 
 use std::collections::HashSet;
@@ -4002,8 +4005,8 @@ impl SignalScope {
 enum ExitWait<'a> {
     /// We own the `Child` handle: exit-driven `child.wait()`.
     Child(&'a mut Child),
-    /// Identity-verified external process: poll `verify_owned_pid` (a
-    /// post-signal zombie counts as exited).
+    /// Expected external identity: revalidate before signaling, then poll `verify_owned_pid`
+    /// (a post-signal zombie counts as exited). This value alone grants no signal authority.
     VerifiedIdentity {
         pid: i32,
         start_time: u64,
@@ -4041,6 +4044,24 @@ async fn terminate_group_with_grace(
     grace: Duration,
 ) -> LeaderExit {
     let (scope_kind, scope_id) = scope.describe();
+    // A persisted identity may have stopped matching since takeover or the last watcher probe.
+    // Reject the entire operation: a member scan of the old numeric PGID cannot restore authority.
+    if let ExitWait::VerifiedIdentity {
+        pid,
+        start_time,
+        boot_id,
+    } = &wait
+        && !verify_owned_pid(*pid, *start_time, boot_id)
+    {
+        tracing::debug!(
+            target: "shared_codex_daemon::stop",
+            scope_kind,
+            scope_id,
+            pid,
+            "external identity unverified before termination; skipping signals and member sweep"
+        );
+        return LeaderExit::FullyGone;
+    }
     // An owned child ALREADY reaped before this helper ran means the numeric pgid may be
     // recycled: nothing here is safely signalable anymore, not even the initial SIGTERM.
     if let ExitWait::Child(child) = &wait

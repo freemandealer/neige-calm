@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -362,13 +363,47 @@ printf '%s\n' '{"headRefOid":"action-head-without-merge"}'
     );
 }
 
+// Keep the unreaped child handle as the authority for failure-path cleanup.
+// A panic while reading native identity must not leave the counter loop alive.
+struct LiveActionChild {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl LiveActionChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.reaped = true;
+                eprintln!("live action child {} reaped: {status}", self.child.id());
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for LiveActionChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            signal_process_group(self.child.id() as i32, libc::SIGKILL);
+            let _ = self.child.kill();
+            let status = self.child.wait().expect("reap live action child");
+            eprintln!(
+                "live action child {} reaped on drop: {status}",
+                self.child.id()
+            );
+        }
+    }
+}
+
 async fn spawn_live_counter_action(
     action: &Path,
     counter: &Path,
     sentinel: &Path,
     finish: &Path,
-) -> (tokio::process::Child, SpawnArtifacts) {
-    let mut cmd = tokio::process::Command::new(action);
+) -> (LiveActionChild, SpawnArtifacts) {
+    let mut cmd = std::process::Command::new(action);
     cmd.arg(counter)
         .arg(sentinel)
         .arg(finish)
@@ -389,7 +424,12 @@ async fn spawn_live_counter_action(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let child = loop {
         match cmd.spawn() {
-            Ok(child) => break child,
+            Ok(child) => {
+                break LiveActionChild {
+                    child,
+                    reaped: false,
+                };
+            }
             Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                 if std::time::Instant::now() >= deadline {
                     panic!("live fake action {action:?} still ETXTBSY after 10s of retries: {err}");
@@ -399,7 +439,7 @@ async fn spawn_live_counter_action(
             Err(err) => panic!("spawn live fake action {action:?}: {err}"),
         }
     };
-    let pid = child.id().expect("child pid") as i32;
+    let pid = child.child.id() as i32;
     let artifacts = SpawnArtifacts {
         pid,
         pgid: pid,
@@ -1678,6 +1718,95 @@ async fn forge_action_issue_read_returns_body_inline_persists_artifact_and_emits
     );
     assert_eq!(fs::read_to_string(&result_path)?, issue_body);
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn assert_recovery_rejects_mismatched_identity(wrong_boot: bool) -> CalmResult<()> {
+    let boot = TestBoot::new().await;
+    let child = LiveActionChild {
+        child: std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn identity test child"),
+        reaped: false,
+    };
+    let pid = child.child.id() as i32;
+    let mut artifacts = SpawnArtifacts {
+        pid,
+        pgid: pid,
+        start_time: read_proc_start_time(pid).expect("child start time"),
+        boot_id: read_boot_id().expect("current boot id"),
+        log_path: None,
+        extra: json!({}),
+    };
+    let idem = "forge-recovery-identity";
+    let op_id = seed_parked_forge_op(
+        &boot,
+        idem,
+        payload(
+            &boot,
+            idem,
+            vec!["/usr/bin/true".into()],
+            boot.temp_path("identity-result"),
+        ),
+        artifacts.clone(),
+    )
+    .await?;
+    let op = boot
+        .operation_repo
+        .get_operation(&op_id)
+        .await?
+        .expect("parked op");
+    let adapter = ForgeActionAdapter::new();
+    let matching = adapter
+        .recover_parked(
+            &op,
+            &artifacts,
+            true,
+            RecoveryMode::PreDeadlineProbe,
+            &boot.spawn_ctx,
+        )
+        .await?;
+    assert!(
+        matches!(matching, ParkedRecovery::LeaveParked),
+        "{matching:?}"
+    );
+    if wrong_boot {
+        artifacts.boot_id.push_str("-stale");
+    } else {
+        artifacts.start_time ^= 1;
+    }
+    let mismatched = adapter
+        .recover_parked(
+            &op,
+            &artifacts,
+            true,
+            RecoveryMode::PreDeadlineProbe,
+            &boot.spawn_ctx,
+        )
+        .await?;
+    assert!(
+        matches!(mismatched, ParkedRecovery::Fail { ref reason }
+        if reason == "forge action process dead with no probe; gate-infra"),
+        "{mismatched:?}"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn forge_action_recovery_rejects_wrong_start_time() -> CalmResult<()> {
+    assert_recovery_rejects_mismatched_identity(false).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn forge_action_recovery_rejects_wrong_boot_id() -> CalmResult<()> {
+    assert_recovery_rejects_mismatched_identity(true).await
 }
 
 #[tokio::test]

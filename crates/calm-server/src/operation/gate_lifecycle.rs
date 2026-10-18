@@ -3,6 +3,9 @@
 //! kernel gate (`task-verify`) and the worker-requested run (`task-gate-run`) each own their
 //! admission, release order and completion; nothing here decides a verdict.
 
+#[cfg(all(test, target_os = "macos"))]
+mod unsupported_gate_tests;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -130,6 +133,7 @@ impl GatePaths {
 
 /// Spawn the held wrapper (`gate_process::spawn_held`) and read its identity triple back. The
 /// wrapper executes nothing until it is released; an identity that cannot be read kills its group.
+/// Platforms without gate descendant cleanup are rejected before creating a wrapper.
 pub(crate) async fn spawn_held_identified(
     repo: &dyn crate::db::RouteRepo,
     cwd: &Path,
@@ -137,6 +141,14 @@ pub(crate) async fn spawn_held_identified(
     paths: &GatePaths,
     op_marker: &str,
 ) -> Result<(tokio::process::Child, SpawnArtifacts)> {
+    // Native leader identity is insufficient: stop_group also needs Linux /proc membership
+    // and environment-marker evidence to prove all descendants stopped before a verdict.
+    if !cfg!(target_os = "linux") {
+        return Err(CalmError::Internal(format!(
+            "gate-infra: gate execution unsupported on {}: descendant cleanup requires Linux /proc",
+            std::env::consts::OS
+        )));
+    }
     let child = spawn_held(repo, cwd, steps, paths.files(), op_marker).await?;
     let pid = child.id().map(|p| p as i32).ok_or_else(|| {
         CalmError::Internal("gate wrapper exited before pid could be read".into())
