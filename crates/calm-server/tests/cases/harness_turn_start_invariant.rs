@@ -58,6 +58,9 @@ fn harness_turn_start_is_gated() {
             continue;
         }
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        if is_test_only_source(&src) {
+            continue;
+        }
         assert!(
             !src.contains(".turn_start("),
             "unexpected turn_start callsite in {rel}"
@@ -80,5 +83,38 @@ fn visit_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             out.push(path);
         }
+    }
+}
+
+/// Only a file-level unconditional `cfg(test)` proves that no caller in the file can
+/// enter a production build. File names, comments and attributes on individual items do not.
+fn is_test_only_source(source: &str) -> bool {
+    syn::parse_file(source)
+        .expect("parse source for file-level test configuration")
+        .attrs
+        .iter()
+        .any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Path>()
+                    .is_ok_and(|path| path.is_ident("test"))
+        })
+}
+
+#[test]
+fn turn_start_scan_excludes_only_rust_enforced_test_files() {
+    assert!(is_test_only_source("#![cfg(test)]\nfn fixture() {}"));
+    assert!(is_test_only_source(
+        "//! test fixtures\n#![cfg(test)]\nfn fixture() {}"
+    ));
+    for source in [
+        "// #![cfg(test)]\nfn production() {}",
+        "const MARKER: &str = \"#![cfg(test)]\";",
+        "#[cfg(test)] mod tests {} fn production() {}",
+        "#![cfg(any(test, unix))]\nfn production() {}",
+        "#![cfg_attr(test, allow(dead_code))]\nfn production() {}",
+        "fn production() {}",
+    ] {
+        assert!(!is_test_only_source(source), "must scan: {source}");
     }
 }
