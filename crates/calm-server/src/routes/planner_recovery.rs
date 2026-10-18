@@ -55,33 +55,25 @@ pub(super) async fn recover(
             "Restore this conversation's workspace before resuming; history is retained.".into(),
         ));
     }
-    crate::harness::backend::factory::PlannerFactory::new(
+    let factory = crate::harness::backend::factory::PlannerFactory::new(
         std::sync::Arc::downgrade(&cs.shared_codex_appserver),
         &s.claude_planner,
         &s.acp_planner,
-    )
-    .ready(
-        &crate::session_projection_repo::AgentProvider::Codex,
-        crate::harness::backend::factory::ReadinessFor::RestoreOrSend,
-    )
-    .await?;
-    let thread = crate::harness::effective_runtime_thread_id(&runtime).ok_or_else(|| {
-        CalmError::Conflict("original conversation thread is missing; history is retained".into())
-    })?;
-    if let Some(old) = s.harness.get(&runtime.id) {
-        old.quiesce_system_error_for_recovery().await?;
-        s.harness.remove_if_same(&runtime.id, &old);
-    }
-    // Quiescence may have waited for a completion to restore dropped steers.
-    // Use that settled durable queue, not the earlier candidate's snapshot.
-    let runtime = w
-        .repo
-        .session_projection_by_id(&runtime.id)
-        .await?
-        .ok_or_else(|| CalmError::Conflict("conversation changed during recovery".into()))?;
-    let outcome = cs
-        .shared_codex_appserver
-        .resume_system_error_conversation(&runtime, &thread)
+    );
+    factory
+        .ready(
+            &crate::session_projection_repo::AgentProvider::Codex,
+            crate::harness::backend::factory::ReadinessFor::RestoreOrSend,
+        )
+        .await?;
+    let outcome = factory
+        .resume_system_error_conversation(w.repo.as_ref(), &runtime, async || {
+            if let Some(old) = s.harness.get(&runtime.id) {
+                old.quiesce_system_error_for_recovery().await?;
+                s.harness.remove_if_same(&runtime.id, &old);
+            }
+            Ok(())
+        })
         .await?;
     if let Some((item_db_id, turn_id)) = outcome {
         s.repo
