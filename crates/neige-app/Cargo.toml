@@ -15,6 +15,7 @@ name = "neige-app"
 path = "src/main.rs"
 
 [dependencies]
+calm-session = { path = "../calm-session" }
 calm-tailnet-control = { path = "../calm-tailnet-control" }
 anyhow = "1"
 # #1282 — the boot-autospawn budget the host must cover before the child binds
@@ -27,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -35,5 +37,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
