@@ -38,7 +38,7 @@ M1 W1–W4 已合入 #2866–#2871）。父合同为 [track-workspace.md](track-
 | 执行：`workspace_executions` 表、`Engine`、typed opt-in Terminal；`unsettled_executions` 接入 `require_safe_tx`、删除调用者 quiesce、clean 跳过 | `workspace-execution.md` §7、§11；`server/operation/terminal_disposal.rs:110-123` |
 | executor 的共享 registration 请求（`Attach` 作 Worktree registration、`Export/ExportAck`、`ObserveDirectories`、`ObserveTransferredDirectories`、`RetireRegistration`）在 calm-server 没有生产发送者；生产适配器 `session_executor` 只发 `Prepare(Private)` 及 Launch/Revoke/Inspect/Control/Watch/Retire | `crates/calm-session/src/control/execution.rs`、`crates/calm-proc-supervisor/src/execution/mod.rs:346-390`、`runtime/execution/session_executor.rs` |
 | executor 帧用 bincode（变体按序号编码）；journal 与 registration receipt 用 JSON 持久化；boot 时要求持久 receipt 的 `contract == EXECUTION_ENVELOPE_VERSION`（现为 4），journal 另有 `JOURNAL_VERSION`（4） | `crates/calm-session/src/lib.rs:281-286`、`crates/calm-session/src/control/execution.rs:29`、`crates/calm-proc-supervisor/src/execution/{mod.rs:250-257,directory.rs:14-22,journal.rs:14,236-246}` |
-| 锁：每卡 `planner_recovery_locks` → 全局 operation drive mutex（`OperationRuntime::lock_for_track_delete`；`drive()` 持有它，但 boot 的 `apply_recovery_item` 不持它直接调用 `drive_one`，所以它**不是**所有 operation 驱动的公共漏斗）→ 每 track `track_delete_locks`（绕过 OperationRuntime 的直接恢复/重连），不得反向。创建持目标 area 的 `area_delete_locks`，先于以上各锁；单 Track DELETE 不取 area 锁 | `server/state.rs:112-141`、`server/operation/driver.rs:75-78,400-408,444-446,1204-1214`、`server/harness/mod.rs:245`、`server/routes/planner_recovery.rs:47`、`server/routes/tracks.rs:722-727,3123-3126` |
+| 锁：每卡 `planner_recovery_locks` → 全局 operation drive mutex（`OperationRuntime::lock_for_track_delete`；`drive()` 持有它；boot 的 `apply_recovery_item` 在 Recover 与 Compensate 取 claim 前也持有它，`driver.rs:1299-1302`、`:1326-1328`，早先基线不持有）→ 每 track `track_delete_locks`（绕过 OperationRuntime 的直接恢复/重连），不得反向。创建持目标 area 的 `area_delete_locks`，先于以上各锁；单 Track DELETE 不取 area 锁 | `server/state.rs:112-141`、`server/operation/driver.rs:75-78,400-408,444-446,1204-1214`、`server/harness/mod.rs:245`、`server/routes/planner_recovery.rs:47`、`server/routes/tracks.rs:722-727,3123-3126` |
 | Planner turn issuance：既有 runtime 从 Idle/TurnCompleted 发下一 turn 只取自身的 `inner.issuance`，复查 archive、shutdown、live carrier 后转 Issuing、持久化 snapshot 再发送，不取 drive 或 track 锁；clean 的 SQL 只排除 `starting/running/turn_pending`，注释写明 idle Planner 不阻止 clean | `server/harness/run_loop.rs:3074,3287-3314,3351-3371,3533-3547`、`server/harness/state.rs:59-68`、`server/workspace_service/ports.rs:65-73` |
 | 删除的 post-commit 窗口：删除事务内捕获 `WorkspaceTrackSweep`（worktree 字符串），行删除提交后经若干 await 才在 `spawn_blocking` 中 `worktree remove --force` 并兜底删目录；Area 删除同样在提交与 `finalize_area_recycle` 之后 sweep | `server/workspace_service/sweep.rs:11-34`、`server/routes/tracks.rs:2939-2997`、`server/routes/areas.rs:643-716`、`runtime/sweep.rs:19-45`、`crates/workspace/src/teardown.rs:56-61,100` |
 | 幂等形状：`create_request_digest` 对后加的可选字段在省略时不写入载荷，以保留历史 binding 的 SHA（`admin` 的 false 与省略同形） | `server/routes/tracks/create.rs:427-465` |
@@ -118,7 +118,10 @@ D1–D3 的前提是三条更窄的事实：(a) **准入时排除**：每个新�
 | C0d | 删除作 Worktree registration 的共享 `Attach`、`RetireRegistration`（`execution/attachment.rs` 的 `attach_objects`、`retirement.rs`、session `attachment_client.rs` 与 `tests/execution_attachment.rs` 的对应部分），以及只服务共享 registration 的 `execution_registration*` 测试 | 净删除；覆盖保留不变量的测试断言改挂到 Private 路径而不是删除 | C0c |
 | C1 | 关闭后清理的围栏，复用既有两把锁、不加第二套 lifecycle 锁（持有区间见下） | 进程内围栏，不加表。验收：clean 在 SQL 采样后暂停 → reopen 并启动 → clean 拒绝且不写 cleaned；clean 先赢时，worker 准备、终端创建、typed admit、Planner 启动/恢复、boot 恢复项各自得到 Busy（可重试，不 Stuck）或等待且 clean 结束后正常启动（每个入口一个测试，不只测 reopen）。既有 idle Planner 双向：① issuance 先赢——clean 采样后、取 track 前暂停，向 idle Planner 投入排队消息使其持久化 Issuing，恢复 clean → 复查看到 `turn_pending`，拒绝且不写 cleaned；② clean 先赢——clean 持 track 停在 `git clean` 之前，分别投入排队消息、自动观察与 pending rewind → 不持久化 Issuing、不发送 turn/start，clean 结束后各自照常发出；③ 删除持 track 时有 issuance 在等待 → 删除完成且该 turn 不发出、无死锁。约 350 行 | 无 |
 | C2a | typed Pipe `CloseStdin` 前置能力：Interactive 精确 capability，关闭 writer、保留输出与生命周期 | 真实 client→wire→executor→child EOF 与 Engine 入口；幂等 close、关闭后 write 拒绝；PTY/未授权/Unknown 拒绝；envelope 9，持久合同与 journal 仍为 4 | E2b（已合入） |
-| C2b | gate shell（`server/operation/gate_process.rs:263` 的 `spawn_held`）改为 Engine 消费者；保留其持久恢复、stdin 释放与 leader reaping 合同 | 一个构造点或一个恢复机制；writer 移入 executor 后 kernel 死亡不再自动关闭 gate stdin，须定义 released/not-released 的持久归属与 boot reconciliation，不能仅靠 CloseStdin | C2a |
+| C2b.0 | 行为不变的准备片，缩小 C2b.1 | ① `tests/execution_hooks.rs:42-75` 的 supervisor 装配移入 `tests/support`（移动，不复制），`execution_hooks` 改用它；② 通用写者对 `terminal_launch` 的三处特判（`writes.rs:155-158`、`:250-253`、`:306-315`）改由该层一个 owner-state 键常量生成，此时常量只有 `terminal_launch`；③ owned 留存守卫（见设计）：`owns_parked_resource()` 改为返回 owner-state 键，四个离开写者带必需的键参数并在事务内留存、返回 `Retained`，driver 对 `Retained` 记错误并在 lease 到期后再 drive；④ owned Parked reconcile 的错误留存；⑤ 新迁移去掉 parked CHECK 对非 isolated 行的 artifacts 要求，该要求只留在 Rust（④⑤ 见设计）。生产适配器都不声明键，CHECK 只放宽，Rust 的 artifacts 围栏不变，故行为不变；迁移使本片为 L2。新测试：lib `claim_tests::owned_key_retains_terminal_writes`、`owned_parked::tests::error_keeps_lease_and_writes_last_error`，calm-truth `typed_gate_park_migration_tests::{upgrade_preserves_rows_refs_indexes_and_keyed_fence, parked_check_keeps_only_owner_neutral_facts}`；replay `execution_hooks` 全部、lib `repo_sqlite::claim_tests`、`operation::tests::{set_parked_requires_lease_and_artifacts_record_rejects_stale_lease, parked_return_without_artifacts_fails_and_drops_observer}`、`terminal_adapter::tests::launch_cleanup_tests` 与 calm-truth `operations_keyed_rows_permanent_tests`。估算 +52/−48，守卫与 `Retained` +40，`mod.rs` +4/−2，`driver.rs` 调用点与延迟 drive +25/−4，28 个测试调用点改参数 +28/−28，新测试 +40；错误留存 +12/−3 与其测试 +40；迁移 +90（表定义取自 0152，只改一支）、`head_schema_fixture.rs` 迁移清单 +1、迁移测试 +90；合计约 +422/−85 ≈ 510 | C2a |
+| C2b.1 | worker gate run（`task-gate-run`）改为 Engine 消费者；同片引入两种 gate 共用的唯一构造点 `server/operation/gate_execution.rs`、必需记录 `gate_execution` v1、typed parked 关联与 typed 占用读者（设计见下） | 范围：Pipe intent 工厂（沿用现有环境白名单；consumer `gate` 注册显式 no-op projection）、记录 CAS（SQL 在 calm-truth）、owner-state 常量加入 `gate_execution`、owned 适配器 park 的 Rust 条件不再要求 `spawn_artifacts_json`（表约束由 C2b.0 迁移放行）、owned 的 Boot 恢复先于 deadline 分流、释放顺序、完成事务内复核 decision、Stop 型 timeout、gate 适配器声明 `gate_execution` 键（留存不变量由 C2b.0 的守卫执行）、boot 矩阵的 gate run 列（SpawnStarted 收窄为 infra）、`gate_ops` 的混合占用合同、`finalize_run` 改收结算 status、`ExecutionUnavailable` 拒绝、pre-C2b 原生 `task-gate-run` op 不推进（task verify 到 C2b.2 才适用）。测试世界接 C2b.0 移出的真实 executor support，`launch_kernel` 重启测试的 supervisor 留在测试进程、活过 kernel kill。删除：`task_gate_run/mod.rs:300-400,448-527` 的重驱 `stop_group`、`spawn_held_identified`/`record_spawn_artifacts`、原生 `recover_parked`、Observer 的 stdin 写入/`observe_verdict`/reap 及原生补偿分支。新测试 `c2b_gate_run_has_one_engine_construction`、`c2b_gate_run_refuses_unavailable_executor`、`c2b_release_authorizes_before_first_byte`、`c2b_refused_release_writes_no_byte`、`c2b_phase_writes_preserve_gate_record`、`c2b_typed_park_needs_no_spawn_artifacts`、`c2b_redrive_of_held_ends_infra_without_second_execution`、`c2b_boot_held_stops_without_token`、`c2b_boot_after_deadline_keeps_boot_origin`、`c2b_changed_decision_aborts_completion`、`c2b_timeout_retries_while_probe_holds_claim`、`c2b_stop_decision_survives_unavailable_and_restart`、`c2b_cancel_parked_leaves_typed_op_parked`、`c2b_typed_gate_op_occupies_until_settled`（新 run 准入、regate、reuse、delivery 各一断言）、`c2b_lost_close_ack_does_not_repeat_steps`、`c2b_leader_exit_drains_descendants_before_verdict`、`c2b_unknown_execution_never_completes_op`、`c2b_pre_c2b_native_op_is_never_advanced`、`c2b_park_write_failure_retains_owned_execution`、`c2b_recorded_op_never_enters_compensation`、`c2b_malformed_record_is_retained_with_backoff`、`c2b_owned_park_requires_decodable_record`。replay：mcp_integration_suite `task_gate_run::{a_gate_run_commits_new_files_before_its_steps_run, a_red_step_returns_its_name_and_tail, an_edit_during_the_run_discards_its_result, done_during_a_run_delivers_after_the_run, a_cancel_during_a_run_keeps_the_checkout_busy_until_it_ends, more::the_run_releases_its_wrapper_only_after_parked, restart::*, commit_message::done_before_checkpoint_release_accepts_the_admitted_input, reuse::an_unchanged_candidate_reuses_the_passing_run}`；kernel_process_suite `parked_operations::{recovery_mode_plumbing_distinguishes_boot_probe_and_past_deadline, boot_recovery_past_deadline_ignores_abandoned_parked_lease}`；lib `task_gate_run::tests::run_recovery_never_reads_the_exit_file`、`execution_boot::port_contract::*`、`repo_sqlite::claim_tests`、C2b.0 的两条 `operation::tests` 原生 artifacts 用例与 `terminal_adapter::tests::launch_cleanup_tests`（pin `terminal_launch` 保留）。`restart::a_restart_before_the_park_reruns_nothing`（R8a）保留名字，断言由“重驱后 Succeeded”改为“step 未执行、run 以 infra 结束”（见 boot 矩阵）。估算（增/删）：`gate_execution.rs` +215；calm-truth 记录 CAS 与结算读取 +45；`writes.rs` 常量与 `set_parked` 的键条件 +8/−1；`driver.rs` +30/−18；`gate_ops.rs` +30/−6；`task_gate_run/mod.rs` +110/−200；`finalize.rs` +20/−15；重启 support +35；22 个新测试 +380；R8a 等既有用例改写 +20/−15。合计约 +893/−255 ≈ 1150，超出约 800：每个生产消费者与其不变量测试保持原子（typed op 从第一次合入起就必须被准入、park、boot、完成与占用读者一致读取），可前置的行为不变整理（含留存守卫）已移入 C2b.0，PR 按上列文件组说明 | C2b.0 |
+| C2b.2 | task verification（`task-verify`）改为同一构造点的 Engine 消费者：释放移到 park 之后，Released 的 boot 只重试 CloseStdin 并重新挂 observer，after-sample 只认 Drained | 范围：observer 释放、`Exited` 后 Stop 收尾子孙、两个计时器（见下）、boot 矩阵的 task verify 列、新 attempt 前要求前一 attempt 的 gate execution 已结算（替代 kill prior）、恢复判决取 executor status 而非 exit file、`gate_ops` 对无记录的原生 op 改判 Unproven（此后不再产生原生 op），无记录的原生 `task-verify` op 自此不推进（boot 矩阵末行）；scheduler 测试世界接 C2b.1 的 executor support。删除：`task_verify_adapter/mod.rs` 的 `spawn_side_effect`（`:368-558`）中的 kill-prior（`:383-417`）、`spawn_held_identified`（`:423`）、`tasks.gate_pid*` 写入与 park 前释放（`:433-495`）、原生 observer/reap（`:511-558`），`recover_parked`（`:560-664`）的 PID 存活与 exit-file 恢复，补偿 `kill_gate_group`（`:720-741`）；verify 对 `target::stop_group`（`target.rs:691`）的调用改为结算事实，函数本身留给 C2b.3。列保留，读者改为 execution 事实。新测试 `c2b_verify_releases_only_after_park`、`c2b_boot_released_retries_only_close_then_reattaches`、`c2b_crash_before_token_is_infra_not_relaunch`、`c2b_timeout_probe_preserves_durable_decision`、`c2b_after_sample_requires_drained`、`c2b_new_attempt_requires_prior_execution_settled`、`c2b_recovered_verdict_uses_executor_status`、`c2b_settled_verify_after_deadline_keeps_status`、`c2b_native_terminal_gate_op_is_unproven`。replay：runtime_suite `scheduler::` 中 `green_gate_flips_verifying_to_done`、`red_gate_fails_with_failing_step_and_log_tail`、`gate_timeout_*`、`gate_spawn_kills_prior_recorded_group`、`forged_exit_file_and_group_kill_cannot_flip_gate_green`、`step_exit_ends_step_and_still_writes_exit_file`、`gate_step_env_is_minimal_and_evidence_paths_scrubbed`、`closed_track_still_drives_verifying_gate`、`stale_gate_before_first_attempt_fails_without_running_shell`、`parked_gate_dead_*`、`boot_reattach_live_gate_lands_verdict_after_exit`、`aborted_observer_leaves_gate_group_alive_and_reattach_lands_verdict`；mcp_integration_suite `gate_binding::{gate_result_discarded_when_tree_changed_during_steps, reattached_gate_result_discarded_when_tree_changed, recovered_gate_stops_the_group_before_sampling, live_reattached_gate_result_discarded_when_tree_changed, gated_candidate_happy_path_wakes_planner_once, legacy_lease_gate_runs_without_target_check, pre_upgrade_frozen_gate_boots_as_unbound}`、`task_regate::regate_reruns_gate_on_same_candidate`；lib `task_verify_adapter::verdict_tests::*`；加 C2b.1 的 `c2b_` 过滤器。改写 PID/exit-file 证据的用例保留名字与断言意图，`parked_gate_dead_with_exit_file_recovers_real_verdict` 与 `pre_upgrade_frozen_gate_boots_as_unbound` 改以 settlement status 为恢复证据（后者用新的 typed 记录构造，不得借此恢复真正无记录的 pre-C2b op）。估算（增/删）：`task_verify_adapter/mod.rs` +150/−290；`target.rs` +15/−20；`gate_execution.rs` 的 Released boot、重挂与授权计时 +60；`gate_ops.rs` +8/−10；`tasks.gate_pid` 读者 +20/−15；scheduler support +40；9 个新测试 +150；PID/exit-file 证据用例改写 +60/−90。合计约 +503/−425 ≈ 930，超出原因同 C2b.1：task verify 这一生产消费者与其不变量测试保持原子（同一 op 的 spawn、park、boot、恢复与占用读者必须同片切换） | C2b.1 |
+| C2b.3 | 删除已无调用者的共享原生 gate 机器（纯删除片） | `gate_process.rs:263-324` 的 `spawn_held`、`:328-426` 的 `GateWait`/`GateObservation`/WNOWAIT `observe_verdict`、`:429-541` 的 group/marker 存活、sweep 与 `kill`（`kill` 先做 caller sweep）及其测试模块 `:543-677`，`gate_lifecycle.rs:137` 的 `spawn_held_identified` 与直接调用它的 `gate_lifecycle/unsupported_gate_tests.rs` 用例（`:149`），`target.rs:691` 的 `stop_group`，以及 caller sweep 证明只服务它们的 `target.rs` kill 与 `proc_identity` marker helper；`marked_group_stopped` 的最后一个生产调用者 `gate_ops.rs:107` 已在 C2b.2 改判，故此片无行为变化。Forge/provider/terminal 仍在用的 helper、`verdict_from_exit_code`、wrapper 与 step/exit 文件保留。无新测试；replay `verdict_tests::*` 与 C2b.1/C2b.2 全部 `c2b_` 过滤器，caller sweep 证据写入 PR。估算约 −470（`gate_process.rs` 约 −410、`gate_lifecycle.rs` 约 −45、`target.rs`/`proc_identity` 约 −60，减去测试用例删除后的 import 调整），兼容改动不超过 60 行 | C2b.2 |
 | C3a / C3b | forge action / probe 改为 Engine 消费者，各对应一个现有 spawn 点（`server/operation/forge_action_adapter/mod.rs:1009`、`:1296`） | 同上；`cwd_lease` 冻结语义不变；不按工具名单注册 | C2a |
 | C4 | Planner 本地 provider 进程（Claude session/rewind/readiness、ACP）与 worker 启动改为 Engine 消费者，每个 provider 的一个启动或恢复入口一片，沿最新 main 的 provider Factory 归属 | 同上；provider 外部协议仍由 provider 层拥有 | C2a |
 | C5 | 破坏性 effect 的正向静默：recycle、`remove_track_worktree`、sweep、area 补偿在 fence 下要求 `unsettled_executions(scope)` 为空，否则 Busy 并保留目录；已迁移类型的 Legacy 代理判断同片删除，未迁移类型的 Legacy 检查保留 | 删除路径保持“先 quiesce、后写者复查”的现有时序；scope 只在非重叠合同（含 O1）成立后才等于 owning track。验收：未结算执行时 Track/Area 删除返回 Conflict 且目录与 branch 保留 | C2a–C4、O1 |
@@ -132,6 +135,203 @@ kernel 死亡后这些 deadline/析构与进程内 fence 不再生效；遗留�
 迁移还需 Engine 当前没有的 stdout/stderr 分离与
 每次 sample 的归属，成本不值得；不为名义消费者而扩大本片。C2a 仅补齐后续迁移的 Pipe half-close。
 升级到 envelope 9 必须重启 supervisor；严格拒绝 envelope 8，不回退 Legacy；持久 receipt 合同和 journal 版本保持 4。
+
+**C2b 设计决定。** 路径前缀：`server/`、`supervisor/`、`runtime/`、`truth/` 分别指 calm-server、calm-proc-supervisor、
+workspace-runtime、calm-truth 的 `src/`（迁移为 `truth/migrations/`）。四片串行（C2b.0 行为不变），每种 gate 只有一条路线，不保留可选的原生回退。
+
+- **构造。** `gate_execution.rs` 是唯一构造点：由冻结 cwd、GateFiles 和现有环境白名单（`server/operation/gate_process.rs:285-309`
+  的 env_clear、五个继承键、`terminal_worker_env`、证据路径与 `NEIGE_GATE_OP`）构造 Pipe `ExecutionIntent`，owner 为 op，
+  alias 每个 gate op 一个（`workspace_executions_current_alias` 唯一索引，`truth/migrations/0170_workspace_executions.sql:14-15`）。
+  Pipe 把 stdout/stderr 并入 executor 自己的输出流（`supervisor/execution/process.rs:177-184`），而判决证据是 gate log，
+  所以 wrapper 在握手之后执行 `exec >>"$log" 2>&1`，log 路径经环境传入后 unset（与 exit/step 路径一样）。脚本、log、step
+  与 exit 路径在准入事务之前写好，不启动一个之后才写脚本的 intent。缺 Engine 或 `!available()` 时，gate run 准入和
+  spawn 前都返回 `CalmError::ExecutionUnavailable`（同终端，`server/operation/terminal_execution_create.rs:27-32`），
+  不建 execution 行，不 fork；envelope 8 已由 C2a 拒绝。
+- **记录。** 必需的 `operations.tx_output_json.data.gate_execution`，`version` 为 JSON 整数 1：`{execution_id, release: Held |
+  Released{authorized_at_ms}, decision: Observing | Stopping{reason: Timeout | KernelRestarted | ReleaseRefused}}`（不设 Canceled，见留存不变量）。
+  `intent_json` 不可变（`0170:19-27` 的 trigger），不能放可变位，记录放 `tx_output_json`；park 的表约束需要新迁移（见下）。记录有三种写入：① 准入，在 SpawnStarted
+  的原 claim 下，与 `require_live_claim_tx`、`Engine::admit` 同一写事务，仅当记录缺失时写 Held；提交后才 `drive`
+  （`runtime/execution/engine.rs:43-60`，ticket 类型见 `mod.rs:166-182`）。② Held→Released。③ Observing→Stopping
+  与 `Engine::request(Stop)` 同一事务（Store 的 Tx 就是 operation 的 SQLite 事务，同终端的 `admit(tx, …)`）。
+  CAS 条件固定 op id、`execution_id`、当前 `release` 与 `decision`；条件 SQL 放 calm-truth（`server/execution_store.rs:9`）。
+  只有这三种写入，没有把记录换绑到另一个 execution 的写入（见 boot 矩阵的 SpawnStarted）。②③ 的写事务都先
+  `require_live_claim_tx`（`writes.rs:73-80`）：live observer、deadline sweep 与 boot 都先取 claim 再写，同一时刻只有一个 release/decision 写者。
+  取不到 claim（`claim_parked` 返回 None，`server/operation/mod.rs:939-962`）不消耗一次性的计时器到期或 ReleaseRefused：
+  写者重读 op 并重试，直到 op 终结或该 decision 已 durable（`c2b_timeout_retries_while_probe_holds_claim`）。
+  通用写者今天只特判 `terminal_launch`（`server/operation/repo_sqlite/writes.rs:155-158`、`:250-253`、`output_value` `:306-315`），
+  否则补偿写会因为 `settlement_output_matches_tx` 不匹配而被拒绝。C2b.0 先把特判改为该层一个 owner-state 键常量，
+  两个 UPDATE 和比较都从它生成；C2b.1 只在常量里加 `gate_execution`。`complete_parked_tx` 在事务内重读行，本身保留记录
+  （`writes.rs:318-372`），由 `c2b_phase_writes_preserve_gate_record` pin 住。永久成本：C2b.0 的键参数是一次性的签名与调用点迁移
+  （四个写者、28 个测试调用点，编译检查），不留调用者或测试清单。日后另一个 owned 资源要做 owner 注册：适配器声明键、owner 的
+  记录编解码与结算、常量加键；parked CHECK 不读 owner 记录，不随 owner 加迁移；只有既有 owner 多保留一个字段才只改常量。新增的 `c2b_`
+  与迁移测试随所在 suite 每个 CI workflow 各跑一次；mutation 只在实现 PR 内做一次，不进 CI。
+- **释放顺序（两种 gate 相同，只在 park 提交后由 observer 执行）。** ① durable authorize：Held→Released 与
+  `require_attempt_startable_tx` 在同一写事务，扩展 `TaskLaunch`。它今天先检查、再在事务外运行 effect
+  （`server/operation/task_launch.rs:71-91`）。之后先等 execution 有可交互的 Spawned receipt（`interact` 先 inspect，无 receipt
+  即拒绝，`runtime/execution/engine.rs:301`、`:353-358`）：Prepared/Forking 只是等待，不是 ReleaseRefused，计入 60s 上限。② `Engine::interact(WriteStdin "go\n")`，同一调用内按 `StdinProgress.accepted_bytes`
+  只重试剩余后缀。③ `Engine::close_stdin`。① 输了，或 ②③ 失败、超过 60s，就走 ③ 型 Stopping{ReleaseRefused}；
+  永不用关闭未授权的 stdin 来取消。崩溃后看到 Released 不再写字节，只重试 CloseStdin。token 未完整送达时，
+  `read -r _go || exit 75`（`gate_process.rs:19`）让 shell 不执行任何 step，没有已开始的 step 就判 infra（`:201-207`）。
+  task verify 今天在 park 前释放（`task_verify_adapter/mod.rs:433-495`），SpawnStarted 重驱又先 kill 再重启（`:383-416`），
+  所以释放后、park 前崩溃会让 step 跑第二遍；改为 park 后释放，SpawnStarted 就只可能是 Held。这是有意的行为变化。
+- **Timeout 与 Stop。** Timeout、ReleaseRefused、KernelRestarted 都走 decision ③ 加 `Desired::Stop`，op 留在 Parked。Desired 只增（`runtime/execution/mod.rs:79-84`，
+  `0170:29-35` trigger），executor 先 TERM、再 KILL（`supervisor/execution/shutdown.rs:7-38`）。完成事务里同时请求
+  `Desired::Retire`，由 executor 收尾输出与回收（`retire_waits_output_open`）。两个计时器不同：授权计时
+  `authorized_at_ms + timeout` 才是 gate 的 timeout，live observer 与 boot 重挂都按它的剩余时间等待，到期写 ③ Stopping{Timeout}；
+  `parked_deadline_ms` 是 park 时刻 + timeout + 120s 余量（`gate_lifecycle.rs:31`、`:62-65`）的 sweep 安全网。observer 在 park 后立即授权时，释放上限
+  60s 小于余量，授权计时先到期；但 park 到授权之间的延迟没有上界（`task_gate_run/mod.rs:173` 的 `before_release` seam 也能
+  停住它），所以 parked deadline 是独立的安全上限，不依赖这一先后。PastDeadline 时未结算且仍 Observing 就写 ③ Stopping{Timeout}，已结算则走下面的结算规则：
+  已结算、无 decision 的 Released verify 不论在 boot 还是过期 sweep 被发现，都取 settlement status，同今天“死且有 exit 证据先于
+  mode 判断”（`task_verify_adapter/mod.rs:576-599`）。settlement 不带退出时间，kernel 停机期间不承诺严格的墙钟 timeout。
+- **回收与 timeout/probe 围栏。** gate 不再持有 Child，删除 WNOWAIT 僵尸锁（`gate_process.rs:352-426` 的 `observe_verdict`、
+  `task_gate_run/mod.rs:489-496`）。observer 经 `Engine::output` 观察状态：`Exited{status}` 时请求 Stop 收尾子孙（对应今天的
+  无条件 `kill`，`gate_process.rs:398`），再在有界的 `wait_settled` 内等到 `Drained{status}`。status 是 helper 报告的 leader 退出码
+  （`supervisor/execution/scope_helper.rs:168-178`），drain 证据是 subreaper（`:84` 设置）的 ECHILD（`:176-178` 之后才报 Drained），
+  不读 /proc 环境，不可读的子孙不再削弱 drain。observer 和 probe 都经 `owned_parked::reconcile` 的 claim 围栏完成
+  （`server/operation/owned_parked.rs:11-53`），判决规则先要求权威结算：未结算一律 LeaveParked，Stopping 本身从不授权完成；
+  已结算时 decision 为 Stopping{r} 取 r，否则取 `Drained{status}` 的 status（NoChild 判 infra）。after-sample 只在 Drained 之后；
+  没有结算证据时 op 保持 parked，检出保持 busy。reconcile 在完成事务之前算好 outcome（`owned_parked.rs:21`），事务内只验 claim
+  （`:26-28`），`complete_parked_tx` 重读行只为保留字段、不复核判决（`writes.rs:318-372`）。所以适配器只从 claim 时 `op` 快照里的
+  记录推导 outcome；gate 适配器在同一事务内既有的 `complete_owned_parked_tx`（`:29-30`）重读记录，`execution_id`、`release`、
+  `decision` 任一与快照不同就返回 Conflict，整个事务回滚，reconcile 按下文的错误留存写 `last_error`、保留 lease，lease 到期后
+  下一轮（observer 重试或 sweep）以新快照重算，Stopping 优先。②③ 必须持 claim 已排除这一竞争；复核是同一 owner 内的防线，不加通用 hook。
+- **owned execution 留存不变量（一条类不变量，取代逐个例外）。** 有记录的 op 只能停在 SpawnStarted 或 Parked，离开它们的唯一写入是
+  上面 reconcile 的完成事务（结算后判决，`complete_owned_parked_tx` 同事务复核记录并请求 Retire）。前三轮阻断同属一类：通用路径
+  （saga 补偿、`mark_failed`、普通与 boot 外层的 `mark_stuck`）只验输入、phase 与 claim（`writes.rs:55-64`），在 Stop、结算与
+  Retire 之前终结 op。
+  - 唯一守卫点：通用 repo 的四个离开写者 `set_phase`（`repo_sqlite.rs:344-388`）、`set_compensating`（`:409-456`）、`mark_failed`
+    （`:490-536`）、`mark_stuck`（`:538-581`）在同一写事务、`has_live_claim_tx` 之后调用 `writes.rs` 的一个 helper：行的
+    `tx_output_json.data.<key>` 存在就不写目标 phase。key 问适配器：`owns_parked_resource()`（`mod.rs:810`）改为返回
+    `Option<&'static str>`（必须是 C2b.0 owner-state 常量里的键，`is_some()` 即原 bool），四个写者以必需参数接收，漏传编译失败。
+    守卫读事务内的行而不读 claim 快照：B1 中 driver 的 `op` 是准入前取的快照，没有记录。记录只在 SpawnStarted 的 claim 下写入，
+    claim 又校验 phase，所以 Pending/TxCommitted/AppServerInteract 来源的写者看到的行必无记录，照旧终结。保证范围是现有生产
+    调用路径：`write_phase_and_tx_output` 不带守卫、不限来源 phase（见表）；新增从 SpawnStarted/Parked 调用它的生产路径须先接同一守卫。
+  - 留存：同一事务只写 `last_error`（“owned execution retained: …”），phase 与 lease 不变，返回区别于丢 claim 的 `Retained`；
+    driver 记 error 日志，并在 lease 到期后安排一次 detached `drive()`（同 `retry_after_track`，`driver.rs:524-552`；稳态没有周期
+    drive）。Parked 行由 parked sweep 在 lease 过期后重取（`mod.rs:939-962`）。退避就是 lease（60s，`mod.rs:76`）：
+    `claim_drive_batch` 跳过未过期 lease（`repo_sqlite.rs:186-210`），持续错误每个 lease 周期重试一次、不热循环；op 非终态，
+    `gate_ops` 报 Unfinished，准入、regate 与 delivery 都能看到该 op 与 `last_error`。
+  - 重试路线（稳态与 boot 相同）：重驱 SpawnStarted 时 `spawn_side_effect` 入口已有记录，typed park 同一 execution，observer
+    不释放，写 ③ Stopping{KernelRestarted} 加 Stop，结算后 infra 加 Retire（boot 矩阵的 SpawnStarted 行）。这解决第三轮 B1：
+    `set_parked`（`driver.rs:790`）失败后外层 `mark_stuck`（`:464-468`、`:1309-1316`）被留存，下一 lease 周期重驱完成上述路线。
+  - Parked 的错误留存：owned Parked 路径不经四个写者。`owned_parked::reconcile` 把 `recover_owned_parked` 的错误（含记录解码）、
+    `Fail` 与完成事务的错误都上抛（`owned_parked.rs:21-24`、`:43-46`），`:50-53` 却先无条件清 lease、不写 `last_error`；driver 只记
+    日志（`driver.rs:984-998`），下一次 sweep 立即重取（`mod.rs:939-962`）。C2b.0 把 `:50-53` 按结果分开：完成已提交或 LeaveParked
+    照旧清 lease；任何 Err 改为一条同样以 `lease_owner = 本 claim AND phase = 'parked'` 为围栏的 UPDATE，只写 `last_error`
+    （“owned execution retained: …”）与 `updated_at_ms`，lease 不动，再返回该错误。lease 即退避：稳态 `claim_parked` 跳过未过期
+    lease，每个 lease 周期重试一次。boot 不看 lease，一次 boot 对起始即 parked 的行至多两次立即尝试：`apply_recovery` 先以 Boot
+    claim 处理 VerifyParked 项（`driver.rs:489`、`:1371`），再无条件 `sweep_parked_for_boot`（`:510`、`:984`），其
+    `claim_parked_for_boot` 不看 lease（`mod.rs:965-976`）；之后由稳态 lease 退避。保留末次 sweep，它也发现恢复中新 park 的行。围栏
+    0 行（claim 已被替换）就不写。它在通用层、与 owner 无关，形状同四写者的 `Retained`；Stop、结算与 Retire 仍归 owner。
+  - 损坏的记录：守卫只看键存在、不解码，照样留存；SpawnStarted 重驱与 Parked reconcile 的解码错误分别经外层守卫与上一条留存，
+    每个 lease 周期记一次错误。这是不变量违背，
+    不自动终结，因为终结会丢掉 Stop 该 execution 的唯一句柄；op 与检出保持 busy 并带 `last_error`，直到人工处理。
+  - 不选“准入、记录与 park 同事务”：它要把通用 phase 写入搬进适配器的准入事务，而 park 之后的写者（缺 deadline、补偿入口、
+    外层 Stuck）仍需同一守卫，不能单独闭合这一类。由此删去两条逐例外规则：gate 的 `plan_compensation` 读到记录返回 Conflict，
+    以及“记录之后 `spawn_side_effect` 不返回 Err”。`cancel_parked` 没有生产调用者（只有 `operation/tests.rs:443`），task cancel
+    也不停 gate（`a_cancel_during_a_run_keeps_the_checkout_busy_until_it_ends`）；它对 owned 适配器仍在 claim 前返回 `Ok(false)`，
+    免得占住 observer 的 parked claim；日后的取消只能在 claim 下写 ③ 并保持 Parked。executor 不可用或未结算时 ③ 只写 DB，
+    reconcile 一律 LeaveParked，boot 不等 executor。Stuck 只留给无记录的 op 与 pre-C2b 原生补偿。
+
+  | 终结或补偿写者（HEAD 行号） | 有记录时 |
+  |---|---|
+  | Pending 失败 `mark_failed`（`driver.rs:596-614`）；TxCommitted `set_phase(Succeeded)` 与补偿（`:649`、`:658-676`）；AppServerInteract 补偿（`:746-754`） | 来源先于 SpawnStarted，行必无记录，照旧终结 |
+  | SpawnStarted 的 `Ready` → `set_phase(SpawnSucceeded)`（`:768`）及 SpawnSucceeded → `Succeeded`（`:834`） | 留存，重驱走 typed park |
+  | SpawnStarted 补偿入口：未声明 Parked、缺 artifacts、Err（`:779-787`、`:807-815`、`:820-828`，经 `fail_with_compensation` `:873-888`） | `set_compensating` 留存；无记录时照旧补偿（无进程步）后 Failed |
+  | 普通外层 `mark_stuck`（`:458-475`）与 boot 外层 `mark_stuck`（`:1296-1324`） | 留存（B1） |
+  | 补偿收尾 `resume_compensation` 的 `mark_failed`/`mark_stuck`（`:890-925`，经 Compensating drive `:843-852` 与 boot Compensate `:1326-1348`） | 有记录的 op 进不了 Compensating；到达也留存 |
+  | `cancel_parked`（`:413-428`） | claim 前返回 `Ok(false)`；到达 `set_compensating` 也留存 |
+  | 缺 deadline 的 `fail_claimed_parked`（`:1019-1027`、`:1241-1255`） | 留存；typed park 的 deadline 必需（`mod.rs:387-390`），不可达 |
+  | 原生 parked：`kill_recheck_then_fail_parked`（`:1201-1239`）、缺 artifacts（`:1125-1131`、`:1386-1396`）、`complete_parked_and_publish`（`:1181-1199`） | owned 分支先返回（`:1054`、`:1117` 与移到 deadline 分流前的 boot owned 分支）；其中 `mark_failed` 也留存 |
+  | `write_phase_and_tx_output`（`writes.rs:197-278`），经 `prepare_tx_and_advance`（`repo_sqlite.rs:296-341`，来源 Pending）、`set_phase_and_tx_output`（`:390-407`；生产调用 `driver.rs:685`、`:710`、`:725`、`:739`，来源 TxCommitted/AppServerInteract）与 `PhaseWrite::Inserted`（`tx_only.rs:196`、`terminal_execution_create.rs:185`，新插入的 Pending） | 不带守卫；现有生产来源都先于 SpawnStarted，行必无记录 |
+  | `owned_parked::reconcile`（`owned_parked.rs:11-53`） | 唯一终结路线；LeaveParked 释放 claim；任何 Err（解码、Fail、完成事务 Conflict）按 Parked 的错误留存写 `last_error`、保留 lease |
+
+  回归：C2b.0 的 lib `claim_tests::owned_key_retains_terminal_writes`（测试适配器声明键，四个写者均留存且只改 `last_error`）；
+  C2b.1 的 `c2b_park_write_failure_retains_owned_execution`（普通与 boot 两个入口，各在准入提交后、park 提交前注入一次失败：一个
+  execution、零个 step、结算前不终结、最终 infra 加 Retire、无永久占用）、`c2b_recorded_op_never_enters_compensation`（准入后
+  `spawn_side_effect` 报错、`plan_compensation` 报错两例）、`c2b_stop_decision_survives_unavailable_and_restart`（Timeout 写入，
+  executor 不可用期间 op 保持 Parked，kernel 重启，executor 恢复后结算，完成与 Retire 同事务）、`c2b_cancel_parked_leaves_typed_op_parked`
+  与 `c2b_malformed_record_is_retained_with_backoff`（SpawnStarted 与 Parked 各一行坏记录，boot 与稳态两个入口：phase 不变、
+  `last_error` 持久、稳态 lease 期内不重取、到期只重试一次，一次 boot 恰两次尝试、不再多，不准入或终结 execution）；C2b.0 的 lib
+  `owned_parked::tests::error_keeps_lease_and_writes_last_error`（测试适配器的 recover 报错、Fail、完成事务 Conflict 三例，另验
+  claim 被替换后旧 reconcile 不写）。
+- **Typed parked 关联。** gate 适配器声明 owner-state 键 `gate_execution`（改型后的 `owns_parked_resource()`）。driver 的 owned 路径（`server/operation/driver.rs:1031-1060`、
+  `:1117-1125`、`:1368-1380`）目前没有实现者（只有 trait 默认值，`server/operation/mod.rs:810`），缺三处：`set_parked` 的
+  `spawn_artifacts_json IS NOT NULL` 条件（`writes.rs:113-117`）和 `driver.rs:796-812` 的缺 artifact 检查，对 owned 适配器改为
+  由适配器解码必需记录，不伪造 PID 三元组；以及 boot 来源：`VerifyParked` 先按 deadline 分流（`:1360-1366`），过期的 owned op
+  经 `apply_parked_past_deadline_with_claim` 以 `RecoveryMode::PastDeadline` 进入（`:1117-1124`），Boot 丢失。改为 owned 适配器
+  在 deadline 判断之前走 Boot 分支（仍以 `ParkedClaimMode::Boot` 取 claim），以 `RecoveryMode::Boot` 调用；`op` 带着
+  `parked_deadline_ms`，来源与 deadline 都到 owner，由它按矩阵与上面的计时规则决定。不加新的 RecoveryMode；原生适配器顺序不变
+  （`calm-server/tests/cases/parked_operations.rs:406-419` 的原生断言照旧）。
+- **park 的表约束（新迁移，C2b.0）。** 0152 的 parked CHECK（`truth/migrations/0152_operations_awaiting_retry.sql:57-75`）要求非
+  `codex-isolated-worker` 行 `spawn_artifacts_json IS NOT NULL`（`:61`），无 artifacts 的例外只给 isolated（`:62-73`），改 Rust 条件
+  也躲不过它；第四轮 adversarial 用 0152 原 DDL 复现两种 gate kind 的 park 都被拒。已发布迁移字节冻结，C2b.0 加
+  `<NNNN>_parked_artifacts_in_rust.sql`（编号合入时取下一个空号）。谓词只改第一支：去掉其 artifacts 要求，成为
+  `kind <> 'codex-isolated-worker'`；parked 的 `parked_at_ms`/`parked_deadline_ms` 事实与 isolated 支逐字不变。schema 不读任何
+  owner 记录：在通用表 CHECK 里解析 `gate_execution` 的字段是 owner 私有政策，且每个日后的 owned 资源都要再加一支迁移（第五轮
+  boundary B1）。不选“artifacts 或 `tx_output_json IS NOT NULL`”：parked 行都经过 TxCommitted，`prepare_tx_and_advance`
+  （`repo_sqlite.rs:296-341`）已写入 tx output，原生与 owned 行都满足，它区分不了任何行，不是 parked 的不变量。artifacts 要求
+  留在今天就执行它的 Rust：非 owned 适配器由 `set_parked` 的 `spawn_artifacts_json IS NOT NULL`（`writes.rs:104-117`）与 driver
+  的缺 artifact 检查（`driver.rs:796-815`）拒绝，C2b.0 起这是原生行唯一的围栏，由 replay 的 `operation::tests::{set_parked_requires_lease_and_artifacts_record_rejects_stale_lease,
+  parked_return_without_artifacts_fails_and_drops_observer}`（`tests.rs:280`、`:1645`，后者经生产 driver 与 `set_parked`）pin 住，
+  生产中只有专用 `set_parked` 可进入 Parked；通用 phase 写者与直接 SQL 不在这个围栏内。
+  实现 PR 分别做 mutation：只删去 `writes.rs:117` 的条件时两条用例应变红；只删去 driver 的缺 artifact 检查时，`parked_return_without_artifacts_fails_and_drops_observer` 应变红（driver 检查在 `set_parked` 返回未写入之后）。C2b.1 起 `set_parked` 以 owner-state 键参数分支：未声明键照旧要求
+  artifacts，声明键则要求同一事务内该键存在（与留存守卫同一个通用事实），不看 artifacts。记录的完整有效性只由 owner 解码器负责：
+  gate 适配器在 `spawn_side_effect` 返回 Parked 前以 `gate_execution.rs` 解码本 claim 下的行（记录只在本 claim 下写入），失败即
+  返回 Err，经补偿入口被守卫留存并写 `last_error`；键缺失则不 park、守卫不留存，照旧补偿（无进程步）后 Failed，因为准入与记录
+  同事务，无记录即无 execution。混合期 C2b.1 的 task verify 仍是原生，走未声明键的分支；迁移不随片或 owner 改。重建沿用 0152 的步骤：迁移
+  事务内外键始终开启（`truth/db/sqlite/infra/database.rs:43`；实测重建被引用的父表在 `defer_foreign_keys` 下同样提交失败），
+  所以先把 HEAD 唯一的引用列 `worker_sessions.spawn_op_id`（0163 定义；0103 的引用表已由 0125 删除）存入临时表并置 NULL；
+  新表的列、默认值与其余 CHECK 同 0152，`INSERT … SELECT *`、DROP、RENAME，恢复引用，再逐字重建三个索引与 keyed 行 DELETE
+  trigger（`0152:89-103`）。测试（C2b.0，calm-truth）：`upgrade_preserves_rows_refs_indexes_and_keyed_fence` 以 `migrator_through`
+  （`track_merge_policy_ask_migration_tests.rs:8`）建前一版本库，灌原生 parked、isolated parked、awaiting_retry、keyed 行与引用它们的
+  `spawn_op_id`，迁移后逐列相等、引用恢复、`foreign_key_check` 为空、索引与 trigger 的 `sqlite_master` SQL 不变、keyed 行仍不可删；
+  `parked_check_keeps_only_owner_neutral_facts` 在正常迁移的库上：无 artifacts 的非 isolated parked 行可写入，缺 `parked_at_ms` 或
+  `parked_deadline_ms` 的仍被拒，isolated 分支不变（无 receipt 与缺键行被拒）。C2b.1 经生产 driver 与 `set_parked`：
+  `c2b_typed_park_needs_no_spawn_artifacts` 两种 kind 各一行；`c2b_owned_park_requires_decodable_record` 键缺失 → 不 park、
+  Failed、零 execution，记录损坏 → 不 park、留存、`last_error` 持久。
+- **占用读者。** `gate_ops.rs:54-92` 只读 `spawn_artifacts_json`，`:101-108` 对终态 op 以 `is_none_or` 把“无 artifacts”当作已停；
+  新 run 准入（`task_gate_run/admission.rs:103-138`）、regate（`regate.rs:148-160`）、reuse（`reuse.rs:141`、`:173`）与 delivery
+  （`git_candidate/delivery.rs:394-398`）都经它。C2b.1 起 `GateOp` 带一个闭合的进程来源：有记录 → 在同一事务内经 calm-truth
+  读取该 execution 是否已结算，未结算为 Unproven；只有 artifacts → 照旧 `marked_group_stopped`（C2b.1 的 task verify 仍是原生）；
+  两者都没有 → 已停（准入与记录同事务，无记录即未 fork）。C2b.2 之后不再产生原生 op，只有 artifacts 的 op 改判 Unproven，与
+  pre-C2b 的 unresolved 政策一致；代价：升级时在途 attempt 若已有原生 gate op，升级后其新 run 与 regate 被拒（既有 Unproven
+  提示），reuse 不复用，delivery 不受影响（只看 Unfinished）。调用者与枚举不变，gate 政策留在 calm-server。
+- **Boot 矩阵。** 在 `Engine::recover` 只排队 drive（`server/state.rs:1584`、`engine.rs:81-101`）之后，由既有 operation 恢复
+  （`server/main.rs:73`）逐 op 处理。boot 本身只写 DB（decision 加 Desired）和 drive，不等 executor：
+  - SpawnStarted 且无记录、无 artifacts：准入事务未提交，没有 execution，重驱按 ① 准入。
+  - SpawnStarted 且有记录（必为 Held；boot 与留存后的稳态重驱相同）：两种 gate 相同。以 typed park 停泊同一 execution，其 observer 不释放，在 parked
+    claim 下写 ③ Stopping{KernelRestarted} 加 Stop（按上面的重试规则），结算后按“已记 Stopping”判 infra；不准入第二个 execution，step 一次也没跑，worker 可再跑、Planner 可 regate。
+    这是有意收窄：旧行 Stop 并结算后仍占别名（`0170:14-15` 的唯一索引只排除 `retire`），Engine 对已结算、非 Retire 的行
+    不再推进（`runtime/execution/engine.rs:206-213`），而 Retire 只在完成事务里请求；替换需要 Retire、准入与记录换绑同事务
+    及其崩溃重放，唯一要它的是 R8a 测试（`calm-server/tests/cases/task_gate_run/restart.rs:125-171` 断言重驱后 Succeeded），不是生产消费者。
+  - Parked 且 Held：两种 gate 相同。Stopping{KernelRestarted} 加 Stop，永不发 token，结算后判 infra。
+  - Parked 且 Released：worker gate run 走 Stopping{KernelRestarted}，判 infra，保持今天的重启合同
+    （`task_gate_run/mod.rs:365-395`），不顺带改成恢复判决。task verify 只重试 CloseStdin，再按授权计时的剩余时间
+    重挂 observer；已过期且未结算就写 ③ Stopping{Timeout}。
+  - 已记 Stopping{r}：用同一 execution 完成 r，永不重启。
+  - 已结算但无 decision：task verify 取 settlement status（NoChild 判 infra，不做 after-sample）；
+    worker gate run 判 infra。
+  - executor 不可用：保留 Desired 与占用，op 留在 parked；drive 等待可用（`runtime/execution/session_executor.rs:198-210`），
+    新 gate 被拒。
+  - supervisor 在同一 OS boot 内重启：活动行变为 Unknown，Prepared 变为 Revoked，Reserved 变为 NoChild
+    （`supervisor/execution/mod.rs:186-188`）。Unknown 拒绝 CloseStdin 与交互（`supervisor/execution/controls.rs:133-141`），
+    `next_step` 对 Stop/Retire 也只会 Wait。gate 不 close、不重启、不采样、不完成。supervisor 退出已关闭 writer，Held 的 shell
+    读到 EOF 后以 75 退出、什么也没执行，但这不产生 durable 的 drain 证据：C2b 在同一 OS boot 内无法恢复这种 execution，
+    op 与检出一直 busy，直到主机重启（NoChild）或另立的 executor 证明/对账功能。C2b 不承诺最终结算，也不加 PID 回退。
+  - OS 重启：活动行变为 NoChild `host_rebooted`（`mod.rs:183-184`），结算后判 infra。
+  - pre-C2b 原生 op（有 `spawn_artifacts_json`、无记录；`task-gate-run` 自 C2b.1、`task-verify` 自 C2b.2）：不发信号、不重启、不完成。parked 的 op 由 reconcile 报 unresolved，
+    检出保持 busy；其余 op 与旧的 `stop_run_group`/`kill_gate_group` 补偿步骤拒绝后进入 Stuck（既有补偿失败路径，
+    `driver.rs:916-923`），原因写明“在旧 kernel 下排空或手工停止 pgid N”。升级前须排空 gate。
+- **Planner 质询。** (a) 接受，删去 prelude。writer 是 supervisor 的 `Process.input`（`process.rs:177-184`、`:257`）：
+  kernel 死亡时 writer 不关闭，held shell 停在 `read`，什么也不执行，boot 会 Stop 它；supervisor 死亡时 writer 关闭，
+  shell 读到 EOF 以 75 退出；半个 token 加 EOF 同样以 75 退出。prelude 只多给“无 kernel 时持有自行过期”，那只是占用，
+  不是执行。备忘录要求“EOF 才是最终释放”，这里不采纳：token 只在 durable 授权之后才写，读到 token 就等于已授权。
+  未找到具体风险。(b) 接受，不加 pre-drive hook。`next_step` 中 Absent/Prepared 加 Stop 得 Revoke，Spawned 加 Stop 得 Stop
+  （`runtime/execution/mod.rs:106-127`）。Engine 抢先 Launch 的 Held intent 只是一个持有中的 shell，而 boot 从不做 Held→Released，
+  所以先后顺序只决定是否 fork，不影响安全。(c) 接受，合并：记录与 typed park 的唯一消费者就是 cutover，typed park 只是上述三处改动。
+  (d) 接受，共四片：行为不变的 C2b.0 之后三片。gate run 先行，因为它从不恢复判决，能先验证构造、释放、Stop 与 park；task verify 再加 Released 的重挂
+  与 after-sample；最后一片是纯删除。mutation 验证只针对“授权先于首字节”、“boot Held 必 Stop”、timeout 围栏（含完成事务内复核）、typed 占用读者与 owned 留存守卫五条不变量。
 
 **C0 保留清单。** 删除边界按私有路径的依赖划定，不按类型整块删：`stage_private`（`execution/preparation.rs:198-201`）、
 唯一的 `release_private`（`execution/private.rs:8-37`）与 transfer 身份/nonce/root 资格检查（同文件 65-132）、
@@ -368,7 +568,7 @@ effect 本身只限于其根，是否对 worktree 根放宽为只拒绝“位于
   （managed 根与 worktree 根），由配置与 DB 行给出，不按 provider、模板或路径字符串（如 `.claude`）推断所有权。
 - **外部合同事实**：Git 根只取 `rev-parse --show-toplevel`；`none` 只要求它成功；worktree 根取 DB 中 kernel 写入的
   `workspace_worktree_path`，不从路径布局推断；executor 的版本与持久形状取自其协议常量。
-- **永久成本**：没有 migration、新表或名单。新增一个等级要改：枚举、解码函数、workspace-runtime 中约 6 处穷举 `match`、
+- **永久成本**：I1/I2 没有 migration、新表或名单；C2b.0 另有 parked CHECK 重建迁移。新增一个等级要改：枚举、解码函数、workspace-runtime 中约 6 处穷举 `match`、
   请求枚举、FE 标签映射，每处一次，由编译器强制。新增一类自有位置要在重叠检查的位置集合中加一处；进行中的 teardown 目标是一个进程内登记表，只有删除路径登记、只有 `none` 准入
   读取，新增删除路径时必须同样登记（由 sweep 的入参类型要求守卫来强制，不靠名单）。它只保护同一进程内的窗口，
   已启动子进程跨崩溃存活留作 G 的显式例外（#2862），不加持久登记。准入检查每次 attached
@@ -376,7 +576,7 @@ effect 本身只限于其根，是否对 worktree 根放宽为只拒绝“位于
   C1 是进程内围栏，不新增持久状态，每次 Planner turn issuance 多一次通常无争用的 track 锁；C0 每片 envelope +1，持久合同常量只在持久形状改变时变化；C6 若实施会新增一类
   operation kind。删除 D1–D3、D6 会显著减少 launch-admission 计划中的永久面。
 
-## 7. 评审处置（计划评审第一、二轮）
+## 7. 评审处置（计划评审第一、二轮与 C2b 设计评审）
 
 | 发现 | 处置 |
 |---|---|
@@ -395,4 +595,16 @@ effect 本身只限于其根，是否对 worktree 根放宽为只拒绝“位于
 | 第二轮 N1：canonical 检查只是一次观察 | 外部路径/链接在准入期间与之后的变化都明确不防御；缺失根按最近已存在祖先的物理位置比较，不把 canonicalize 失败当不重叠 |
 | 第二轮 N2：`none` 与自有位置不重叠不是全局不变量 | §3.1/§4.2 改写为准入时排除 + 后来创建 worktree 的已接受例外，owned/owned 由 O1 保障 |
 | 第二轮 N3：同宿主 Unknown 与 envelope 写者 | C0 夹具拆为同宿主重启保持 Unknown、boot 改变 → NoChild、已 durable settle 重放；列出 `EXECUTION_ENVELOPE_VERSION` 的全部持久写者与读者 |
-| 第二轮 N4：`apply_recovery_item` 不持 drive | §1 改正锁事实；C1 加 boot 恢复一行，围栏在 adapter 而非 drive mutex 上，Busy 可重试；不以计时器宽限作顺序保证 |
+| 第二轮 N4：`apply_recovery_item` 不持 drive | §1 改正锁事实（第四轮 adversarial N1：HEAD 已在取 claim 前持 drive，`driver.rs:1299-1302`、`:1326-1328`，§1 改为现状）；C1 加 boot 恢复一行，围栏在 adapter 而非 drive mutex 上，Busy 可重试；不以计时器宽限作顺序保证 |
+| C2b 设计评审 boundary B1 / adversarial B1：SpawnStarted 重驱的“Stop、结算、再准入”没有合法的记录与别名转换 | 收窄而非替换：有记录的 SpawnStarted 写 Stopping{KernelRestarted} 加 Stop，typed park 同一 execution，结算后判 infra；记录仍只有三种写入。唯一需要替换的是 R8a 测试，不是生产消费者；R8a 改断言 |
+| C2b 设计评审 boundary B2：`gate_ops` 读 `spawn_artifacts_json` 并调用 `marked_group_stopped`，不在任何切片里 | C2b.1 引入混合占用合同（有记录看 execution 结算），C2b.2 把无记录的原生 op 改判 Unproven，C2b.3 因此仍是纯删除；计入两片预算，`c2b_typed_gate_op_occupies_until_settled` 覆盖四个调用者 |
+| C2b 设计评审 adversarial B2：过期的 owned op 在 boot 时以 PastDeadline 进入，丢失 Boot | owned 适配器在 deadline 分流之前走 Boot 分支，`op` 带 deadline；原生顺序不变；回归 `c2b_boot_after_deadline_keeps_boot_origin` |
+| C2b 设计评审 adversarial B3：reconcile 在完成事务前算好 outcome，期间写入的 timeout/cancel 判决会丢 | release/decision 写者都先 `require_live_claim_tx`；gate 的 `complete_owned_parked_tx` 在同一事务内复核 execution id、release、decision，不同则回滚重算；结算是判决前提，Stopping 不单独授权完成 |
+| C2b 设计评审第二轮 adversarial B1：Stop 型 cancel/补偿走既有 saga，结算前 `mark_failed` 或未结算即 Stuck | 有记录的 typed op 不进入补偿：`cancel_parked` 无生产调用者，对 owned op 返回 false，decision 去掉 Canceled；记录前失败无 execution，补偿无进程步；记录后一律 typed park，Stop 只写 decision 并留在 Parked，由同一 reconcile 结算后完成与 Retire；回归 `c2b_stop_decision_survives_unavailable_and_restart`、`c2b_cancel_parked_leaves_typed_op_parked` |
+| C2b 设计评审第二轮非阻塞项 | claim 竞争不消耗一次性计时器或 ReleaseRefused（`c2b_timeout_retries_while_probe_holds_claim`）；首个 WriteStdin 前等可交互 receipt；不推进原生 op 按 kind 分片生效；parked deadline 是独立安全上限；新增行为不变的 C2b.0，超预算理由改为“生产消费者与其不变量测试保持原子”；boundary N1 的 603 是加法错误（逐项和为 +503），C2b.2 合计不变 |
+| C2b 设计评审第三轮 adversarial B1：准入后 `set_parked` 失败，普通与 boot 外层 `mark_stuck` 终结有记录的 op，execution 无人 Stop、别名不 Retire；boundary N1：“共 3 片” | 三轮阻断同属一类，改为一条类不变量：有记录的 op 只经 reconcile 完成事务离开 SpawnStarted/Parked。四个通用离开写者在事务内按适配器声明的 owner-state 键留存（只写 `last_error`、lease 即退避、到期再 drive），附全部写者穷举表；删去 `plan_compensation` Conflict 等逐例外规则；守卫放进行为不变的 C2b.0（约 270），C2b.1 加两条回归（约 1100）；(d) 改为四片 |
+| C2b 设计评审第四轮 adversarial B1：0152 的 parked CHECK 只许 isolated 无 artifacts，typed gate park 必败，留存后永久重试 | 删去“不加迁移”；C2b.0 加新迁移，第一支改为“有 artifacts 或有 v1 `gate_execution` 记录”（`COALESCE` 防 NULL 放行；谓词已由第五轮 B1 改为只去掉 artifacts 要求），按 0152 步骤重建并逐字保留索引、keyed 行 trigger 与 `worker_sessions.spawn_op_id`；calm-truth 升级与正常迁移两个测试，C2b.1 经生产 `set_parked` 覆盖两种 kind；C2b.0 约 510，改为 L2 |
+| 第四轮 boundary B1：owned Parked reconcile 出错时先清 lease、不写 `last_error`，sweep 立即重取 | C2b.0 在 `owned_parked.rs` 加与 owner 无关的错误留存：以本 claim 为围栏的 UPDATE 只写 `last_error`，保留 lease 作退避；回归 C2b.0 lib `error_keeps_lease_and_writes_last_error` 与 C2b.1 `c2b_malformed_record_is_retained_with_backoff`（SpawnStarted/Parked × boot/稳态） |
+| 第四轮非阻塞：boundary N1 写者表缺 `write_phase_and_tx_output`；N2 永久成本；adversarial N1 锁基线 | 表加该行，保证写为现有生产调用路径并约束新调用者；区分一次性键参数迁移与日后 owner 注册，写明 CI 频率；§1 与第二轮 N4 改为现状 |
+| 第五轮 boundary B1：通用 CHECK 解析 `gate_execution` 的 version/execution_id，是 owner 私有政策，每个 owned 资源再加一支迁移；adversarial N1：boot 有两次立即尝试；N2：CHECK 只是浅判别 | 新迁移第一支去掉 artifacts 要求，只留 parked 时间事实与原 isolated 支；不选“或 `tx_output_json IS NOT NULL`”（parked 行必有 tx output，区分不了）；原生 artifacts 围栏留在 Rust（`writes.rs:104-117`、`driver.rs:796-815`），C2b.0 replay 两条既有用例；owned 键只要求键存在，记录有效性只归 `gate_execution.rs` 解码器，`c2b_owned_park_requires_decodable_record` 覆盖缺失与损坏；迁移测试改名 `parked_check_keeps_only_owner_neutral_facts`；写明并断言一次 boot 两次尝试；C2b.1 约 1150 |
+| C2b 设计评审非阻塞项：行号、同宿主 Unknown、计时语义、预算 | 改正 `gate_process.rs` 与 `task_*` 删除范围；明确同一 OS boot 内 Unknown 不可恢复、不承诺结算；区分授权计时与 parked 安全网，已结算 verify 过期后取 status；两片预算按文件重估，均超出约 800 并写明无安全切点 |

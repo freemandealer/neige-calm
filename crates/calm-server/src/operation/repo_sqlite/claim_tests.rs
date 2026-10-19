@@ -44,9 +44,10 @@ async fn expired_claim_cannot_set_phase_without_reclaim() {
     let (db, repo, op) = claimed_operation().await;
     expire(&db, &op).await;
     assert!(
-        repo.set_phase(&op, Phase::Succeeded)
+        repo.set_phase(&op, Phase::Succeeded, None)
             .await
             .unwrap()
+            .applied()
             .is_none(),
         "an unchanged owner token does not authorize settlement after its lease expires"
     );
@@ -92,9 +93,10 @@ async fn expired_claim_rejects_compensation_and_failure_writers() {
     let (db, repo, op) = claimed_operation().await;
     expire(&db, &op).await;
     assert!(
-        repo.set_compensating(&op, &compensation())
+        repo.set_compensating(&op, &compensation(), None)
             .await
             .unwrap()
+            .applied()
             .is_none()
     );
     assert!(
@@ -104,15 +106,17 @@ async fn expired_claim_rejects_compensation_and_failure_writers() {
             .is_none()
     );
     assert!(
-        repo.mark_failed(&op, "stale".into(), op.phase.tag(), None)
+        repo.mark_failed(&op, "stale".into(), op.phase.tag(), None, None)
             .await
             .unwrap()
+            .applied()
             .is_none()
     );
     assert!(
-        repo.mark_stuck(&op, "stale".into(), op.phase.tag())
+        repo.mark_stuck(&op, "stale".into(), op.phase.tag(), None)
             .await
             .unwrap()
+            .applied()
             .is_none()
     );
     let stored = repo.get_operation(&op.id).await.unwrap().unwrap();
@@ -199,9 +203,10 @@ async fn original_identity_phase_owner_and_completion_are_claim_fences() {
             .await
             .unwrap();
         assert!(
-            repo.set_phase(&op, Phase::Succeeded)
+            repo.set_phase(&op, Phase::Succeeded, None)
                 .await
                 .unwrap()
+                .applied()
                 .is_none(),
             "{changed}"
         );
@@ -312,9 +317,10 @@ async fn phase_only_settlement_preserves_a_provider_checkpoint() {
     .unwrap();
     tx.commit().await.unwrap();
     let settled = repo
-        .set_phase(&op, Phase::Succeeded)
+        .set_phase(&op, Phase::Succeeded, None)
         .await
         .unwrap()
+        .applied()
         .unwrap();
     assert_eq!(settled.tx_output.unwrap().result, output.result);
 }
@@ -367,10 +373,12 @@ async fn failed_later_checkpoint_can_compensate_without_replacing_committed_outp
         "cleanup_issued_effect",
         json!({"ticket": later.data["cleanup_ticket"]}),
     ));
-    let compensating =
-        repo.set_compensating(&op, &state).await.unwrap().expect(
-            "failed checkpoint must not strand a still-owned operation before compensation",
-        );
+    let compensating = repo
+        .set_compensating(&op, &state, None)
+        .await
+        .unwrap()
+        .applied()
+        .expect("failed checkpoint must not strand a still-owned operation before compensation");
     assert_eq!(compensating.phase, Phase::Compensating);
     assert_eq!(compensating.tx_output.unwrap().result, first.result);
     assert_eq!(
@@ -388,9 +396,10 @@ async fn settlement_retains_released_terminal_launch_owner_bytes() {
         .bind(&op.id).execute(db.pool()).await.unwrap();
     let op = repo.get_operation(&op.id).await.unwrap().unwrap();
     let settled = repo
-        .set_compensating(&op, &compensation())
+        .set_compensating(&op, &compensation(), None)
         .await
         .unwrap()
+        .applied()
         .unwrap();
     assert_eq!(settled.tx_output.unwrap().data["terminal_launch"], state);
 }
@@ -542,4 +551,85 @@ async fn expired_claim_cannot_consume_prepared_evidence() {
         repo.get_operation(&op.id).await.unwrap().unwrap().phase,
         op.phase
     );
+}
+
+#[tokio::test]
+async fn owned_key_retains_terminal_writes() {
+    for record in [json!({"version": 1}), json!(null), json!("malformed")] {
+        let (db, repo, stale_snapshot) = claimed_operation().await;
+        repo.set_phase(&stale_snapshot, Phase::SpawnStarted, None)
+            .await
+            .unwrap()
+            .applied()
+            .unwrap();
+        let stale_snapshot = repo.claim_drive_batch(1).await.unwrap().pop().unwrap();
+        // The claim snapshot predates the owner's checkpoint: read the transactional row.
+        sqlx::query("UPDATE operations SET \
+            tx_output_json=json_set(tx_output_json,'$.data',json_object('terminal_launch',json(?1))) \
+            WHERE id=?2")
+            .bind(record.to_string()).bind(&stale_snapshot.id).execute(db.pool()).await.unwrap();
+        let before: String = sqlx::query_scalar("SELECT \
+            json_object('phase',phase,'detail',phase_detail_json,'output',tx_output_json,'owner',lease_owner,'until',lease_until_ms,'updated',updated_at_ms,'completed',completed_at_ms,'compensation',compensation_state) \
+            FROM operations WHERE id=?1")
+            .bind(&stale_snapshot.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            repo.get_operation(&stale_snapshot.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tx_output
+                .unwrap()
+                .data["terminal_launch"],
+            record
+        );
+        let key = Some("terminal_launch");
+        let outcomes = [
+            repo.set_phase(&stale_snapshot, Phase::Succeeded, key)
+                .await
+                .unwrap(),
+            repo.set_compensating(&stale_snapshot, &compensation(), key)
+                .await
+                .unwrap(),
+        ];
+        assert!(
+            outcomes
+                .iter()
+                .all(|v| matches!(v, super::super::LeaveWrite::Retained))
+        );
+        assert!(matches!(
+            repo.mark_failed(
+                &stale_snapshot,
+                "failure".into(),
+                PhaseTag::SpawnStarted,
+                None,
+                key
+            )
+            .await
+            .unwrap(),
+            super::super::LeaveWrite::Retained
+        ));
+        assert!(matches!(
+            repo.mark_stuck(&stale_snapshot, "stuck".into(), PhaseTag::SpawnStarted, key)
+                .await
+                .unwrap(),
+            super::super::LeaveWrite::Retained
+        ));
+        let after: String = sqlx::query_scalar("SELECT \
+            json_object('phase',phase,'detail',phase_detail_json,'output',tx_output_json,'owner',lease_owner,'until',lease_until_ms,'updated',updated_at_ms,'completed',completed_at_ms,'compensation',compensation_state) \
+            FROM operations WHERE id=?1")
+            .bind(&stale_snapshot.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(after, before);
+        let stored = repo
+            .get_operation(&stale_snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .last_error
+                .unwrap()
+                .starts_with("owned execution retained:")
+        );
+        assert!(repo.claim_drive_batch(1).await.unwrap().is_empty());
+    }
 }
