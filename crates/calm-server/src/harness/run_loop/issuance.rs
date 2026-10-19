@@ -217,6 +217,9 @@ pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
     };
     // Deterministic drain-vs-supersede window. No-op in production.
     wait_at_planner_harness_drain_race_hook(inner).await;
+    let TrackIssuance::Acquired(track_guard) = lock_track_for_issuance(inner).await? else {
+        return Ok(());
+    };
     let _issuance_guard = inner.issuance.lock().await;
     // A lifecycle write holds this fence through its commit. Observations that
     // arrive later remain queued until the person explicitly restores the card.
@@ -336,7 +339,13 @@ pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         },
         None => budget::FrozenBudget::NotApplicable,
     };
-    persist_snapshot(inner).await?;
+    if !persist_snapshot_inner(inner, None, None).await? {
+        *inner.state.lock().await = prior_turn
+            .map(|last_turn_id| HarnessState::TurnCompleted { last_turn_id })
+            .unwrap_or(HarnessState::Idle);
+        return Ok(());
+    }
+    drop(track_guard);
 
     let drained = {
         let mut queue = inner.pending_queue.lock().await;
@@ -614,4 +623,37 @@ pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) enum TrackIssuance {
+    Acquired(crate::per_card_lock::KeyedLockGuard),
+    ShuttingDown,
+    Busy,
+    Superseded,
+}
+
+/// No card, drive or issuance lock may be held while waiting here. Idle remains
+/// cleanable; only the transition to durable turn_pending excludes clean.
+pub(super) async fn lock_track_for_issuance(inner: &Arc<Inner>) -> Result<TrackIssuance> {
+    let mut shutdown = inner.shutdown.subscribe();
+    // Recovery holds track while awaiting this owner's Release acknowledgement.
+    // A retained Compact must refuse a failed owner before waiting on that lock.
+    // The loop also calls this from ticks; keep one precheck for both entries.
+    // These are advisory reads: callers retain authoritative checks under issuance.
+    if inner.shutting_down.load(Ordering::SeqCst) {
+        return Ok(TrackIssuance::ShuttingDown);
+    }
+    if !inner.state.lock().await.can_issue_turn() {
+        return Ok(TrackIssuance::Busy);
+    }
+    crate::conversation_archive::require_unarchived(inner.repo.as_ref(), inner.card_id.as_str())
+        .await?;
+    if !runtime_is_still_the_live_carrier(inner).await? {
+        return Ok(TrackIssuance::Superseded);
+    }
+    Ok(tokio::select! {
+        biased;
+        _ = shutdown.recv() => TrackIssuance::ShuttingDown,
+        guard = crate::per_card_lock::lock_key(&inner.track_delete_locks, inner.track_id.as_str()) => TrackIssuance::Acquired(guard),
+    })
 }
