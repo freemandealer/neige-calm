@@ -203,15 +203,6 @@ impl PlannerBackend {
         }
     }
 
-    /// Whether a queued entry can join the running turn (§5.9): the run loop checks this before
-    /// it takes the entry out of the queue.
-    pub fn supports_steer(&self) -> bool {
-        match &self.0 {
-            Arm::Codex(..) => true,
-            Arm::Claude(_) | Arm::Acp(_) => false,
-        }
-    }
-
     /// Host selection preflight stays at the existing admission point, after snapshot persistence.
     pub(crate) async fn compact_request(
         &self,

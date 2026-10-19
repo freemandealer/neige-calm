@@ -28,6 +28,8 @@ pub(crate) enum CatalogProtocol {
 }
 
 pub(crate) struct BackendMetadata {
+    /// Whether queued input can join a running turn.
+    pub steer: bool,
     pub catalog: CatalogProtocol,
     pub capabilities: ManagedCapabilities,
     pub discovery: ToolDiscovery,
@@ -47,10 +49,10 @@ impl super::backend::PlannerBackend {
     }
 
     pub(crate) fn metadata(provider: &AgentProvider) -> BackendMetadata {
-        let (images, manual_compact, history_replacement, discovery) = match provider {
-            AgentProvider::Codex => (true, true, true, ToolDiscovery::DeferredSearch),
-            AgentProvider::Claude => (true, true, true, ToolDiscovery::DirectMcp),
-            AgentProvider::OpenCode => (false, false, false, ToolDiscovery::SessionToolList),
+        let (steer, images, manual_compact, history_replacement, discovery) = match provider {
+            AgentProvider::Codex => (true, true, true, true, ToolDiscovery::DeferredSearch),
+            AgentProvider::Claude => (false, true, true, true, ToolDiscovery::DirectMcp),
+            AgentProvider::OpenCode => (false, false, false, false, ToolDiscovery::SessionToolList),
         };
         let catalog = match provider {
             AgentProvider::Codex => CatalogProtocol::Codex,
@@ -62,6 +64,7 @@ impl super::backend::PlannerBackend {
             AgentProvider::Claude | AgentProvider::OpenCode => (true, false),
         };
         BackendMetadata {
+            steer,
             catalog,
             requires_codex_daemon,
             capabilities: ManagedCapabilities {
