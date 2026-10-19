@@ -2977,6 +2977,7 @@ async fn minted_terminal_card(
                     &cache,
                     RequestTheme::default_dark(),
                     false,
+                    calm_types::card_presentation::CardCreationSource::Manual,
                 )
                 .await
             })
@@ -3228,7 +3229,7 @@ async fn s0_row_without_terminal_row_decodes_closed() {
             title: None,
             kind: "terminal".into(),
             sort: None,
-            payload: json!({}),
+            payload: json!({"terminal_presentation": {"source": "unrecorded", "in_workbench": false}}),
         },
         CardRole::Worker,
         true,

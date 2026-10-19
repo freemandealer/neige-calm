@@ -29,6 +29,8 @@ pub const CARD_CREATE: &str = "card-create";
 pub struct CardCreateOperationPayload {
     /// `Plugin(<id>)` for a card a plugin tool made, so plugins cannot spoof their actor.
     pub actor: ActorId,
+    /// Explicit entrypoint attribution also distinguishes new admission from old client-authored payloads.
+    pub creation_source: calm_types::card_presentation::CardCreationSource,
     /// `user_tool_call:<tool>` for a tool-made card; `None` for a direct create.
     pub correlation: Option<String>,
     pub track_id: String,
@@ -61,6 +63,10 @@ impl TxOnlyAdapter for CardCreateAdapter {
 
     async fn validate(&self, input: &Value) -> Result<()> {
         let payload: CardCreateOperationPayload = serde_json::from_value(input.clone())?;
+        calm_truth::card_kind::validate_stored_card_payload_global(
+            &payload.kind,
+            &payload.payload,
+        )?;
         if self.repo.track_get(&payload.track_id).await?.is_none() {
             return Err(CalmError::NotFound(format!("track {}", payload.track_id)));
         }
@@ -73,7 +79,22 @@ impl TxOnlyAdapter for CardCreateAdapter {
         input: &Value,
         _op: &Operation,
     ) -> Result<TxOutput> {
-        let payload: CardCreateOperationPayload = serde_json::from_value(input.clone())?;
+        let mut normalized = input.clone();
+        if input.get("creation_source").is_none() {
+            // Before reservation, this payload key could be supplied by a client on any kind.
+            if let Some(fields) = normalized.get_mut("payload").and_then(Value::as_object_mut) {
+                fields.remove(calm_types::card_presentation::TERMINAL_PRESENTATION_PAYLOAD_KEY);
+            }
+            if let Some(fields) = normalized.as_object_mut() {
+                fields.insert("creation_source".into(), serde_json::json!("unrecorded"));
+            }
+        }
+        let payload: CardCreateOperationPayload = serde_json::from_value(normalized)?;
+        let stored_payload = calm_truth::card_kind::prepare_card_create_payload_global(
+            &payload.kind,
+            payload.payload,
+            payload.creation_source,
+        )?;
         let card_id = new_id();
         let track_id = TrackId::from(payload.track_id);
         let scope = card_scope_tx(tx, CardId::from(card_id.clone()), track_id.clone()).await?;
@@ -85,7 +106,7 @@ impl TxOnlyAdapter for CardCreateAdapter {
                 track_id,
                 kind: payload.kind,
                 sort: payload.sort,
-                payload: payload.payload,
+                payload: stored_payload,
                 title: payload.title,
             },
             CardRole::Worker,

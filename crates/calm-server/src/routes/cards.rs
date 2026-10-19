@@ -266,7 +266,7 @@ pub struct ViaToolCall {
         (status = 201, description = "Card created", body = Card),
         (status = 400, description = "Missing `kind` and no `via_tool_call`, or a blank, non-ASCII or over-long `Idempotency-Key` (`idempotency_key_invalid`)", body = ErrorBody),
         (status = 403, description = "Plugin lacks `permissions.cards_create`", body = ErrorBody),
-        (status = 404, description = "Track not found, or plugin not running / not in registry", body = ErrorBody),
+        (status = 404, description = "Track or keyed Terminal not found, or plugin not running / not in registry", body = ErrorBody),
         (status = 409, description = "`idempotency_key_reused`: the key names another request; `conflict`: refused, and the key binds nothing", body = ErrorBody),
         (status = 422, description = "Tool returned no `_meta.ui.resourceUri`", body = ErrorBody),
         (status = 502, description = "Plugin tool call failed", body = ErrorBody),
@@ -312,8 +312,17 @@ pub(crate) async fn create_card(
     s.card_kind_registry()
         .validate_payload(&kind, &payload)
         .map_err(|e| CalmError::from(e).into_response())?;
+    let payload = s
+        .card_kind_registry()
+        .prepare_create_payload(
+            &kind,
+            payload,
+            calm_types::card_presentation::CardCreationSource::Manual,
+        )
+        .map_err(|error| CalmError::from(error).into_response())?;
     let card = CardCreateOperationPayload {
         actor: actor.to_actor_id(),
+        creation_source: calm_types::card_presentation::CardCreationSource::Manual,
         correlation: None,
         track_id,
         kind,
@@ -446,8 +455,17 @@ async fn create_via_tool_call(
         .validate_payload(&creation.resource_uri, &payload)
         .map_err(|e| CalmError::from(e).into_response())?;
     // Actor stays `Plugin(<id>)`; `correlation` records the user-driven invocation so audit queries can reconstruct the causal chain.
+    let payload = s
+        .card_kind_registry()
+        .prepare_create_payload(
+            &creation.resource_uri,
+            payload,
+            calm_types::card_presentation::CardCreationSource::Plugin,
+        )
+        .map_err(|error| CalmError::from(error).into_response())?;
     let card = CardCreateOperationPayload {
         actor: ActorId::Plugin(via.plugin_id.clone()),
+        creation_source: calm_types::card_presentation::CardCreationSource::Plugin,
         correlation: Some(format!("user_tool_call:{}", via.tool_name)),
         track_id,
         kind: creation.resource_uri,
