@@ -193,7 +193,7 @@ it('aligns header controls, disclosure arrows and row menus on one system action
   const tools = page.getByRole('button', { name: 'Tools', exact: true }).element();
   expect(tools.querySelector('svg')!.getBoundingClientRect().width).toBe(14);
   expect(center(tools.querySelector('svg')!).y).toBe(center(tools.closest('section[aria-label="Workbench"]')!.querySelector('h2')!.parentElement!).y);
-  for (const summary of root.querySelectorAll('summary')) expect(center(summary.querySelector('svg')!).x).toBe(axis);
+  for (const summary of root.querySelectorAll('summary')) expect(center([...summary.querySelectorAll('svg')].at(-1)!).x).toBe(axis);
   await userEvent.click(document.querySelector<HTMLElement>('[data-nc-work-inventory] summary')!);
   const menu = page.getByRole('button', { name: 'Actions for Server', exact: true }).element();
   expect(center(menu.querySelector('svg')!).x).toBe(axis);
