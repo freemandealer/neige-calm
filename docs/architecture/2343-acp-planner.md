@@ -73,30 +73,64 @@ Pass `--acp-planner-config /absolute/path/acp-planner.json`:
   "agents": [{
     "provider": "opencode",
     "command": "/absolute/path/opencode",
-    "args": ["acp"],
+    "args": [],
     "env": {
       "HOME": "/private/opencode-profile",
       "XDG_CONFIG_HOME": "/private/opencode-profile/config",
       "XDG_DATA_HOME": "/private/opencode-profile/data",
       "XDG_CACHE_HOME": "/private/opencode-profile/cache"
     },
-    "expected_agent_name": "OpenCode",
-    "expected_agent_version": "1.18.34"
+    "min_agent_version": "1.18.34"
   }]
 }
 ```
 
-Use an operator-owned private profile and authenticate through the native CLI outside Neige. All launch fields are required, unknown keys are refused, and the agent's initialize identity/version must match before session operations. The child inherits no ambient environment. Kernel PATH and marker/credential keys cannot be overridden by registration.
+Use an operator-owned private profile and authenticate through the native CLI outside Neige. All launch fields are required and unknown keys are refused. The child inherits no ambient environment. Kernel PATH and marker/credential keys cannot be overridden by registration.
+
+The argument vector is the registration's `args`, then the provider profile's ACP entry with the
+agent options of the turn's permission mode inside it: the entry's arguments before the options,
+the options, then its arguments after them. Where an agent CLI accepts options is that CLI's own
+fact, so its profile states it and the operator does not; `args` only prefix the entry, such as a
+wrapper's or interpreter's own arguments, and never hold the ACP subcommand. OpenCode's entry is
+`acp` with no options, so it always launches as `<command> <args> acp`; a Grok-shaped entry is
+`agent <options> --no-leader stdio`.
+
+Each provider's ACP profile (`acp_planner/profile/`) fixes where the agent's `initialize` answer
+reports who it is: ACP's `agentInfo` with the profile's name (OpenCode: `OpenCode`), or only a
+version at `_meta.agentVersion`. The reported version must be semver and at least
+`min_agent_version`, itself semver; anything else stops the process before a session operation.
+Precedence is semver's: build metadata never ranks, and a pre-release ranks below its own
+release only, so with minimum `1.18.35` an agent reporting `1.18.36-beta.1` is accepted and one
+reporting `1.18.35-beta.1` is not.
+A file still naming `expected_agent_name` (now fixed by the profile) or `expected_agent_version`
+(renamed `min_agent_version`) fails to parse, and the error adds that change and that `args` no
+longer holds the ACP subcommand; the two forms are never read together.
+
+A conversation bound to a native session is claimed under a digest of what that session depends
+on: the provider, `command`, `args`, `env` and the working directory. Changing one of them makes
+the conversation refuse to resume until it is reset explicitly. `min_agent_version` is admission
+policy checked on every launch and is not part of the digest, so raising it resets nothing. A new
+registration field is placed in or out of the digest explicitly where the digest is built.
+
+A profile may name the `authMethods` id every launch authenticates with after `initialize` and
+before any session operation. OpenCode's names none and sends no `authenticate`. When one is
+named, it must be among the methods the agent reports, and `authenticate` must succeed within its
+bound; otherwise the process stops and the launch fails. Readiness takes this same path, so the
+provider reads unavailable with the advice to sign the agent in with its own CLI under the
+environment its registration declares. Neige judges sign-in only from the agent's ACP answers,
+never from its private credential files.
 
 Operational launches explicitly receive their active Planner card's
 `NEIGE_MCP_SOCKET` and `NEIGE_MCP_TOKEN`, using the same per-turn context as the
 MCP shim (#2413). This enables the kernel-served `neige` CLI without inheriting
 user or daemon credentials. Readiness launches receive neither. Managed ownership
 and active-carrier checks precede token issuance; launch/negotiation failures
-revoke it, as do setup failure, settlement and shutdown. The operator-registered
+revoke it, as do setup failure, settlement and shutdown; an authentication
+failure is a negotiation failure. The operator-registered
 native binary is trusted to hold the same card credential already delivered in
-its MCP descriptors; the advertised agent name/version remains a compatibility
-check, not cryptographic authentication of the executable. CLI commands still
+its MCP descriptors; the advertised agent identity and version remain a compatibility
+check, not cryptographic authentication of the executable, and ACP `authenticate`
+signs the agent into its own service, not into Neige. CLI commands still
 use the authoritative kernel parser and role checks; native permission requests
 follow the card's permission mode.
 

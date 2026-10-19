@@ -1,5 +1,5 @@
+use super::profile::AcpAgentProfile;
 use crate::error::{CalmError, Result};
-use crate::planner_permission_mode::PlannerPermissionMode;
 use crate::planner_process::MarkerInstance;
 use calm_types::runtime::{AgentProtocol, AgentProvider};
 use serde::{Deserialize, Serialize};
@@ -12,20 +12,105 @@ pub const MARKER_KEY: &str = "NEIGE_ACP_PLANNER";
 pub struct AcpPlannerConfig {
     pub agents: Vec<AcpAgentConfig>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcpAgentConfig {
     pub provider: AgentProvider,
     pub command: PathBuf,
+    /// Arguments before the provider profile's ACP entry, such as a wrapper's or interpreter's
+    /// own; the profile adds the agent's ACP subcommand and options after them.
     pub args: Vec<String>,
     /// Complete operator-declared environment additions. Nothing is inherited implicitly.
     pub env: BTreeMap<String, String>,
-    pub expected_agent_name: String,
-    pub expected_agent_version: String,
+    /// The lowest agent version a launch accepts; the agent's profile says where it reports it.
+    #[serde(deserialize_with = "semver_text")]
+    pub min_agent_version: semver::Version,
 }
+
+/// A semver version from its text.
+fn semver_text<'de, D: serde::Deserializer<'de>>(input: D) -> Result<semver::Version, D::Error> {
+    let text = String::deserialize(input)?;
+    semver::Version::parse(&text)
+        .map_err(|error| serde::de::Error::custom(format!("`min_agent_version` {text:?}: {error}")))
+}
+
+/// What a bound native session depends on: the agent process a launch talks to, and the
+/// directory it runs in. A conversation resumes its native session only under the same key.
+/// Admission policy such as `min_agent_version` is checked on every launch instead, so raising it
+/// resets nothing.
+#[derive(Serialize)]
+struct NativeSessionKey<'a> {
+    provider: &'a AgentProvider,
+    command: &'a Path,
+    args: &'a [String],
+    env: &'a BTreeMap<String, String>,
+    cwd: &'a Path,
+}
+
+impl AcpAgentConfig {
+    /// The digest a bound conversation's native session is claimed under for `cwd`.
+    pub(super) fn native_session_digest(&self, cwd: &Path) -> Result<String> {
+        use sha2::Digest as _;
+        // Exhaustive, so a new registration field has to be placed in or out of the key here.
+        let Self {
+            provider,
+            command,
+            args,
+            env,
+            min_agent_version: _,
+        } = self;
+        let key = NativeSessionKey {
+            provider,
+            command,
+            args,
+            env,
+            cwd,
+        };
+        Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(&key)?)))
+    }
+}
+
+/// Registration fields this version no longer reads, and what replaced each: a file that fails
+/// to parse and still names one is told what to change, beside the parse error. Delete this list
+/// and [`replaced_field_hint`] in the first release after the one that ships them (#2924): every
+/// operator file has been rewritten by then, and the parse error alone names the unknown field.
+const REPLACED_FIELDS: [(&str, &str); 2] = [
+    (
+        "expected_agent_name",
+        "remove it: the provider's profile fixes the agent name it accepts",
+    ),
+    (
+        "expected_agent_version",
+        "rename it to `min_agent_version`: the lowest semver version accepted",
+    ),
+];
+
+/// What to change in a registration that failed to parse, when it still names replaced fields.
+fn replaced_field_hint(bytes: &[u8]) -> Option<String> {
+    let raw: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let agents = raw.get("agents")?.as_array()?;
+    let changes: Vec<String> = REPLACED_FIELDS
+        .into_iter()
+        .filter(|(field, _)| agents.iter().any(|agent| agent.get(field).is_some()))
+        .map(|(field, change)| format!("ACP registration field `{field}` was replaced; {change}"))
+        .collect();
+    (!changes.is_empty()).then(|| {
+        format!(
+            "{}. `args` no longer holds the ACP subcommand: the provider's profile adds it, so \
+             drop `\"acp\"` from `args`",
+            changes.join(". ")
+        )
+    })
+}
+
 impl AcpPlannerConfig {
     pub fn read(path: &Path) -> Result<Self> {
-        let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let bytes = std::fs::read(path)?;
+        let config: Self =
+            serde_json::from_slice(&bytes).map_err(|error| match replaced_field_hint(&bytes) {
+                Some(hint) => CalmError::BadRequest(format!("{hint} ({error})")),
+                None => error.into(),
+            })?;
         config.validate()?;
         Ok(config)
     }
@@ -39,11 +124,10 @@ impl AcpPlannerConfig {
                     "ACP registration names an unsupported or duplicate agent".into(),
                 ));
             }
-            if !agent.command.is_absolute()
-                || agent.expected_agent_name.is_empty()
-                || agent.expected_agent_version.is_empty()
-            {
-                return Err(CalmError::BadRequest("ACP registration requires an absolute command and pinned agent identity/version".into()));
+            if !agent.command.is_absolute() {
+                return Err(CalmError::BadRequest(
+                    "ACP registration requires an absolute command".into(),
+                ));
             }
             if agent
                 .env
@@ -58,18 +142,19 @@ impl AcpPlannerConfig {
         Ok(())
     }
 }
-impl AcpAgentConfig {
-    /// The environment one Planner turn's process adds under `mode`, set explicitly, never
-    /// inherited. `never` adds nothing: the agent's own configuration stands, as before.
-    pub fn permission_env(&self, mode: PlannerPermissionMode) -> Vec<(&'static str, &'static str)> {
-        super::profile::AcpAgentProfile::of(&self.provider)
-            .map_or_else(Vec::new, |profile| profile.permission_env(mode))
-    }
+
+/// One registered agent and its provider's profile: everything one launch reads.
+#[derive(Clone, Copy)]
+pub(super) struct Registration<'a> {
+    pub config: &'a AcpAgentConfig,
+    pub profile: &'static AcpAgentProfile,
 }
 
 #[derive(Debug)]
 pub struct AcpPlannerHost {
     config: Option<AcpPlannerConfig>,
+    /// [`AcpAgentProfile::of`]; a unit test substitutes a profile no provider registers yet.
+    profiles: fn(&AgentProvider) -> Option<&'static AcpAgentProfile>,
     pub instance: MarkerInstance,
     pub mcp_shim: PathBuf,
     pub mcp_socket: PathBuf,
@@ -92,6 +177,7 @@ impl AcpPlannerHost {
         }
         Ok(Self {
             config,
+            profiles: AcpAgentProfile::of,
             instance: MarkerInstance::for_data_dir(data_dir, MARKER_KEY)?,
             mcp_shim,
             mcp_socket,
@@ -129,6 +215,23 @@ impl AcpPlannerHost {
             })
     }
 
+    /// The registration of `provider` with its profile.
+    pub(super) fn registration(&self, provider: &AgentProvider) -> Result<Registration<'_>> {
+        let config = self.configured(provider)?;
+        let profile = (self.profiles)(provider).ok_or_else(|| {
+            CalmError::Internal(format!("{} has no ACP profile", provider.wire_name()))
+        })?;
+        Ok(Registration { config, profile })
+    }
+    #[cfg(test)]
+    pub(super) fn with_profiles(
+        mut self,
+        profiles: fn(&AgentProvider) -> Option<&'static AcpAgentProfile>,
+    ) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
     pub fn record_configuration(
         &self,
         card: &str,
@@ -152,10 +255,10 @@ impl AcpPlannerHost {
 
     pub async fn check_ready(&self, provider: &AgentProvider) -> Result<()> {
         let _probe = self.readiness.lock().await;
-        let config = self.configured(provider)?;
+        let registration = self.registration(provider)?;
         let process = super::process::Process::spawn(
             self,
-            config,
+            registration,
             "readiness",
             &std::env::temp_dir(),
             super::process::LaunchContext::Readiness,
@@ -215,56 +318,122 @@ async fn revoke_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn opencode() -> AcpAgentConfig {
-        AcpAgentConfig {
-            provider: AgentProvider::OpenCode,
-            command: "/opt/opencode".into(),
-            args: vec!["acp".into()],
-            env: BTreeMap::new(),
-            expected_agent_name: "OpenCode".into(),
-            expected_agent_version: "1.18.35".into(),
+    fn read(agent: serde_json::Value) -> Result<AcpPlannerConfig> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), json!({"agents":[agent]}).to_string()).unwrap();
+        AcpPlannerConfig::read(file.path())
+    }
+    fn opencode() -> serde_json::Value {
+        json!({"provider":"opencode","command":"/opt/opencode","args":[],"env":{},
+            "min_agent_version":"1.18.35"})
+    }
+
+    #[test]
+    fn a_registration_reads_its_minimum_version_as_semver() {
+        let config = read(opencode()).unwrap();
+        assert_eq!(
+            config.agents[0].min_agent_version,
+            semver::Version::new(1, 18, 35)
+        );
+        for version in ["1.18", "v1.18.35", "latest", ""] {
+            let mut agent = opencode();
+            agent["min_agent_version"] = json!(version);
+            assert!(read(agent).is_err(), "{version}");
+        }
+        let mut agent = opencode();
+        agent.as_object_mut().unwrap().remove("min_agent_version");
+        assert!(read(agent).is_err(), "min_agent_version is required");
+        // The ACP entry is the profile's; a registration cannot name it.
+        let mut agent = opencode();
+        agent["subcommand"] = json!(["acp"]);
+        assert!(read(agent).is_err(), "subcommand is unknown");
+    }
+
+    /// An older file names what replaced its fields, beside the parse error and its position, and
+    /// the old and new forms are never accepted together.
+    #[test]
+    fn replaced_identity_fields_are_refused_with_their_replacement() {
+        for (field, value, hint) in [
+            (
+                "expected_agent_version",
+                "1.18.35",
+                "rename it to `min_agent_version`",
+            ),
+            (
+                "expected_agent_name",
+                "OpenCode",
+                "the provider's profile fixes",
+            ),
+        ] {
+            // Alone, as an older file has it with its `acp` argument, and beside its replacement.
+            for keep_new_form in [false, true] {
+                let mut agent = opencode();
+                if !keep_new_form {
+                    agent.as_object_mut().unwrap().remove("min_agent_version");
+                    agent["args"] = json!(["acp"]);
+                }
+                agent[field] = json!(value);
+                let message = read(agent).unwrap_err().to_string();
+                assert!(
+                    message.contains(field)
+                        && message.contains(hint)
+                        && message.contains("`args` no longer holds the ACP subcommand")
+                        && message.contains("at line 1 column"),
+                    "{message}"
+                );
+            }
         }
     }
 
-    /// `ask` makes OpenCode ask before bash, edits and fetches; `never` adds nothing, so its launch
-    /// is today's.
+    /// A file as older versions wrote it is told every change at once.
     #[test]
-    fn only_ask_overrides_opencodes_permission_config() {
-        assert_eq!(
-            opencode().permission_env(PlannerPermissionMode::Ask),
-            vec![(
-                "OPENCODE_PERMISSION",
-                r#"{"bash":"ask","edit":"ask","webfetch":"ask"}"#
-            )]
-        );
-        assert_eq!(
-            opencode().permission_env(PlannerPermissionMode::Never),
-            Vec::<(&str, &str)>::new()
+    fn an_older_file_is_told_every_replaced_field() {
+        let mut agent = opencode();
+        let object = agent.as_object_mut().unwrap();
+        object.remove("min_agent_version");
+        object.insert("args".into(), json!(["acp"]));
+        object.insert("expected_agent_name".into(), json!("OpenCode"));
+        object.insert("expected_agent_version".into(), json!("1.18.34"));
+        let message = read(agent).unwrap_err().to_string();
+        assert!(
+            message.contains("`expected_agent_name` was replaced; remove it")
+                && message.contains("`expected_agent_version` was replaced; rename it"),
+            "{message}"
         );
     }
 
-    /// #2441: `full` allows each acting tool by name, outside the workspace too, and never with a
-    /// `*` rule, which would also allow the tools OpenCode denies a Planner.
+    /// A parse error of a current file keeps its position.
     #[test]
-    fn full_allows_each_acting_tool_by_name() {
-        let env = opencode().permission_env(PlannerPermissionMode::Full);
-        let [(key, value)] = env.as_slice() else {
-            panic!("one override: {env:?}");
+    fn a_parse_error_names_its_position() {
+        let mut agent = opencode();
+        agent["min_agent_version"] = json!("latest");
+        let message = read(agent).unwrap_err().to_string();
+        assert!(message.contains("at line 1 column"), "{message}");
+    }
+
+    /// The native session key covers the agent process and its directory, not admission policy.
+    #[test]
+    fn only_the_agent_process_and_cwd_key_a_native_session() {
+        let digest = |agent: serde_json::Value, cwd: &str| {
+            read(agent).unwrap().agents[0]
+                .native_session_digest(Path::new(cwd))
+                .unwrap()
         };
-        assert_eq!(*key, "OPENCODE_PERMISSION");
-        let permission: serde_json::Value = serde_json::from_str(value).unwrap();
-        assert_eq!(
-            permission,
-            serde_json::json!({
-                "bash": "allow",
-                "edit": "allow",
-                "webfetch": "allow",
-                "external_directory": "allow",
-                "doom_loop": "allow",
-                "read": "allow",
-            })
-        );
-        assert!(permission.get("*").is_none(), "{permission}");
+        let base = digest(opencode(), "/work");
+        let mut raised = opencode();
+        raised["min_agent_version"] = json!("1.19.0");
+        assert_eq!(digest(raised, "/work"), base, "min_agent_version");
+        for (field, value) in [
+            ("command", json!("/opt/other/opencode")),
+            ("args", json!(["--wrapped"])),
+            ("env", json!({"HOME":"/private/other"})),
+        ] {
+            let mut changed = opencode();
+            changed[field] = value;
+            assert_ne!(digest(changed, "/work"), base, "{field}");
+        }
+        assert_ne!(digest(opencode(), "/elsewhere"), base, "cwd");
     }
 }

@@ -240,14 +240,11 @@ impl AcpPlannerSession {
                 }
             }
         }
-        let config = params
+        let registration = params
             .host
-            .configured(&params.provider)
+            .registration(&params.provider)
             .map_err(|error| refused(&error.to_string()))?;
-        use sha2::Digest as _;
-        let digest = hex::encode(sha2::Sha256::digest(
-            serde_json::to_vec(&(config, &params.cwd)).map_err(CalmError::from)?,
-        ));
+        let digest = registration.config.native_session_digest(&params.cwd)?;
         crate::db::sqlite::acp_registration_claim(
             &pool,
             &params.worker_session_id,
@@ -259,7 +256,7 @@ impl AcpPlannerSession {
         let token = mint_token(params).await?;
         let mut process = match Process::spawn_control(
             &params.host,
-            config,
+            registration,
             &params.worker_session_id,
             &params.cwd,
             super::process::LaunchContext::Planner {
