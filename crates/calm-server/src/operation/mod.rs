@@ -19,6 +19,7 @@ pub mod claude_restart_adapter;
 pub mod codex_adapter;
 mod dry_run;
 pub mod forge_action_adapter;
+pub(crate) mod gate_execution;
 pub(crate) mod gate_lifecycle;
 pub(crate) mod gate_ops;
 pub(crate) mod gate_process;
@@ -840,6 +841,9 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Wake owner lifecycle work only after successful parked completion commits.
+    fn owned_parked_completed(&self, _op: &Operation, _ctx: &SpawnCtx) {}
+
     async fn recover_parked(
         &self,
         _op: &Operation,
@@ -951,8 +955,9 @@ pub trait OperationRepo: Send + Sync {
         &self,
         op: &Operation,
         deadline_ms: TimestampMs,
+        owner_key: Option<&'static str>,
     ) -> Result<Option<Operation>> {
-        repo_sqlite::set_parked(&self.sqlite_db(), op, deadline_ms).await
+        repo_sqlite::set_parked(&self.sqlite_db(), op, deadline_ms, owner_key).await
     }
 
     async fn claim_parked(&self, op_id: &str) -> Result<Option<Operation>> {

@@ -70,6 +70,9 @@ pub struct OperationRuntime {
 }
 
 impl OperationRuntime {
+    pub(crate) fn require_gate_execution(&self) -> Result<()> {
+        super::gate_execution::engine(&self.spawn_ctx).map(|_| ())
+    }
     pub(crate) fn track_delete_locks(&self) -> &crate::per_card_lock::KeyedLocks {
         &self.spawn_ctx.track_delete_locks
     }
@@ -461,6 +464,14 @@ impl OperationRuntime {
     }
 
     pub async fn cancel_parked(&self, op_id: &OperationId, reason: &str) -> Result<bool> {
+        let Some(op) = self.repo.get_operation(op_id).await? else {
+            return Ok(false);
+        };
+        if !matches!(op.phase, Phase::Parked)
+            || self.adapter(&op.kind)?.owns_parked_resource().is_some()
+        {
+            return Ok(false);
+        }
         let Some(op) = self.repo.claim_parked(op_id).await? else {
             return Ok(false);
         };
@@ -901,7 +912,12 @@ impl OperationRuntime {
                             .await?;
                             return Ok(());
                         }
-                        if self.repo.set_parked(&op, deadline_ms).await?.is_some() {
+                        if self
+                            .repo
+                            .set_parked(&op, deadline_ms, adapter.owns_parked_resource())
+                            .await?
+                            .is_some()
+                        {
                             tokio::spawn(observer);
                             return Ok(());
                         }
@@ -918,7 +934,10 @@ impl OperationRuntime {
                             .as_ref()
                             .map(|row| row.spawn_artifacts.is_none())
                             .unwrap_or(false);
-                        if still_holds_lease && missing_artifacts {
+                        if still_holds_lease
+                            && missing_artifacts
+                            && adapter.owns_parked_resource().is_none()
+                        {
                             self.fail_with_compensation(
                                 adapter.as_ref(),
                                 op,
@@ -1515,14 +1534,6 @@ impl OperationRuntime {
                 if !matches!(op.phase, Phase::Parked) {
                     return Ok(());
                 }
-                if op
-                    .parked_deadline_ms
-                    .is_some_and(|deadline| now_ms() > deadline)
-                {
-                    self.apply_parked_past_deadline_with_claim(&op_id, ParkedClaimMode::Boot)
-                        .await?;
-                    return Ok(());
-                }
                 let adapter = self.adapter(&op.kind)?;
                 if adapter.owns_parked_resource().is_some() {
                     if let Some(claimed) = self
@@ -1537,6 +1548,14 @@ impl OperationRuntime {
                         )
                         .await?;
                     }
+                    return Ok(());
+                }
+                if op
+                    .parked_deadline_ms
+                    .is_some_and(|deadline| now_ms() > deadline)
+                {
+                    self.apply_parked_past_deadline_with_claim(&op_id, ParkedClaimMode::Boot)
+                        .await?;
                     return Ok(());
                 }
                 let Some(artifacts) = op.spawn_artifacts.clone() else {
