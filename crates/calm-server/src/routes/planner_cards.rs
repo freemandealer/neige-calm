@@ -1,6 +1,7 @@
 //! `/api/cards/{id}/planner/*` — the headless planner-harness card surface: interrupt, run
 //! snapshot, reset, restart and the harness start they share, plus the input-length rule and the
 //! shared-planner turn teardown used by card, track and area deletion.
+use provider::control::NativeInterruptOutcome;
 
 use crate::actor::Actor;
 use crate::db::RouteRepo;
@@ -58,18 +59,21 @@ pub(crate) async fn interrupt_shared_card_active_turn(
     if !card_is_shared_planner(card, active_runtime.as_ref()) {
         return;
     }
-    if let Err(e) = cs
+    match cs
         .shared_codex_appserver
-        .interrupt_active_turn_for_card(card.id.as_str())
+        .interrupt_active_outcome_for_card(card.id.as_str())
         .await
     {
-        tracing::warn!(
-            target: "shared_codex_daemon::orphan_turn",
-            card_id = %card.id,
-            track_id = %card.track_id,
-            error = %e,
-            "failed to interrupt active shared codex turn during card teardown"
-        );
+        Ok(NativeInterruptOutcome::NativeAck | NativeInterruptOutcome::NoTarget) => {}
+        Ok(NativeInterruptOutcome::Unconfirmed { error: e }) | Err(e) => {
+            tracing::warn!(
+                target: "shared_codex_daemon::orphan_turn",
+                card_id = %card.id,
+                track_id = %card.track_id,
+                error = %e,
+                "failed to interrupt active shared codex turn during card teardown"
+            );
+        }
     }
 }
 
@@ -92,9 +96,14 @@ pub(crate) async fn quiesce_shared_card_active_turn(
             seals.seal(thread_id);
         }
         if let Some(thread_id) = thread_id.as_deref() {
-            cs.shared_codex_appserver
-                .interrupt_active_turn(thread_id)
-                .await?;
+            match cs
+                .shared_codex_appserver
+                .interrupt_active_outcome(thread_id)
+                .await
+            {
+                NativeInterruptOutcome::NativeAck | NativeInterruptOutcome::NoTarget => {}
+                NativeInterruptOutcome::Unconfirmed { error } => return Err(error),
+            }
         }
         return Ok(seals.retain().pop());
     }

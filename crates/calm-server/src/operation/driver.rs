@@ -1,3 +1,4 @@
+use provider::control::NativeInterruptOutcome;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -296,14 +297,14 @@ impl OperationRuntime {
         // A failed interrupt fails the cleanup (#1830 S2 D7): the marker stays, the lease stays
         // held, and the next tick retries — unless the worker is proven stopped anyway.
         let interrupted = shared_codex_appserver
-            .interrupt_active_turn(&thread_id)
+            .interrupt_active_outcome(&thread_id)
             .await;
         codex_interrupt_settled(shared_codex_appserver, &thread_id, interrupted).await?;
         if cached_turn.is_none()
             && let Some(persisted_turn) = persisted_turn.as_deref()
         {
             let interrupted = shared_codex_appserver
-                .turn_interrupt(&thread_id, persisted_turn)
+                .interrupt_outcome(&thread_id, persisted_turn)
                 .await;
             codex_interrupt_settled(shared_codex_appserver, &thread_id, interrupted).await?;
         }
@@ -1364,11 +1365,12 @@ fn kill_parked_group_if_alive(artifacts: &SpawnArtifacts, alive: bool) {
 async fn codex_interrupt_settled(
     shared: &crate::shared_codex_appserver::SharedCodexAppServer,
     thread_id: &str,
-    interrupted: Result<()>,
+    interrupted: NativeInterruptOutcome<CalmError>,
 ) -> Result<()> {
     use provider::worker::{CodexDaemonProbe, ThreadStatusLite, TurnStatusLite};
-    let Err(error) = interrupted else {
-        return Ok(());
+    let error = match interrupted {
+        NativeInterruptOutcome::NativeAck | NativeInterruptOutcome::NoTarget => return Ok(()),
+        NativeInterruptOutcome::Unconfirmed { error } => error,
     };
     if !shared.is_running_per_readiness() {
         return Ok(());

@@ -423,8 +423,12 @@ async fn run_abort_probe(server: &mut BootedServer, thread_id: &str) -> String {
     };
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    if let Err(e) = server.client.turn_interrupt(thread_id, &turn_id).await {
-        return format!("turn/interrupt({turn_id}) failed: {e} (skipped)");
+    match server.client.interrupt_outcome(thread_id, &turn_id).await {
+        provider::control::NativeInterruptOutcome::NativeAck
+        | provider::control::NativeInterruptOutcome::NoTarget => {}
+        provider::control::NativeInterruptOutcome::Unconfirmed { error } => {
+            return format!("turn/interrupt({turn_id}) failed: {error} (skipped)");
+        }
     }
     eprintln!("[codex-e2e-completed-at]   interrupted turn {turn_id}");
 
