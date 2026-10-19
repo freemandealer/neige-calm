@@ -33,6 +33,7 @@ struct Boot {
     roles: CardRoleCache,
     tracks: TrackAreaCache,
     shared_codex: Arc<calm_server::shared_codex_appserver::SharedCodexAppServer>,
+    operation_runtime: Arc<calm_server::operation::OperationRuntime>,
     tmp: TempDir,
 }
 
@@ -73,6 +74,7 @@ async fn boot() -> Boot {
     .with_shared_codex_appserver(shared_codex.clone())
     .with_workspace_root(workspace_root.clone());
     let harness = state.harness.clone();
+    let operation_runtime = state.operation_runtime.clone();
     let app = routes::router()
         .layer(axum::middleware::from_fn_with_state(
             calm_server::auth::AuthState::new(calm_server::auth::AuthConfig {
@@ -95,6 +97,7 @@ async fn boot() -> Boot {
         roles,
         tracks,
         shared_codex,
+        operation_runtime,
         tmp,
     }
 }
@@ -1585,7 +1588,7 @@ async fn a_area_directory_with_an_unrecyclable_track_survives() {
 }
 
 #[tokio::test]
-async fn the_trash_gc_expires_old_entries_on_the_next_delete() {
+async fn deleting_a_track_keeps_unrelated_expired_trash_for_maintenance() {
     let b = boot().await;
     let area_id = create_area(&b, "Atlas").await;
     let (first_id, _) = managed_track(&b, &area_id, "one").await;
@@ -1609,7 +1612,10 @@ async fn the_trash_gc_expires_old_entries_on_the_next_delete() {
     let (status, _) = delete_track(&b, &second_id).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    assert!(!stale.exists(), "the expired trash entry was not swept");
+    assert!(
+        stale.exists(),
+        "deleting one track synchronously collected unrelated expired trash; its work belongs to maintenance"
+    );
     assert!(fresh.exists(), "a fresh trash entry was swept early");
     assert!(trash_entry_for(&b.workspace_root, &second_id).is_some());
 }
@@ -1636,3 +1642,9 @@ async fn deleting_a_track_takes_its_live_harness_out_of_the_registry() {
 
 #[path = "isolation_none.rs"]
 mod isolation_none;
+
+#[path = "track_workspace_recycle/deletion_observation.rs"]
+mod deletion_observation;
+
+#[path = "track_workspace_recycle/trash_maintenance.rs"]
+mod trash_maintenance;
