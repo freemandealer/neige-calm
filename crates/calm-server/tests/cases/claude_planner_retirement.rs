@@ -19,6 +19,7 @@ use calm_server::harness::{
 use calm_server::planner_model::TurnModelSelection;
 use serde_json::json;
 
+use super::claude_planner_session_fixture::request;
 use super::claude_planner_stack_fixture::{Root, Stack};
 use super::claude_planner_wiring::wait_file;
 
@@ -338,13 +339,14 @@ async fn a_stale_harness_tick_after_shutdown_never_mints_over_the_replacer() {
     let refused = stale_session
         .turn_start(
             &thread,
-            vec![InputItem::Text {
-                text: "stale".into(),
-            }],
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &uuid::Uuid::new_v4().simple().to_string(),
-            None,
+            request(
+                vec![InputItem::Text {
+                    text: "stale".into(),
+                }],
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &uuid::Uuid::new_v4().simple().to_string(),
+            ),
         )
         .await;
     assert!(refused.is_err(), "a shut-down session never starts a turn");

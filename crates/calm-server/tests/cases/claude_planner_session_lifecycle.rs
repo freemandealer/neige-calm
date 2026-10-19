@@ -8,7 +8,7 @@ use calm_server::claude_planner::session::{SETTLE_AFTER_STOP, STOP_TIMER};
 use calm_server::planner_model::TurnModelSelection;
 
 use super::claude_planner_session_fixture::{
-    Rig, client_id, completed_turn, until_completed, wait_for_file,
+    Rig, client_id, completed_turn, request, until_completed, wait_for_file,
 };
 
 /// An interrupt's `TurnCompleted` is due by `settle_by` = the interrupt + [`STOP_TIMER`] +
@@ -25,11 +25,12 @@ async fn an_ignored_interrupt_is_ended_by_the_stop_timer_within_budget() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -60,11 +61,12 @@ async fn stdout_that_is_not_utf8_fails_the_turn_as_protocol() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -84,11 +86,12 @@ async fn the_first_init_binds_the_row_and_a_reopened_session_resumes() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -103,11 +106,12 @@ async fn the_first_init_binds_the_row_and_a_reopened_session_resumes() {
     reopened
         .turn_start(
             &rig.thread,
-            rig.text("after a restart"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("after a restart"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -129,11 +133,12 @@ async fn a_ready_result_wins_over_a_stop_that_fires_with_it() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -163,11 +168,12 @@ async fn the_mcp_token_is_minted_once_at_the_first_turn() {
         rig.session()
             .turn_start(
                 &rig.thread,
-                rig.text(text),
-                &TurnModelSelection::inherit(),
-                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-                &client_id(),
-                None,
+                request(
+                    rig.text(text),
+                    &TurnModelSelection::inherit(),
+                    calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                    &client_id(),
+                ),
             )
             .await
             .expect("turn_start");
@@ -195,11 +201,12 @@ async fn a_session_that_was_never_installed_refuses_without_minting() {
     let error = loser
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect_err("not installed");
@@ -218,11 +225,12 @@ async fn an_interrupted_cli_that_stopped_reading_stdin_settles_within_budget() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -253,11 +261,12 @@ async fn a_cli_that_never_stops_writing_is_stopped_within_budget() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -280,11 +289,12 @@ async fn a_failed_init_check_still_binds_the_session_it_named() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -303,11 +313,12 @@ async fn a_failed_init_check_still_binds_the_session_it_named() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("again"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("again"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -327,11 +338,12 @@ async fn the_bind_leaves_active_turn_id_to_the_harness() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -358,11 +370,12 @@ async fn the_stop_timer_runs_from_the_interrupt_not_from_its_write() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -392,11 +405,12 @@ async fn a_cli_ignoring_sigterm_still_settles_by_settle_by() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -436,11 +450,12 @@ async fn a_first_turn_mint_on_a_superseded_row_fails_and_writes_nothing() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect_err("the guarded mint refuses a retired row");
@@ -474,11 +489,12 @@ async fn a_failed_bind_is_retried_on_the_next_turn() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -500,11 +516,12 @@ async fn a_failed_bind_is_retried_on_the_next_turn() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("again"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("again"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -531,11 +548,12 @@ async fn a_shutdown_or_seal_during_the_version_check_mints_nothing() {
             session
                 .turn_start(
                     &thread,
-                    text,
-                    &TurnModelSelection::inherit(),
-                    calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-                    &client_id(),
-                    None,
+                    request(
+                        text,
+                        &TurnModelSelection::inherit(),
+                        calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                        &client_id(),
+                    ),
                 )
                 .await
         });

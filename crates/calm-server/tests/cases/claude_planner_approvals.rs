@@ -12,7 +12,7 @@ use calm_server::planner_model::TurnModelSelection;
 use calm_server::planner_permission_mode::PlannerPermissionMode;
 use serde_json::{Value, json};
 
-use super::claude_planner_session_fixture::{Rig, client_id, until_completed};
+use super::claude_planner_session_fixture::{Rig, client_id, request, until_completed};
 use super::claude_planner_stack_fixture::{Root, Stack};
 
 const ALLOW_LINE: &str = r#"{"type":"control_response","response":{"subtype":"success","request_id":"perm-1","response":{"behavior":"allow"}}}"#;
@@ -33,11 +33,12 @@ async fn start(rig: &Rig, scenario: &str, mode: PlannerPermissionMode) -> String
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("approve me"),
-            &TurnModelSelection::inherit(),
-            mode,
-            &client_id(),
-            None,
+            request(
+                rig.text("approve me"),
+                &TurnModelSelection::inherit(),
+                mode,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start")

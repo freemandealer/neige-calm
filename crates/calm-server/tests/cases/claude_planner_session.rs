@@ -18,7 +18,8 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use super::claude_planner_session_fixture::{
-    P_D_FIXTURE, Rig, alive, client_id, cmdline, completed_turn, until_completed, wait_for_file,
+    P_D_FIXTURE, Rig, alive, client_id, cmdline, completed_turn, request, until_completed,
+    wait_for_file,
 };
 
 /// Larger than a pipe buffer, so writing it cannot complete unless the CLI reads it.
@@ -60,16 +61,16 @@ async fn exit_path_records_the_outcome_before_turn_completed() {
     rig.session()
         .set_before_turn_completed_pause_for_test(pause.clone());
     let mut rx = rig.session().subscribe_events();
-
     let turn = rig
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -82,7 +83,6 @@ async fn exit_path_records_the_outcome_before_turn_completed() {
     tokio::time::timeout(Duration::from_secs(30), pause.entered.notified())
         .await
         .expect("settlement reaches the pause");
-
     let outcomes = rig.outcomes().await;
     assert_eq!(
         outcomes.len(),
@@ -117,7 +117,6 @@ async fn exit_path_records_the_outcome_before_turn_completed() {
         rig.marked_pids().is_empty(),
         "no marked process before emit"
     );
-
     pause.release.notify_one();
     let seen = until_completed(&mut rx).await;
     let completed = completed_turn(&seen);
@@ -132,7 +131,6 @@ async fn exit_path_records_the_outcome_before_turn_completed() {
             .any(|n| matches!(n.kind, PlannerEventKind::TokenUsage { .. }))
     );
     assert_eq!(rig.session().active_turn_id_for_thread(&rig.thread), None);
-
     let argv = rig.read_bin("argv").expect("argv");
     let argv: Vec<&str> = argv.lines().collect();
     let at = argv
@@ -142,17 +140,17 @@ async fn exit_path_records_the_outcome_before_turn_completed() {
     assert_eq!(argv[at + 1], rig.thread);
     assert!(!argv.contains(&"--resume"));
     assert_env_is_the_allowlist(&rig).await;
-
     // The first init bound the session: the next turn resumes it.
     let second = rig
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("again"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("again"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("second turn_start");
@@ -234,11 +232,12 @@ async fn a_surviving_setsid_child_of_a_successful_exit_is_gone_before_turn_compl
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -248,7 +247,6 @@ async fn a_surviving_setsid_child_of_a_successful_exit_is_gone_before_turn_compl
         .and_then(|pid| pid.trim().parse::<i32>().ok())
         .map(alive);
     let marked = rig.marked_pids();
-
     assert_eq!(completed_turn(&seen)["status"], "completed");
     assert_eq!(
         orphan_alive,
@@ -269,11 +267,12 @@ async fn a_killed_cli_settles_failed_with_its_exit_status() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -304,7 +303,6 @@ async fn a_killed_cli_settles_failed_with_its_exit_status() {
     );
     let seen = until_completed(&mut rx).await;
     let completed = completed_turn(&seen);
-
     assert_eq!(completed["status"], "failed");
     let message = completed["error"]["message"].as_str().unwrap_or("");
     assert!(message.starts_with("claude exited"), "{message}");
@@ -335,16 +333,16 @@ async fn a_cli_lingering_after_its_result_is_stopped_and_the_turn_completes() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
     let seen = until_completed(&mut rx).await;
-
     assert_eq!(completed_turn(&seen)["status"], "completed");
     assert!(
         rig.marked_pids().is_empty(),
@@ -360,16 +358,16 @@ async fn an_undecodable_line_fails_the_turn_as_protocol() {
     rig.session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
     let completed = completed_turn(&until_completed(&mut rx).await);
-
     assert_eq!(completed["status"], "failed");
     let message = completed["error"]["message"].as_str().unwrap_or("");
     assert!(message.starts_with("protocol"), "{message}");
@@ -400,11 +398,12 @@ async fn assert_refused_before_ok(rig: &Rig, input: Vec<InputItem>) -> String {
         .session()
         .turn_start(
             &rig.thread,
-            input,
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                input,
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect_err("turn_start must refuse");
@@ -514,18 +513,18 @@ async fn a_recorded_interrupt_then_an_is_error_result_is_interrupted() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
     wait_for_file(&rig.bin("stdin")).await;
     let _outcome = rig.session().turn_interrupt(&rig.thread, &turn).await;
     let completed = completed_turn(&until_completed(&mut rx).await);
-
     assert_eq!(completed["status"], "interrupted");
     let outcomes = rig.outcomes().await;
     assert_eq!(outcomes[0]["status"], "interrupted");
@@ -542,11 +541,12 @@ async fn the_private_instructions_never_reach_a_cmdline() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -600,11 +600,12 @@ async fn the_stop_seam_fails_without_signalling_until_cleared() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await;
     clear_claude_planner_stop_failure_for_test(&rig.worker_session_id);
@@ -658,11 +659,12 @@ async fn shutdown_interrupts_the_running_turn_and_refuses_the_next() {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
@@ -678,11 +680,12 @@ async fn shutdown_interrupts_the_running_turn_and_refuses_the_next() {
         rig.session()
             .turn_start(
                 &rig.thread,
-                rig.text("later"),
-                &TurnModelSelection::inherit(),
-                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-                &client_id(),
-                None
+                request(
+                    rig.text("later"),
+                    &TurnModelSelection::inherit(),
+                    calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                    &client_id()
+                ),
             )
             .await
             .is_err()
@@ -699,16 +702,17 @@ async fn an_image_goes_out_as_base64_and_is_stored_as_its_placeholder() {
     rig.session()
         .turn_start(
             &rig.thread,
-            vec![
-                InputItem::Text {
-                    text: "what colour?".into(),
-                },
-                InputItem::LocalImage { path: path.clone() },
-            ],
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                vec![
+                    InputItem::Text {
+                        text: "what colour?".into(),
+                    },
+                    InputItem::LocalImage { path: path.clone() },
+                ],
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");

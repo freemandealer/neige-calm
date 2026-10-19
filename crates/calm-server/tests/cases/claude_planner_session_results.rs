@@ -2,7 +2,9 @@
 
 use calm_server::planner_model::TurnModelSelection;
 
-use super::claude_planner_session_fixture::{Rig, client_id, completed_turn, until_completed};
+use super::claude_planner_session_fixture::{
+    Rig, client_id, completed_turn, request, until_completed,
+};
 
 async fn result_turn(scenario: &str, status: &str, error: Option<&str>) {
     let rig = Rig::new(scenario).await;
@@ -11,11 +13,12 @@ async fn result_turn(scenario: &str, status: &str, error: Option<&str>) {
         .session()
         .turn_start(
             &rig.thread,
-            rig.text("hello"),
-            &TurnModelSelection::inherit(),
-            calm_server::planner_permission_mode::PlannerPermissionMode::Never,
-            &client_id(),
-            None,
+            request(
+                rig.text("hello"),
+                &TurnModelSelection::inherit(),
+                calm_server::planner_permission_mode::PlannerPermissionMode::Never,
+                &client_id(),
+            ),
         )
         .await
         .expect("turn_start");
