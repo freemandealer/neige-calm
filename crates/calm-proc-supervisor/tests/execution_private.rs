@@ -194,18 +194,98 @@ async fn private_prepare_wire_watch_reconnect_and_retire() {
 #[tokio::test]
 async fn private_prepare_wire_exact_replay_ignores_replaced_root_and_boot() {
     let mut harness = Harness::start().await;
-    let mut client = harness.connect().await;
+    let client = harness.connect().await;
     let root = harness.root("replay-root", false);
     let path = root.path.clone();
     let (request, held) = private_request(&client, root);
+    use std::os::fd::AsRawFd;
+    assert_eq!(
+        unsafe { libc::flock(held.root().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let fresh = HeldSourceObjects::open(&path, false).unwrap();
+    let mut watcher = harness.connect().await.watch().await.unwrap();
+    let mut socket = tokio::net::UnixStream::connect(&harness.socket)
+        .await
+        .unwrap();
+    calm_session::write_frame(
+        &mut socket,
+        &calm_session::control::ControlMsg::Execution(Box::new(ExecutionRequest::Handshake(
+            ExecutionHandshake {
+                required_contract: EXECUTION_ENVELOPE_VERSION,
+                client_secret: harness.secret.clone(),
+                mode: ExecutionProtocolMode::RegisteredV3,
+            },
+        ))),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
-        client
-            .prepare_private(request.clone(), &held)
-            .await
-            .unwrap(),
-        ExecutionReply::Prepared
+        calm_session::read_frame::<calm_session::control::ControlReply, _>(&mut socket).await.unwrap(),
+        calm_session::control::ControlReply::Execution(reply)
+            if matches!(*reply, ExecutionReply::Handshake { .. })
     ));
+    rights::send(
+        &socket,
+        &calm_session::control::ControlMsg::Execution(Box::new(ExecutionRequest::Prepare(
+            request.clone(),
+        ))),
+        &held.descriptors(),
+    )
+    .await
+    .unwrap();
+    drop(socket); // Disconnect without reading the Prepare ACK.
     drop(held);
+    drop(client);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher.changed())
+            .await
+            .unwrap()
+            .unwrap(),
+        (1, request.identity.execution_id.clone())
+    );
+    drop(watcher);
+    let journal_path = harness.journal().join(format!(
+        "{}.execution",
+        request.identity.execution_id.as_str()
+    ));
+    let durable = std::fs::read(&journal_path).unwrap();
+    let mut client = harness.connect().await;
+    // Lost ACK replay must retain the original open description, not the retry's FD.
+    let replay = client
+        .prepare_private(request.clone(), &fresh)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            replay,
+            ExecutionReply::Receipt {
+                state: ExecutionState::Prepared,
+                receipt: None
+            }
+        ),
+        "{replay:?}"
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), durable);
+    assert_eq!(
+        serde_json::to_value(
+            client
+                .prepare_private(request.clone(), &fresh)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&replay).unwrap()
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), durable);
+    assert_eq!(
+        unsafe { libc::flock(fresh.root().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     std::fs::rename(&path, harness.temp.path().join("original-root")).unwrap();
     std::fs::create_dir(&path).unwrap();
     let replacement = HeldSourceObjects::open(&path, false).unwrap();
@@ -229,6 +309,10 @@ async fn private_prepare_wire_exact_replay_ignores_replaced_root_and_boot() {
             ..
         }
     ));
+    assert_eq!(
+        unsafe { libc::flock(fresh.root().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
     drop(client);
     // Terminal exact retries are independent of the executor boot, just like Inspect.
     unsafe {
@@ -300,3 +384,78 @@ async fn legacy_handshake_server_wire_stable_and_typed_v3_refused() {
 
 #[path = "execution_private/c0_compat.rs"]
 mod c0_compat;
+
+#[path = "execution_private/qualification.rs"]
+mod qualification;
+
+#[tokio::test]
+async fn private_retirement_preserves_peer_and_does_not_grow_fds() {
+    let h = Harness::start().await;
+    let mut c = h.connect().await;
+    let root = h.root("retirement", false);
+    let (peer, held) = private_request(&c, root.clone());
+    assert!(matches!(
+        c.prepare_private(peer.clone(), &held).await.unwrap(),
+        ExecutionReply::Prepared
+    ));
+    let fd_count = || {
+        std::fs::read_dir(format!("/proc/{}/fd", h.child.id()))
+            .unwrap()
+            .count()
+    };
+    let baseline = fd_count();
+    for _ in 0..24 {
+        let (r, held) = private_request(&c, root.clone());
+        assert!(matches!(
+            c.prepare_private(r.clone(), &held).await.unwrap(),
+            ExecutionReply::Prepared
+        ));
+        assert!(matches!(
+            c.request(ExecutionRequest::Revoke(consume(&r)))
+                .await
+                .unwrap(),
+            ExecutionReply::RevocationAcknowledged {
+                state: ExecutionState::Revoked,
+                ..
+            }
+        ));
+        let retire = ExecutionRequest::Retire {
+            execution_id: r.identity.execution_id.clone(),
+            lifecycle: r.control_tokens.lifecycle.clone(),
+        };
+        let tombstone = c.request(retire.clone()).await.unwrap();
+        assert!(
+            matches!(&tombstone, ExecutionReply::Retired(t) if t.registration.as_ref() == Some(&r.identity.source_registration))
+        );
+        assert!(
+            matches!((c.request(retire).await.unwrap(), tombstone), (ExecutionReply::Retired(a), ExecutionReply::Retired(b)) if a == b)
+        );
+        assert!(matches!(
+            c.request(ExecutionRequest::Inspect(
+                peer.identity.execution_id.clone()
+            ))
+            .await
+            .unwrap(),
+            ExecutionReply::Inspected {
+                state: ExecutionState::Prepared,
+                ..
+            }
+        ));
+        assert_eq!(fd_count(), baseline);
+    }
+    drop(held); // Only the supervisor's original private lease can satisfy Launch.
+    let launched = c
+        .request(ExecutionRequest::Launch(consume(&peer)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            launched,
+            ExecutionReply::Receipt {
+                state: ExecutionState::Spawned,
+                receipt: Some(_)
+            }
+        ),
+        "{launched:?}"
+    );
+}
