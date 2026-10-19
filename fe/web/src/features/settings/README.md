@@ -115,10 +115,21 @@ One row per Planner provider: its status as a chip (`Ready`, `Unavailable` in
 warn tones, `Not configured` neutral) and, when it is not ready, the server's own
 sentence naming the failed check and its fix. The pane never words a reason
 itself; the one thing it adds is, for a provider create still accepts while
-unavailable (Codex, `CREATE_REFUSED_WHEN_UNAVAILABLE`), core's note on what a
+unavailable (`capabilities.requires_ready_availability` is false), core's note on what a
 create does then. A last **Recheck** row asks the server to run every check again
-(`refresh=true`) and writes the answer into the same query the new-track model
-picker reads, so both show one answer.
+(`refresh=true`). The app joins each shared `agentProviders` availability entry
+with `capabilities.requires_ready_availability` from the managed-provider query,
+by provider identity and in availability order. Status, reason, authentication notice
+and checked-at time come only from shared availability. While either read lacks
+data the pane shows Checking; a missing managed entry is an explicit load error
+with Retry for both reads, never a guessed capability or legacy table fallback.
+Authentication notices precede readiness copy. The app owns query lifetime,
+retry and Recheck state for the visit; a failed Recheck retains previous answers.
+A successful Recheck updates only shared availability and refreshes model catalogs.
+There is no reconciliation effect or dual-cache write: delayed managed reads cannot
+replace fresh availability. Codex recovery continues to invalidate both queries.
+Contract tests live in
+`planners.test.tsx` and `app/shell/settings-planners.test.tsx`.
 
 ## Plugin configuration is the one two-level section (#1284 S4)
 

@@ -1,4 +1,4 @@
-// `GET /api/agent-providers` for the new-track model picker and Settings › Planners (#1817): one
+// Availability for the model picker and Recheck for Settings › Planners (#1817): one
 // shared answer, and the Settings pane's Recheck that replaces it with a fresh one. A Recheck also
 // re-fetches the Claude CLI's model list on the server (#1822), so every model catalog is refreshed.
 

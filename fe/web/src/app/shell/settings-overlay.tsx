@@ -28,6 +28,7 @@ import {
   pluginDetailQueryOptions, pluginsQueryOptions, settingsQueryOptions, queryKeys, usePluginConfigMutations,
   usePluginInstall, usePluginMutations, useSettingsMutation,
 } from '../providers/queries.ts';
+import { managedProvidersQueryOptions } from '../providers/managed-providers.ts';
 import { agentProvidersQueryOptions, useAgentProvidersRecheck } from '../providers/agent-providers.ts';
 import { useCodexAuthenticationRetry } from '../providers/codex-authentication-retry.ts';
 import { useCurrentPath, useGo, type NavTarget } from '../router/navigation.ts';
@@ -154,14 +155,26 @@ function SectionPane({ section, transport, unauthorized }: SettingsOverlayProps 
   }
 }
 
-/** Settings › Planners: the shared availability answer the new-track picker also reads, and its Recheck. */
+/** App owns managed query lifetime/recovery; the feature consumes required server facts.
+ * Mount/unmount follows the Settings visit. settings-planners.test.tsx pins this injection. */
 function PlannersPaneHost({ transport, unauthorized }: SettingsOverlayProps) {
   const client = useQueryClient();
   // A same-value successful read can withdraw an obsolete save acknowledgement.
   // Observe query state too, so structural sharing cannot hide its read counter.
   const settings = useQuery({ ...settingsQueryOptions(transport, unauthorized), notifyOnChangeProps: 'all' });
   const save = useSettingsMutation(transport, unauthorized);
-  const providers = useQuery(agentProvidersQueryOptions(transport, unauthorized));
+  const providers = useQuery(managedProvidersQueryOptions(transport, unauthorized));
+  const availability = useQuery(agentProvidersQueryOptions(transport, unauthorized));
+  // Availability has one owner. Managed reads supply only static capability facts,
+  // joined by identity so a delayed response cannot replace a newer Recheck.
+  const missing = availability.data?.find((entry) => providers.data !== undefined
+    && !providers.data.some(({ availability: managed }) => managed.provider === entry.provider));
+  const joined = availability.data === undefined || providers.data === undefined || missing !== undefined
+    ? undefined : availability.data.map((entry) => ({
+      availability: entry,
+      capabilities: { requires_ready_availability: providers.data.find(({ availability: managed }) => managed.provider === entry.provider)!.capabilities.requires_ready_availability },
+    }));
+  const loadError = availability.error ?? providers.error;
   const recheck = useAgentProvidersRecheck(transport, unauthorized);
   const recovery = useCodexAuthenticationRetry(transport, unauthorized);
   const go = useGo();
@@ -175,9 +188,10 @@ function PlannersPaneHost({ transport, unauthorized }: SettingsOverlayProps) {
       authenticationRecovery={{ provider: 'codex', pending: recovery.pending, error: recovery.error,
         notices: recovery.notices, onRetry: recovery.retry,
         onOpenConversation: (notice) => go({ name: 'track', trackId: notice.track_id, cardId: notice.card_id, openPlanner: true }) }}
-      providers={providers.data}
-      loadError={providers.error === null ? null : readErrorText(providers.error, 'Planners are unavailable.')}
-      onRetryLoad={() => { void providers.refetch(); }}
+      providers={joined}
+      loadError={loadError !== null ? readErrorText(loadError, 'Planners are unavailable.')
+        : missing === undefined ? null : `Planner capabilities are unavailable for ${missing.provider}.`}
+      onRetryLoad={() => { void availability.refetch(); void providers.refetch(); }}
       onRecheck={recheck.recheck}
       rechecking={recheck.rechecking}
       recheckError={recheck.error}
