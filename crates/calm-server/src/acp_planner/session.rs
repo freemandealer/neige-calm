@@ -150,7 +150,7 @@ impl AcpPlannerSession {
             .await
             .map_err(CalmError::from)?
             .ok_or_else(|| refused("ACP owner is missing"))?;
-        if row.provider != WorkerProviderKind::OpenCode
+        if row.provider != WorkerProviderKind::from(&params.provider)
             || !matches!(
                 row.contract,
                 WorkerContract::Planner | WorkerContract::Assistant

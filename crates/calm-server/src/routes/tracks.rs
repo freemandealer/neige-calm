@@ -58,6 +58,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use calm_types::runtime::AgentProtocol;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -760,15 +761,13 @@ pub(crate) async fn create_track(
     } else {
         None
     };
-    let acp_availability = if request.planner_provider == AgentProvider::OpenCode {
+    let acp_availability = if request.planner_provider.protocol() == AgentProtocol::Acp {
         Some(
             s.provider_availability
-                .get(
+                .acp(
                     &request.planner_provider,
                     crate::agent_providers::Freshness::Cached,
-                    &s.claude_planner,
                     &s.acp_planner,
-                    &codex.shared_codex_appserver,
                 )
                 .await,
         )
@@ -850,7 +849,7 @@ pub(crate) async fn create_track(
     let reasoning_effort = request.reasoning_effort.take();
     let source = match &claude_catalog {
         Some(catalog) => super::planner_model::CatalogSource::Claude(catalog),
-        None if request.planner_provider == AgentProvider::OpenCode => {
+        None if request.planner_provider.protocol() == AgentProtocol::Acp => {
             super::planner_model::CatalogSource::Acp
         }
         None => super::planner_model::CatalogSource::Codex(&codex),
