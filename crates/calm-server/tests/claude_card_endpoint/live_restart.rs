@@ -176,14 +176,38 @@ async fn post_session_start(boot: &Boot, card_id: &str, session_id: &str) {
 /// Update of a running card: the old child gets SIGTERM and its exit is recorded, then exactly one
 /// new child resumes the session the card last started.
 #[tokio::test]
-async fn update_of_a_running_card_stops_its_child_then_resumes_the_latest_session() {
+async fn c1_fence_claude_update_waits_then_resumes() {
     let _guard = ENV_LOCK.lock().await;
     let live = live_card().await;
     let (boot, log) = (&live.boot, &live.log);
     let (old_pid, _) = starts(log)[0];
     post_session_start(boot, &live.card_id, SESSION_AFTER_CLEAR).await;
 
-    let (status, response) = post_restart(boot.app.clone(), &live.card_id).await;
+    let held = calm_server::per_card_lock::lock_key(
+        boot.state.operation_runtime.track_locks_for_test(),
+        &boot.track_id,
+    )
+    .await;
+    let arrival = calm_server::test_seams::PausePoint {
+        entered: Arc::default(),
+        release: Arc::default(),
+    };
+    calm_server::test_seams::install_pause_for_test(
+        "key-lock-waiting",
+        &boot.track_id,
+        arrival.clone(),
+    );
+    let restart = post_restart(boot.app.clone(), &live.card_id);
+    tokio::pin!(restart);
+    tokio::select! {
+        result = &mut restart => panic!("request completed before held track released: {result:?}"),
+        arrived = tokio::time::timeout(std::time::Duration::from_secs(5), arrival.entered.notified()) => arrived.expect("request reached track fence"),
+    }
+    assert!(alive(old_pid));
+    assert_eq!(starts(log).len(), 1);
+    arrival.release.notify_one();
+    drop(held);
+    let (status, response) = restart.await;
     assert_eq!(status, StatusCode::OK, "body={response:?}");
     assert_eq!(response["runtime"]["status"], "running", "{response}");
     eventually("the replacement starts", || starts(log).len() == 2).await;

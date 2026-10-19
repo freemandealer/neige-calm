@@ -525,7 +525,7 @@ async fn a_recovered_harness_streams_into_its_registrys_live_replies() {
 }
 
 #[tokio::test]
-async fn boot_recovery_respawns_harness_with_snapshot() {
+async fn c1_fence_direct_harness_recovery_waits_then_respawns() {
     let repo = Arc::new(SqlxRepo::open("sqlite::memory:").await.unwrap());
     let area = repo
         .area_create(
@@ -589,7 +589,18 @@ async fn boot_recovery_respawns_harness_with_snapshot() {
     let registry = HarnessRegistry::new();
     let claude_wiring =
         calm_server::harness::wiring::PlannerWiring::unconfigured_for_test(repo.clone());
-    let recovered = recover_harnesses_on_boot(
+    let locks = calm_server::harness::new_track_delete_locks();
+    let held = calm_server::per_card_lock::lock_key(&locks, track.id.as_str()).await;
+    let arrival = calm_server::test_seams::PausePoint {
+        entered: Arc::default(),
+        release: Arc::default(),
+    };
+    calm_server::test_seams::install_pause_for_test(
+        "key-lock-waiting",
+        track.id.as_str(),
+        arrival.clone(),
+    );
+    let recovery = recover_harnesses_on_boot(
         repo,
         EventBus::new(),
         calm_server::card_role_cache::CardRoleCache::new(),
@@ -598,12 +609,19 @@ async fn boot_recovery_respawns_harness_with_snapshot() {
         daemon.thread_seals().clone(),
         &claude_wiring,
         &registry,
-        &calm_server::harness::new_track_delete_locks(),
+        &locks,
         calm_server::harness::BootRows::All,
-    )
-    .await
-    .unwrap();
-    assert_eq!(recovered, 1);
+    );
+    tokio::pin!(recovery);
+    tokio::select! {
+        result = &mut recovery => panic!("request completed before held track released: {result:?}"),
+        arrived = tokio::time::timeout(std::time::Duration::from_secs(5), arrival.entered.notified()) => arrived.expect("request reached track fence"),
+    }
+    assert_eq!(registry.len_active(), 0);
+    assert!(daemon.resumed_threads_for_test().is_empty());
+    arrival.release.notify_one();
+    drop(held);
+    assert_eq!(recovery.await.unwrap(), 1);
     let handle = registry.get(&runtime_id).expect("recovered harness");
     let restored = handle.snapshot().await;
     assert_eq!(restored.push_watermark, 42);

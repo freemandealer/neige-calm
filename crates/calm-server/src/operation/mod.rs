@@ -39,7 +39,7 @@ pub mod track_recipe_create_adapter;
 mod tx_only;
 pub(crate) mod worker_cleanup;
 
-pub use driver::{OperationCompletionBus, OperationRuntime};
+pub use driver::{OperationCompletionBus, OperationDriveGuard, OperationRuntime};
 pub use repo_sqlite::SqlxOperationRepo;
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
@@ -269,6 +269,7 @@ impl TxOutput {
 
 #[derive(Clone)]
 pub struct SpawnCtx {
+    pub track_delete_locks: crate::per_card_lock::KeyedLocks,
     pub execution: crate::execution_quiesce::ExecutionLifecycle,
     pub repo: Arc<dyn crate::db::RouteRepo>,
     pub operation_repo: Arc<dyn OperationRepo>,
@@ -295,9 +296,15 @@ impl SpawnCtx {
             terminal_renderer,
             events,
             completion,
+            track_delete_locks: crate::per_card_lock::new_keyed_locks(),
             shared_codex_appserver: None,
             execution: Default::default(),
         }
+    }
+
+    pub fn with_track_delete_locks(mut self, locks: crate::per_card_lock::KeyedLocks) -> Self {
+        self.track_delete_locks = locks;
+        self
     }
 
     pub fn with_execution(
@@ -756,6 +763,13 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn validate(&self, input: &Value) -> Result<()>;
 
+    /// Adapter declares the track whose checkout preparation must exclude clean.
+    /// The driver holds its existing track guard through the occupancy commit,
+    /// including boot recovery.
+    async fn preparation_track(&self, _input: &Value, _ctx: &SpawnCtx) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Recoverable preparation that must finish outside the repository writer transaction.
     /// Adapters retain ownership of their resource protocol; the driver knows no kind list.
     /// Optional typed evidence is consumed once after the repository revalidates the original
@@ -886,6 +900,16 @@ pub trait OperationRepo: Send + Sync {
     ) -> Result<Option<Operation>>;
     async fn operation_result(&self, op_id: &str) -> Result<Option<OperationResult>>;
     async fn claim_drive_batch(&self, limit: i64) -> Result<Vec<Operation>>;
+    /// Called under drive after a Busy waker releases track; a later phase owns its lease.
+    async fn release_pending_for_retry(&self, id: &str) -> Result<()> {
+        let db = self.sqlite_db();
+        let mut tx = crate::db::sqlite::begin_immediate_tx(&db).await?;
+        sqlx::query("UPDATE operations SET lease_owner=NULL, lease_until_ms=NULL WHERE id=? AND phase='pending'")
+            .bind(id).execute(&mut **tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn claim_interaction_retry(
         &self,
         op: &Operation,

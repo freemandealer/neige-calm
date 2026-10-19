@@ -157,7 +157,7 @@ async fn seed_task_worker_card(boot: &Boot) -> String {
 /// After a host crash, boot reconcile marks every lost PTY exited; the owner's Claude card comes
 /// back on its own, once, and a Planner task worker's card is left to its Planner.
 #[tokio::test]
-async fn boot_resumes_owner_created_claude_cards_and_leaves_task_workers_exited() {
+async fn c1_fence_legacy_auto_resume_waits_then_resumes_owner_only() {
     let _guard = ENV_LOCK.lock().await;
     let calls = Arc::new(tokio::sync::Mutex::new(Vec::<SpawnCall>::new()));
     let calls_for_factory = calls.clone();
@@ -188,7 +188,33 @@ async fn boot_resumes_owner_created_claude_cards_and_leaves_task_workers_exited(
 
     // A terminal listed twice still resumes its card once.
     let listed_twice = [stale.clone(), stale].concat();
-    calm_server::claude_auto_resume::resume_owner_claude_cards(&boot.state, &listed_twice).await;
+    let held = calm_server::per_card_lock::lock_key(
+        boot.state.operation_runtime.track_locks_for_test(),
+        &boot.track_id,
+    )
+    .await;
+    let arrival = calm_server::test_seams::PausePoint {
+        entered: Arc::default(),
+        release: Arc::default(),
+    };
+    calm_server::test_seams::install_pause_for_test(
+        "key-lock-waiting",
+        &boot.track_id,
+        arrival.clone(),
+    );
+    let resume =
+        calm_server::claude_auto_resume::resume_owner_claude_cards(&boot.state, &listed_twice);
+    tokio::pin!(resume);
+    tokio::select! {
+        _ = &mut resume => panic!("auto-resume passed held track"),
+        arrived = tokio::time::timeout(std::time::Duration::from_secs(5), arrival.entered.notified()) => arrived.expect("auto-resume reached track fence"),
+    }
+    arrival.release.notify_one();
+    assert_eq!(calls.lock().await.len(), spawns_before);
+    drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), resume)
+        .await
+        .expect("auto-resume must not wait for lease expiry");
 
     let restarted: Vec<String> = sqlx::query(
         "SELECT json_extract(payload_json, '$.card_id') AS card_id FROM operations \
