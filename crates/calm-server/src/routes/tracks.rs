@@ -1268,6 +1268,7 @@ enum TrackInit {
     /// Instantiate a template recipe; the key is the roster's own, never the caller's string.
     Template {
         key: &'static str,
+        capabilities: &'static [calm_types::track_capability::TrackCapability],
         /// The owning plugin at creation time, when the admitted template is bound to a running
         /// and trusted one. Lives in this arm so a non-`Template` source has nowhere to put an
         /// owner. Boxed: a `Manifest` is ~864 bytes (`clippy::large_enum_variant`).
@@ -1512,6 +1513,7 @@ pub(crate) async fn create_managed_track(
         normalized_cwd: p.cwd.clone(),
         init: TrackInit::Template {
             key: template.key(),
+            capabilities: template.capabilities(),
             binding: None,
         },
         workspace_plan: TrackWorkspacePlan::ManagedUnder(s.workspace_root.clone()),
