@@ -6,7 +6,7 @@ mod common;
 use common::{command, evaluator, exit_run, judged_run, metric, objective, value_run};
 use objective::check::{Direction, SampleOutput, Trend};
 use objective::command::CommandCall;
-use objective::definition::{BudgetLimit, CompactPolicy, Mode, ObjectiveSpec, Role, Usage};
+use objective::definition::{BudgetLimit, CompactPolicy, Mode, ObjectiveDefinition, Role, Usage};
 use objective::engine::{Event, IgnoreReason, Intent, Notice, State, Status, react};
 use objective::ids::{CheckId, EvaluationId, ObjectiveKey, Revision};
 use objective::ledger::{Decision, SettleError};
@@ -21,7 +21,7 @@ fn rev(name: &str) -> Revision {
     Revision::new(name)
 }
 
-fn speed() -> ObjectiveSpec {
+fn speed() -> ObjectiveDefinition {
     objective(
         "speed",
         Mode::Loop { plateau: 2 },
@@ -33,19 +33,19 @@ fn speed() -> ObjectiveSpec {
     )
 }
 
-fn speed_redefined() -> ObjectiveSpec {
+fn speed_redefined() -> ObjectiveDefinition {
     let mut redefined = speed();
     redefined.constraints.push("no unsafe code".into());
     redefined
 }
 
-fn docs() -> ObjectiveSpec {
+fn docs() -> ObjectiveDefinition {
     let mut docs = objective("docs", Mode::Converge, vec![command("docs", Role::Goal)]);
     docs.compact = CompactPolicy::OnClose;
     docs
 }
 
-fn approve(objective: &ObjectiveSpec) -> Event {
+fn approve(objective: &ObjectiveDefinition) -> Event {
     Event::ApprovalGranted {
         objective: objective.key.clone(),
         approval: Approval {
@@ -124,8 +124,8 @@ fn scenario() -> Vec<Event> {
     stale_docs.constraints.clear();
     let mut log = vec![
         usage(0),
-        Event::SpecChanged { objective: speed() },
-        Event::SpecChanged { objective: docs() },
+        Event::DefinitionChanged { objective: speed() },
+        Event::DefinitionChanged { objective: docs() },
         Event::Requested {
             objective: key("speed"),
             revision: rev("r0"),
@@ -174,7 +174,7 @@ fn scenario() -> Vec<Event> {
             objective: key("docs"),
         },
         Event::HostIdle { queue_len: 0 },
-        Event::SpecChanged {
+        Event::DefinitionChanged {
             objective: speed_redefined(),
         },
         Event::Requested {
@@ -264,7 +264,7 @@ fn the_scenario_notifies_the_planner_in_order() {
             _ => None,
         })
         .collect();
-    let required = |objective: &ObjectiveSpec| Notice::ApprovalRequired {
+    let required = |objective: &ObjectiveDefinition| Notice::ApprovalRequired {
         objective: objective.key.clone(),
         standard_hash: standard_hash(objective),
     };
@@ -412,4 +412,48 @@ fn the_scenario_leaves_ledgers_and_statuses_consistent() {
     assert_eq!(docs.ledger.baseline.as_ref().unwrap().revision, rev("r3"));
     assert_eq!(state.compactions, 2);
     assert!(!state.pending_compact);
+}
+
+#[test]
+fn objective_host_serde_version_pins() {
+    assert_eq!(objective::engine::EVENT_VERSION, 1);
+    assert_eq!(objective::engine::STATE_VERSION, 1);
+    let events = scenario();
+    let steps = replay(State::default(), &events);
+    let running = steps
+        .iter()
+        .map(|(state, _)| state)
+        .find(|state| {
+            state.objectives.values().any(|o| {
+                matches!(
+                    o.evaluation,
+                    Some(objective::engine::Evaluation::Running { .. })
+                )
+            })
+        })
+        .unwrap();
+    let ready = steps
+        .iter()
+        .map(|(state, _)| state)
+        .find(|state| {
+            state.objectives.values().any(|o| {
+                matches!(
+                    o.evaluation,
+                    Some(objective::engine::Evaluation::Ready { .. })
+                )
+            })
+        })
+        .unwrap();
+    let actual = serde_json::json!({"events": events, "default":State::default(), "running":running, "ready":ready, "final":final_state(&steps)});
+    let events: serde_json::Value =
+        serde_json::from_str(include_str!("goldens/events-v1.json")).unwrap();
+    let active: serde_json::Value =
+        serde_json::from_str(include_str!("goldens/states-active-v1.json")).unwrap();
+    let final_state: serde_json::Value =
+        serde_json::from_str(include_str!("goldens/state-final-v1.json")).unwrap();
+    let expected = serde_json::json!({"events":events,"default":active["default"],"running":active["running"],"ready":active["ready"],"final":final_state});
+    assert_eq!(
+        actual, expected,
+        "persisted objective contracts changed; review version bumps"
+    );
 }
