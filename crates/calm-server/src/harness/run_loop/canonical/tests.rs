@@ -33,6 +33,14 @@ impl Fixture {
     }
 
     async fn with_config(config: HarnessConfig) -> Self {
+        Self::with_usage(config, None, false).await
+    }
+
+    async fn with_usage(
+        config: HarnessConfig,
+        usage: Option<TokenUsage>,
+        invalidated: bool,
+    ) -> Self {
         let original = ExistingRuntime::new().await;
         let inner = &original.harness.inner;
         let auth = crate::auth::AuthState::new(crate::auth::AuthConfig {
@@ -57,6 +65,8 @@ impl Fixture {
         let source = source.unwrap();
         let mut snapshot = CanonicalHarnessSnapshot::dormant(0);
         snapshot.header.last_thread_id = inner.thread_id.read().await.clone();
+        snapshot.header.token_usage = usage;
+        snapshot.header.context_usage_invalidated = invalidated;
         let mut tx = begin_immediate_tx(original.repo.db()).await.unwrap();
         assert!(
             session_set_handle_state_tx(
@@ -424,4 +434,316 @@ async fn real_loop_unknown_report_keeps_issuing_claim_without_rebuffer_or_redisp
     assert_eq!(count, 1);
     // No native turn was acknowledged, so cleanup must not fabricate an END.
     fx.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn context_usage_canonical_pre_feature_claim_is_sent_unchanged() {
+    assert_resumed_context_usage(None).await;
+}
+
+#[tokio::test]
+async fn context_usage_canonical_resumed_claim_replays_identical_text() {
+    assert_resumed_context_usage(Some(
+        "[Trusted Planner context usage]\nContext window: 50% used (142000 of 272000 tokens) as of the latest response before this turn. Record important state in the Report before compacting; conversation text after compaction is not guaranteed to survive."
+    )).await;
+}
+
+async fn assert_resumed_context_usage(usage: Option<&str>) {
+    let fx = Fixture::new().await;
+    let (_client, mut peer) = connect(&fx.daemon).await;
+    let mut contexts = vec![
+        SystemRenderContext::new(
+            HarnessInputPresentation::SystemPlannerTurnBudget,
+            crate::planner_turn_budget::PlannerTurnBudget::default().initial_input(),
+        )
+        .unwrap(),
+    ];
+    if let Some(text) = usage {
+        contexts.push(
+            SystemRenderContext::new(
+                HarnessInputPresentation::SystemPlannerContextUsage,
+                text.into(),
+            )
+            .unwrap(),
+        );
+    }
+    // Persist a composed claim before the scheduler has a live source. Resume
+    // must hydrate this immutable plan without additions or a fresh reading.
+    let mut tx = begin_immediate_tx(fx.original.repo.db()).await.unwrap();
+    let mut carrier = current_input_carrier_tx(
+        &mut tx,
+        fx.harness.inner.card_id.as_str(),
+        &fx.harness.inner.worker_session_id,
+    )
+    .await
+    .unwrap();
+    let plan = human_plan_for_pending_prefix_tx(
+        &mut tx,
+        &carrier,
+        std::num::NonZeroU32::new(1).unwrap(),
+        contexts,
+    )
+    .await
+    .unwrap();
+    let expected = crate::harness::input_dispatch::hydrate_for_test(
+        &mut tx,
+        fx.harness.inner.card_id.as_str(),
+        &plan,
+    )
+    .await
+    .unwrap();
+    let claim =
+        crate::conversation_inputs::claim_initial_tx(&mut tx, &fx.source, &mut carrier, plan)
+            .await
+            .unwrap();
+    let mut snapshot: CanonicalHarnessSnapshot =
+        serde_json::from_value(carrier.snapshot().clone()).unwrap();
+    snapshot.header.turn_budget = budget::FrozenBudget::Planner {
+        budget: crate::planner_turn_budget::PlannerTurnBudget::default(),
+        start_attempt: QueueEntryId::from_wire(claim.submission_id.as_str().into()),
+        warning_attempted: false,
+        context_usage: calm_types::harness::budget::FrozenContextUsage::RenderPlan,
+    };
+    let mut header = header_value(&snapshot).unwrap();
+    if usage.is_none() {
+        header["turn_budget"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_usage");
+    }
+    persist_runtime_frame_tx(
+        &mut tx,
+        fx.harness.inner.card_id.as_str(),
+        &fx.harness.inner.worker_session_id,
+        &RuntimeExecutionFence::from_carrier(&carrier),
+        header,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    fx.harness
+        .observe_canonical_source(fx.message.clone(), fx.source.clone())
+        .await
+        .unwrap();
+    let call = request(&mut peer).await;
+    assert_eq!(call["method"], "turn/start");
+    let [InputItem::Text { text: expected }] = expected.as_slice() else {
+        panic!("one text input")
+    };
+    assert_eq!(call["params"]["input"][0]["text"], *expected);
+    assert_eq!(call["params"]["input"].as_array().unwrap().len(), 1);
+    let input = call["params"]["input"].to_string();
+    assert_eq!(
+        input.matches("[Trusted Planner context usage]").count(),
+        usize::from(usage.is_some())
+    );
+    assert!(!input.contains("not recorded"));
+    let mut tx = begin_immediate_tx(fx.original.repo.db()).await.unwrap();
+    let stored = crate::db::sqlite::conversation::submission_plan_tx(&mut tx, &claim.submission_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.plan, claim.plan);
+    tx.rollback().await.unwrap();
+    send(
+        &mut peer,
+        json!({"id":call["id"],"error":{"code":-32000,"message":"fixture rejected"}}),
+    )
+    .await;
+    peer.close(None).await.unwrap();
+    fx.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn context_usage_canonical_freezes_context_at_claim() {
+    let fx = Fixture::new().await;
+    let (_client, mut peer) = connect(&fx.daemon).await;
+    fx.harness
+        .observe_canonical_source(fx.message.clone(), fx.source.clone())
+        .await
+        .unwrap();
+    let call = request(&mut peer).await;
+    assert_eq!(call["method"], "turn/start");
+    let input = call["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(input.contains("[Trusted Planner turn budget]"));
+    assert_eq!(input.matches("[Trusted Planner context usage]").count(), 1);
+    assert!(
+        input.contains(
+            "[Trusted Planner context usage]\nContext usage is unknown (no reading yet)."
+        ),
+        "{input}"
+    );
+    assert!(
+        input.find("[Trusted Planner turn budget]") < input.find("[Trusted Planner context usage]")
+    );
+    let frozen = fx.frame().await;
+    let wire = serde_json::to_string(&frozen).unwrap();
+    assert_eq!(
+        serde_json::to_value(&frozen).unwrap()["turn_budget"]["context_usage"],
+        json!({"kind":"render_plan"})
+    );
+    // Render data belongs to the submission, while the runtime snapshot stays body-free.
+    let submission = &frozen
+        .canonical_inputs
+        .active
+        .as_ref()
+        .unwrap()
+        .submission_ids[0];
+    let mut tx = begin_immediate_tx(fx.original.repo.db()).await.unwrap();
+    let stored = crate::db::sqlite::conversation::submission_plan_tx(&mut tx, submission)
+        .await
+        .unwrap();
+    let before = crate::harness::input_dispatch::hydrate_for_test(
+        &mut tx,
+        fx.harness.inner.card_id.as_str(),
+        &stored.plan,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    let [InputItem::Text { text: before_text }] = before.as_slice() else {
+        panic!("one text input")
+    };
+    assert_eq!(before_text, input);
+    let thread = call["params"]["threadId"].as_str().unwrap();
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/started",
+        json!({"id":"usage-turn"}),
+    )
+    .await;
+    send(
+        &mut peer,
+        json!({"id":call["id"],"result":{"turn":{"id":"usage-turn"}}}),
+    )
+    .await;
+    fx.wait_phase(HarnessPhaseTag::TurnRunning).await;
+    send(&mut peer, json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":thread,"turnId":"usage-turn",
+        "tokenUsage":{"last":{"totalTokens":142000},"total":{"totalTokens":9999999},"modelContextWindow":272000}
+    }})).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fx
+                .frame()
+                .await
+                .header
+                .token_usage
+                .as_ref()
+                .is_some_and(|u| u.used_tokens == 142000)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let restored: CanonicalHarnessSnapshot = serde_json::from_str(&wire).unwrap();
+    assert_eq!(restored, frozen);
+    let mut tx = begin_immediate_tx(fx.original.repo.db()).await.unwrap();
+    let stored = crate::db::sqlite::conversation::submission_plan_tx(&mut tx, submission)
+        .await
+        .unwrap();
+    let after = crate::harness::input_dispatch::hydrate_for_test(
+        &mut tx,
+        fx.harness.inner.card_id.as_str(),
+        &stored.plan,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+    let [InputItem::Text { text: after_text }] = after.as_slice() else {
+        panic!("one text input")
+    };
+    assert_eq!(after_text, before_text);
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/completed",
+        json!({"id":"usage-turn","status":"completed"}),
+    )
+    .await;
+    fx.wait_phase(HarnessPhaseTag::TurnCompleted).await;
+    peer.close(None).await.unwrap();
+    fx.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn context_usage_canonical_known_and_invalidated_readings() {
+    for (used_tokens, context_window, invalidated, expected) in [
+        (
+            -1,
+            Some(258400),
+            false,
+            "Context usage is unknown (invalid reading).",
+        ),
+        (
+            i64::MIN,
+            Some(258400),
+            false,
+            "Context usage is unknown (invalid reading).",
+        ),
+        (
+            142000,
+            Some(272000),
+            false,
+            "Context window: 50% used (142000 of 272000 tokens)",
+        ),
+        (
+            142000,
+            Some(272000),
+            true,
+            "Context usage is unknown (reset by compaction).",
+        ),
+        (
+            142000,
+            None,
+            false,
+            "Context usage is unknown (window unknown).",
+        ),
+        (
+            272001,
+            Some(272000),
+            false,
+            "Context usage is unknown (reading exceeds window).",
+        ),
+    ] {
+        let fx = Fixture::with_usage(
+            HarnessConfig::default(),
+            Some(TokenUsage {
+                used_tokens,
+                total_tokens: 9999999,
+                context_window,
+                at_ms: 1,
+            }),
+            invalidated,
+        )
+        .await;
+        let (_client, mut peer) = connect(&fx.daemon).await;
+        fx.harness
+            .observe_canonical_source(fx.message.clone(), fx.source.clone())
+            .await
+            .unwrap();
+        let call = request(&mut peer).await;
+        assert_eq!(call["method"], "turn/start");
+        let input = call["params"]["input"][0]["text"].as_str().unwrap();
+        assert!(input.contains(expected), "{input}");
+        if invalidated
+            || used_tokens < 0
+            || context_window.is_none()
+            || used_tokens > context_window.unwrap()
+        {
+            assert!(!input.contains("% used"), "{input}");
+        }
+        send(
+            &mut peer,
+            json!({"id":call["id"],"error":{"code":"malformed","message":"unknown"}}),
+        )
+        .await;
+        peer.close(None).await.unwrap();
+        fx.harness.shutdown().await.unwrap();
+    }
 }

@@ -15491,7 +15491,8 @@
           "system_task_completed",
           "system_task_failed",
           "system_mail",
-          "system_planner_turn_budget"
+          "system_planner_turn_budget",
+          "system_planner_context_usage"
         ]
       },
       "HarnessInputSegment": {
@@ -18400,7 +18401,8 @@
           "system_task_completed",
           "system_task_failed",
           "system_mail",
-          "system_planner_turn_budget"
+          "system_planner_turn_budget",
+          "system_planner_context_usage"
         ]
       },
       "TagMention": {

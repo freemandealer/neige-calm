@@ -6,12 +6,20 @@ use crate::model::{HarnessInputPresentation, HarnessInputSegment};
 pub use crate::planner_turn_budget::FrozenBudget;
 use crate::planner_turn_budget::PlannerTurnBudgetExt;
 use crate::planner_turn_budget::{LoadError, PlannerTurnBudget};
+use calm_types::harness::budget::FrozenContextUsage;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Both facts follow one reuse decision, made before issuance chooses an identity.
+#[derive(Debug)]
+pub(super) struct SampledPlanner {
+    pub budget: PlannerTurnBudget,
+    pub context_usage: FrozenContextUsage,
+}
+
 pub(super) async fn sample(
     inner: &Inner,
-) -> Result<Option<PlannerTurnBudget>, super::IssuanceRefusal> {
+) -> Result<Option<SampledPlanner>, super::IssuanceRefusal> {
     let Some(card) = inner
         .repo
         .card_get(inner.card_id.as_str())
@@ -31,21 +39,55 @@ pub(super) async fn sample(
         .and_then(|role| HarnessProfile::from_shape(&card.kind, role, &card.payload))
         == Some(HarnessProfile::Planner);
     if is_planner {
+        // Ownership is a mode contract, independent of the optional retry projection id.
+        if inner.inputs.canonical().is_none()
+            && matches!(
+                &*inner.turn_budget.lock().await,
+                FrozenBudget::Planner {
+                    context_usage: calm_types::harness::budget::FrozenContextUsage::RenderPlan,
+                    ..
+                }
+            )
+        {
+            return Err(super::IssuanceRefusal::rejected(
+                "historical context usage belongs to a canonical render plan".into(),
+                "Cannot retry this turn: its context usage belongs to a canonical render plan."
+                    .into(),
+            ));
+        }
         // An interrupted start attempt replays under its frozen budget and stable projection id.
         if let Some(id) = inner.projection_client_id.lock().await.as_ref()
             && let FrozenBudget::Planner {
                 budget,
                 start_attempt,
+                context_usage,
                 ..
             } = &*inner.turn_budget.lock().await
             && id == start_attempt
         {
-            return Ok(Some(*budget));
+            return Ok(Some(SampledPlanner {
+                budget: *budget,
+                context_usage: context_usage.clone(),
+            }));
         }
-        PlannerTurnBudget::load(inner.repo.as_ref())
+        let budget = PlannerTurnBudget::load(inner.repo.as_ref())
             .await
-            .map(Some)
-            .map_err(sampling_refusal)
+            .map_err(sampling_refusal)?;
+        let context_usage = if inner.inputs.canonical().is_some() {
+            // The canonical claim composes and owns its immutable render plan.
+            FrozenContextUsage::RenderPlan
+        } else {
+            let invalidated = inner.context_usage_invalidation.lock().await.is_some();
+            let usage = inner.token_usage.lock().await;
+            FrozenContextUsage::Text(crate::harness::token_usage::planner_context_input(
+                usage.as_ref(),
+                invalidated,
+            ))
+        };
+        Ok(Some(SampledPlanner {
+            budget,
+            context_usage,
+        }))
     } else {
         Ok(None)
     }
@@ -100,6 +142,7 @@ pub(super) async fn warn(inner: &Arc<Inner>) -> crate::error::Result<()> {
             budget,
             start_attempt,
             warning_attempted,
+            ..
         } = &mut *frozen
         else {
             return Ok(());

@@ -50,6 +50,31 @@ impl PlannerTurnBudget {
     }
 }
 
+/// A context-usage segment is frozen at first composition and replayed unchanged.
+/// Pre-feature turns retain the absence of that segment.
+/// Present values use only the tagged enum wire form.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "text",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FrozenContextUsage {
+    /// Historical issuance owns the composed segment text.
+    Text(String),
+    /// Canonical issuance replays the immutable render plan exactly as stored.
+    RenderPlan,
+    /// Planner budgets persisted before this feature omitted `context_usage`.
+    /// A matching attempt is delivered without a context-usage segment.
+    LegacyNotRecorded,
+}
+
+/// Map only an absent Planner `context_usage` field from pre-feature persisted budgets.
+fn legacy_context_not_recorded() -> FrozenContextUsage {
+    FrozenContextUsage::LegacyNotRecorded
+}
+
 /// An explicit legacy state preserves the existing recovery policy without guessing a budget.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -61,6 +86,8 @@ pub enum FrozenBudget {
         budget: PlannerTurnBudget,
         start_attempt: super::snapshot::QueueEntryId,
         warning_attempted: bool,
+        #[serde(default = "legacy_context_not_recorded")]
+        context_usage: FrozenContextUsage,
     },
 }
 
@@ -84,12 +111,14 @@ mod tests {
                         "attempt".into(),
                     ),
                     warning_attempted: true,
+                    context_usage: FrozenContextUsage::RenderPlan,
                 },
                 json!({
                     "kind": "planner",
                     "budget": 15,
                     "start_attempt": "attempt",
-                    "warning_attempted": true
+                    "warning_attempted": true,
+                    "context_usage": {"kind": "render_plan"}
                 }),
             ),
         ];
@@ -98,6 +127,56 @@ mod tests {
             assert_eq!(serde_json::from_value::<FrozenBudget>(wire).unwrap(), value);
         }
         assert_eq!(FrozenBudget::default(), FrozenBudget::Legacy);
+    }
+
+    #[test]
+    fn frozen_budget_context_usage_preserves_legacy_and_ownership() {
+        let base = json!({"kind":"planner", "budget":15,
+            "start_attempt":"attempt", "warning_attempted":false});
+        for (field, expected) in [
+            (None, FrozenContextUsage::LegacyNotRecorded),
+            (
+                Some(json!({"kind":"render_plan"})),
+                FrozenContextUsage::RenderPlan,
+            ),
+            (
+                Some(json!({"kind":"text", "text":"frozen reading"})),
+                FrozenContextUsage::Text("frozen reading".into()),
+            ),
+            (
+                Some(json!({"kind":"legacy_not_recorded"})),
+                FrozenContextUsage::LegacyNotRecorded,
+            ),
+        ] {
+            let mut wire = base.clone();
+            if let Some(field) = field {
+                wire["context_usage"] = field;
+            }
+            let value: FrozenBudget = serde_json::from_value(wire).unwrap();
+            let FrozenBudget::Planner { context_usage, .. } = &value else {
+                panic!("planner")
+            };
+            assert_eq!(context_usage, &expected);
+            assert_eq!(
+                serde_json::from_value::<FrozenBudget>(serde_json::to_value(&value).unwrap())
+                    .unwrap(),
+                value
+            );
+        }
+        for invalid in [
+            json!(null),
+            json!("frozen reading"),
+            json!(17),
+            json!({"kind":"text"}),
+            json!({"kind":"unknown"}),
+        ] {
+            let mut wire = base.clone();
+            wire["context_usage"] = invalid;
+            assert!(
+                serde_json::from_value::<FrozenBudget>(wire.clone()).is_err(),
+                "{wire}"
+            );
+        }
     }
 
     #[test]

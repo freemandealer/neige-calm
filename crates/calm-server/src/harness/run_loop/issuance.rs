@@ -1,6 +1,7 @@
 //! Ordinary issuance under the harness's existing claim and issuance lock.
 use super::*;
 use crate::harness::backend::StartDiagnostic;
+use calm_types::harness::budget::FrozenContextUsage;
 use provider::control::{TurnEdit, TurnRequest, TurnStartOutcome};
 
 pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
@@ -331,11 +332,12 @@ pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
         *slot = Some(key.clone());
         key
     };
-    *inner.turn_budget.lock().await = match sampled_budget {
-        Some(budget) => budget::FrozenBudget::Planner {
-            budget,
+    *inner.turn_budget.lock().await = match &sampled_budget {
+        Some(sampled) => budget::FrozenBudget::Planner {
+            budget: sampled.budget,
             start_attempt: client_id.clone(),
             warning_attempted: false,
+            context_usage: sampled.context_usage.clone(),
         },
         None => budget::FrozenBudget::NotApplicable,
     };
@@ -374,10 +376,21 @@ pub(super) async fn maybe_issue_turn(inner: &Arc<Inner>) -> Result<()> {
     .await;
 
     // Entry-index consumers must finish before adding kernel-owned context.
-    if let Some(budget) = sampled_budget {
-        let mut context = budget::segment(budget.initial_input());
+    if let Some(sampled) = sampled_budget {
+        let mut context = budget::segment(sampled.budget.initial_input());
         context.presentation = HarnessInputPresentation::SystemPlannerTurnBudget;
         segments.insert(0, context);
+        match sampled.context_usage {
+            FrozenContextUsage::Text(text) => {
+                let mut usage = budget::segment(text);
+                usage.presentation = HarnessInputPresentation::SystemPlannerContextUsage;
+                segments.insert(1, usage);
+            }
+            FrozenContextUsage::LegacyNotRecorded => {}
+            FrozenContextUsage::RenderPlan => {
+                unreachable!("budget sampling refuses historical render-plan ownership")
+            }
+        }
     }
     if let Some(notice) = timeout_notice {
         segments.insert(0, notice);

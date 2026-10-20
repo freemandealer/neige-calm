@@ -423,7 +423,7 @@ pub(super) async fn tick(inner: &Arc<Inner>) -> Result<()> {
     })
     .await?;
     let resolved = async {
-        let budget = budget::sample(inner).await?;
+        let budget = budget::sample(inner).await?.map(|sampled| sampled.budget);
         let selection = inner.backend.resolve_selection(&read_admission).await?;
         let permission = turn_permission::resolve(inner).await?;
         Ok::<_, IssuanceRefusal>((budget, selection, permission))
@@ -445,6 +445,16 @@ pub(super) async fn tick(inner: &Arc<Inner>) -> Result<()> {
             SystemRenderContext::new(
                 HarnessInputPresentation::SystemPlannerTurnBudget,
                 budget.initial_input(),
+            )
+            .map_err(|error| CalmError::Conflict(error.into()))?,
+        );
+        contexts.push(
+            SystemRenderContext::new(
+                HarnessInputPresentation::SystemPlannerContextUsage,
+                crate::harness::token_usage::planner_context_input(
+                    header.token_usage.as_ref(),
+                    header.context_usage_invalidated,
+                ),
             )
             .map_err(|error| CalmError::Conflict(error.into()))?,
         );
@@ -474,6 +484,7 @@ pub(super) async fn tick(inner: &Arc<Inner>) -> Result<()> {
                             claimed.submission_id.as_str().into(),
                         ),
                         warning_attempted: false,
+                        context_usage: calm_types::harness::budget::FrozenContextUsage::RenderPlan,
                     },
                     None => budget::FrozenBudget::NotApplicable,
                 };
