@@ -67,6 +67,9 @@ pub(crate) async fn admit(
     marker: &str,
 ) -> Result<Record> {
     let engine = engine(ctx)?;
+    // Gate cwd permits a symlink (the target sampler verifies its provenance).
+    // Private execution roots require a directory opened with O_NOFOLLOW.
+    let root = tokio::fs::canonicalize(cwd).await?;
     let mut environment: Vec<(String, String)> = ["PATH", "HOME", "LANG", "LC_ALL", "TERM"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key.into(), v)))
@@ -102,7 +105,7 @@ pub(crate) async fn admit(
             owner: OperationRef(op.id.clone()),
             track: TrackId(track.into()),
             source: PrivateSource {
-                root: cwd.into(),
+                root,
                 cwd: workspace::identity::WorkspaceCwd::root(),
                 registration: ObjectRegistrationId::fresh()?,
                 nonce: TransferNonce::fresh()?,
@@ -289,6 +292,30 @@ pub(crate) async fn settlement(ctx: &SpawnCtx, record: &Record) -> Result<Option
     value
         .map(|s| serde_json::from_str(&s).map_err(Into::into))
         .transpose()
+}
+
+/// Leader exit is not settlement: ask the executor to drain descendants before sampling.
+pub(crate) async fn drain_exited(ctx: &SpawnCtx, op: &Operation, record: &Record) -> Result<()> {
+    if let Some(engine) = ctx.execution.engine()
+        && matches!(
+            engine.output(&record.execution_id, None).await,
+            Ok(ExecutionReply::Observation {
+                state: ExecutionState::Exited { .. },
+                ..
+            })
+        )
+    {
+        let pool = ctx.operation_repo.sqlite_db();
+        let mut tx = crate::db::sqlite::begin_immediate_tx(&pool).await?;
+        super::repo_sqlite::require_live_claim_tx(&mut tx, op).await?;
+        let ticket = engine
+            .request(&mut tx, &record.execution_id, Desired::Stop)
+            .await
+            .map_err(conflict)?;
+        tx.commit().await?;
+        engine.drive(ticket.committed());
+    }
+    Ok(())
 }
 
 /// Completion rechecks the decision in the same transaction as phase write and Retire.
