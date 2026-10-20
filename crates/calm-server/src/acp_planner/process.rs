@@ -68,7 +68,7 @@ impl Process {
             .env(MARKER_KEY, host.instance.marker(worker))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if let LaunchContext::Planner { mcp_token, .. } = context {
             command.envs(crate::mcp_server::wiring::card_mcp_env(
@@ -89,6 +89,7 @@ impl Process {
             StartFailure::Failed(CalmError::Conflict("ACP process spawn timed out".into()))
         })?
         .map_err(|error| StartFailure::Failed(error.into()))?;
+        keep_stderr(child.stderr(), stderr_log(host, worker));
         let connection = Connection::new(
             child
                 .stdout()
@@ -119,6 +120,69 @@ impl Process {
         reap(&mut self.child).await;
         result
     }
+}
+
+/// The most of one agent process's stderr that is kept; the rest is read and dropped, so the agent
+/// never blocks writing it.
+const STDERR_LIMIT: usize = 256 * 1024;
+
+/// The file the stderr of `worker`'s agent processes is kept in, under the host's data directory;
+/// each launch overwrites it.
+fn stderr_log(host: &AcpPlannerHost, worker: &str) -> std::path::PathBuf {
+    let name: String = worker
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    host.agent_logs.join(format!("{name}.stderr.log"))
+}
+
+/// Copy the first [`STDERR_LIMIT`] bytes of an agent's stderr to `path` (owner-only), and drain the
+/// rest, until the process closes it. The agent's own diagnostics only: Neige writes nothing there,
+/// and the card credential the process holds is revoked when its turn ends.
+fn keep_stderr(stderr: Option<tokio::process::ChildStderr>, path: std::path::PathBuf) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(mut stderr) = stderr else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut file = match open_log(&path).await {
+            Ok(file) => Some(file),
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "ACP agent stderr is not kept");
+                None
+            }
+        };
+        let mut kept = 0;
+        let mut buffer = vec![0; 8192];
+        while let Ok(read @ 1..) = stderr.read(&mut buffer).await {
+            let take = read.min(STDERR_LIMIT - kept);
+            if take > 0
+                && let Some(log) = file.as_mut()
+            {
+                if log.write_all(&buffer[..take]).await.is_err() {
+                    file = None;
+                }
+                kept += take;
+            }
+        }
+    });
+}
+
+async fn open_log(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    if let Some(directory) = path.parent() {
+        tokio::fs::create_dir_all(directory).await?;
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).await
 }
 
 /// `initialize`, then the profile's identity at the registered minimum version, then its

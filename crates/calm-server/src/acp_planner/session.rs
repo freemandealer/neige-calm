@@ -250,6 +250,14 @@ impl AcpPlannerSession {
             .registration(&params.provider)
             .map_err(|error| refused(&error.to_string()))?;
         let digest = registration.config.native_session_digest(&params.cwd)?;
+        // Neige's server under this launch's own key and, for an agent that asks before its
+        // tools, the tools it lists the session now.
+        let server = registration.profile.mcp_server_key();
+        let tools = match registration.profile.mcp_tool_request {
+            Some(_) => params.host.listed_tools(&params.worker_session_id).await?,
+            None => Vec::new(),
+        };
+        let asks = registration.profile.asks(&server, tools);
         crate::db::sqlite::acp_registration_claim(
             &pool,
             &params.worker_session_id,
@@ -279,7 +287,7 @@ impl AcpPlannerSession {
         };
         let prepared = async {
             let mcp = [protocol::McpServer::Stdio {
-                name: crate::mcp_server::wiring::MCP_SERVER_KEY.into(),
+                name: server.clone(),
                 command: params.host.mcp_shim.to_string_lossy().into_owned(),
                 // Native MCP consumers may build model output from content alone.
                 args: vec!["--structured-content-as-text".into()],
@@ -398,7 +406,8 @@ impl AcpPlannerSession {
         };
         #[cfg(feature = "fixtures")]
         let held = super::test_seams::tap_held(&params.worker_session_id, held);
-        let approvals = Approvals::for_turn(permission, &held, &turn, &process.connection.client);
+        let approvals =
+            Approvals::for_turn(permission, &held, &turn, &process.connection.client, asks);
         let (cancel, cancelled) = watch::channel(false);
         shared.state.lock().expect("ACP state").active = Some(Active {
             thread: thread.into(),

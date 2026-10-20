@@ -38,6 +38,9 @@ pub(super) const PROFILE: AcpAgentProfile = AcpAgentProfile {
         env: &[FULL_PERMISSION],
         agent_options: &[],
     },
+    mcp_tool_request: None,
+    decline_ends_turn: false,
+    refused_env: &[],
 };
 
 #[cfg(test)]
