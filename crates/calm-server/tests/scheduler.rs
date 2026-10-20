@@ -3,6 +3,8 @@
 
 #[path = "scheduler/c2b.rs"]
 mod c2b;
+#[path = "scheduler/child_track_config.rs"]
+mod child_track_config;
 mod support;
 
 use calm_types::organization::LEGACY_OWNER_USER_ID;
@@ -476,6 +478,7 @@ fn plan_task(track_id: &TrackId, key: &str, kind: TaskKind, deps: &[&str]) -> Ta
         access: calm_server::model::TaskAccess::ReadWrite,
         start: calm_server::model::TaskStart::Checkout,
         result_contract: None,
+        child_track_json: None,
         created_at_ms: now,
         updated_at_ms: now,
         finished_at_ms: None,
@@ -489,9 +492,9 @@ async fn seed_task(boot: &Boot, task: Task) {
            (id,track_id,key,kind,goal,context_json,acceptance_criteria,cwd,
             depends_on_json,priority,gate_json,status,status_detail,worker_card_id,
             gate_result_json,gate_attempt,gate_pid,gate_pid_starttime,gate_pid_boot_id,
-            running_deadline_ms,spawn,created_at_ms,updated_at_ms,finished_at_ms,access)
+            running_deadline_ms,spawn,created_at_ms,updated_at_ms,finished_at_ms,access,child_track_json)
            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
-                  ?18,?19,?20,?21,?22,?23,?24,?25)"#,
+                  ?18,?19,?20,?21,?22,?23,?24,?25,?26)"#,
     )
     .bind(task.id)
     .bind(task.track_id)
@@ -518,6 +521,7 @@ async fn seed_task(boot: &Boot, task: Task) {
     .bind(task.updated_at_ms)
     .bind(task.finished_at_ms)
     .bind(task.access.as_str())
+    .bind(task.child_track_json)
     .execute(pool.writer_pool())
     .await
     .expect("seed task row");
@@ -569,6 +573,12 @@ async fn seed_projected_task_for(
         ("access".into(), json!(task.access)),
         ("ready".into(), json!(true)),
     ]);
+    if let Some(config) = &task.child_track_json {
+        payload.insert(
+            "child_track".into(),
+            serde_json::from_str(config).expect("child config JSON"),
+        );
+    }
     let instruction_field = if task.kind == TaskKind::Terminal {
         "command"
     } else {
@@ -8097,17 +8107,12 @@ async fn acceptance_18_deleted_flip_rechecks_the_deletion_after_its_snapshot() {
     );
 }
 
-async fn boot_in_real_directory() -> (Boot, tempfile::TempDir, String) {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().to_string_lossy().into_owned();
-    (boot_at_workspace(&path).await, dir, path)
-}
-
 /// A child workspace freezes at creation; a refused re-point preserves the resource binding
 /// and historical operation result, and re-driving the task reuses its original bootstrap.
 #[tokio::test]
 async fn frozen_child_refuses_repoint_and_reuses_its_bootstrap() {
-    let (boot, _attached_dir, attached_path) = boot_in_real_directory().await;
+    let (boot, attached_dir) = child_track_config::boot_git_parent().await;
+    let attached_path = attached_dir.path().to_str().unwrap();
     let mut task = plan_task(&boot.track_id, "repaired-bootstrap", TaskKind::Codex, &[]);
     task.spawn = "sub-track".into();
     task.status = TaskStatus::Dispatched;
@@ -8139,6 +8144,8 @@ async fn frozen_child_refuses_repoint_and_reuses_its_bootstrap() {
         .unwrap();
     let before_track = boot.repo.track_get(&child_id).await.unwrap().unwrap();
     assert_eq!(before_track.workspace.path, attached_path);
+    assert!(before_track.workspace.worktree.is_some());
+    assert_ne!(before_track.workspace.agent_cwd(), attached_path);
     assert!(before_track.workspace.frozen_at.is_some());
     let binding = |pool: sqlx::SqlitePool, id: String| async move {
         sqlx::query_as::<_, (String, i64, String, String, Option<String>, Option<i64>)>(
@@ -8224,7 +8231,8 @@ async fn frozen_child_refuses_repoint_and_reuses_its_bootstrap() {
 
 #[tokio::test]
 async fn acceptance_19_child_bootstrap_is_before_running_and_exactly_once_after_redrive() {
-    let (boot, _attached_dir, attached_path) = boot_in_real_directory().await;
+    let (boot, attached_dir) = child_track_config::boot_git_parent().await;
+    let attached_path = attached_dir.path().to_str().unwrap();
     let mut task = plan_task(&boot.track_id, "bootstrap", TaskKind::Codex, &[]);
     task.spawn = "sub-track".into();
     task.status = TaskStatus::Dispatched;
@@ -8267,10 +8275,11 @@ async fn acceptance_19_child_bootstrap_is_before_running_and_exactly_once_after_
         .await
         .unwrap();
     let child_result = runtime.wait(&child_op).await.unwrap();
-    assert!(matches!(
-        child_result.outcome,
-        OperationOutcome::Succeeded { .. }
-    ));
+    assert!(
+        matches!(child_result.outcome, OperationOutcome::Succeeded { .. }),
+        "child-track outcome: {:?}",
+        child_result.outcome
+    );
     assert_eq!(operation_count(&boot, "planner-harness-start").await, 0);
     assert_eq!(
         boot.repo.task_get(&task_id).await.unwrap().unwrap().status,
@@ -8327,11 +8336,8 @@ async fn acceptance_19_child_bootstrap_is_before_running_and_exactly_once_after_
     .await
     .unwrap();
     // The key carries a digest of the cwd the bootstrap was submitted with: stable for an unchanged path, moves when the path does.
-    let child_cwd: String = sqlx::query_scalar("SELECT workspace_path FROM tracks WHERE id=?1")
-        .bind(&child_id)
-        .fetch_one(boot.repo.sqlite_db().unwrap().read_pool())
-        .await
-        .unwrap();
+    let child = boot.repo.track_get(&child_id).await.unwrap().unwrap();
+    let child_cwd = child.workspace.agent_cwd().to_owned();
     let bootstrap_key = |cwd: &str| {
         let mut hasher = Sha256::new();
         hasher.update(cwd.as_bytes());
@@ -8341,14 +8347,16 @@ async fn acceptance_19_child_bootstrap_is_before_running_and_exactly_once_after_
         )
     };
     assert_eq!(idem, bootstrap_key(&child_cwd));
-    // This fixture's track is ATTACHED, so the child inherits its path verbatim rather than allocating one.
+    // Attached children keep the parent repository and bootstrap in their own track worktree.
+    assert_eq!(child.workspace.path, attached_path);
     assert_eq!(
-        child_cwd, attached_path,
-        "a child of an attached parent must inherit the parent's path"
+        child.workspace.worktree.as_deref(),
+        Some(child_cwd.as_str())
     );
+    assert_ne!(child_cwd, attached_path);
 
     // Crash while bootstrap is blocked after its prepare transaction; recover with a new runtime.
-    let crash_boot = self::boot().await;
+    let (crash_boot, _crash_parent_repo) = child_track_config::boot_git_parent().await;
     let mut crash_task = plan_task(
         &crash_boot.track_id,
         "bootstrap-crash",
@@ -8476,7 +8484,7 @@ async fn acceptance_13e_failed_and_stuck_at_both_operation_levels_close_once() {
         ("bootstrap", "failed", "child-track-bootstrap-failed"),
         ("bootstrap", "stuck", "child-track-bootstrap-stuck"),
     ] {
-        let boot = boot().await;
+        let (boot, _parent_repo) = child_track_config::boot_git_parent().await;
         let mut task = plan_task(
             &boot.track_id,
             &format!("{stage}-{phase}"),
@@ -8554,8 +8562,8 @@ async fn acceptance_13e_failed_and_stuck_at_both_operation_levels_close_once() {
         let row = boot.repo.task_get(&task_id).await.unwrap().unwrap();
         assert_eq!(row.status, TaskStatus::Failed, "{stage}/{phase}");
         assert_eq!(
-            row.status_detail.as_deref(),
-            Some(expected),
+            status_detail_class(row.status_detail.as_deref().unwrap_or_default()),
+            expected,
             "{stage}/{phase}"
         );
         if stage == "create" {
@@ -8763,7 +8771,7 @@ async fn acceptance_3c_claim_success_uses_transaction_reread_spawn() {
 
 #[tokio::test]
 async fn acceptance_5b_stale_frozen_context_refuses_real_child_operation() {
-    let boot = boot().await;
+    let (boot, _parent_repo) = child_track_config::boot_git_parent().await;
     insert_report_payload(
         &boot,
         "stale-child-report",
@@ -8915,8 +8923,8 @@ async fn acceptance_9_depth_exhaustion_fails_parent_without_in_track_fallback() 
     let row = boot.repo.task_get(&task_id).await.unwrap().unwrap();
     assert_eq!(row.status, TaskStatus::Failed);
     assert_eq!(
-        row.status_detail.as_deref(),
-        Some("sub-track-depth-exceeded")
+        status_detail_class(row.status_detail.as_deref().unwrap_or_default()),
+        "sub-track-depth-exceeded"
     );
     assert_eq!(operation_count(&boot, "codex-worker").await, 0);
 }
