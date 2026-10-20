@@ -4,6 +4,7 @@ import { cleanup, act, fireEvent, render, waitFor } from '@testing-library/react
 import { afterEach, describe, expect, it } from 'vitest';
 
 import '../../../styles/entry.css';
+import { CardFrame } from '../../../ui/card-frame/public.tsx';
 
 import { ChatThread } from './public.tsx';
 import type { Conversation, ConversationTurn, TranscriptEntry } from '../../../../../core/domain/conversation.ts';
@@ -25,13 +26,13 @@ const stored = (text: string): ConversationTurn => ({ id: '42', author: 'agent',
 
 function Pane({ turns, width = 640 }: { turns: readonly TranscriptEntry[]; width?: number }) {
   return (
-    <div className={drawerStyles.drawer} data-nc-drawer="" style={{ animation: 'none', transition: 'none', position: 'relative', inlineSize: width, blockSize: 448 }}>
+    <CardFrame className={drawerStyles.drawer} data-nc-drawer="" style={{ animation: 'none', transition: 'none', position: 'relative', inlineSize: width, blockSize: 448 }}>
       <div className={drawerStyles.scroll} data-nc-drawer-scroll="" style={{ blockSize: 400, flex: 'none' }}>
         <div className={drawerStyles.bodyInner}>
           <ChatThread hasPendingMessages={false} canContinue={false} cards={{}} stalled={false} pending conversation={conversation} turns={turns} />
         </div>
       </div>
-    </div>
+    </CardFrame>
   );
 }
 

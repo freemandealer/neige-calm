@@ -8,6 +8,7 @@ declare module 'vitest/browser' { interface BrowserCommands { tap(selector: stri
 
 /* The whole cascade before the component: a CSS Module imported first registers `@layer features` ahead of everything. */
 import '../../../styles/entry.css';
+import { CardFrame } from '../../../ui/card-frame/public.tsx';
 
 import { ChatThread } from './public.tsx';
 import type { Conversation, ConversationTurn } from '../../../../../core/domain/conversation.ts';
@@ -51,7 +52,7 @@ function RailPane({ turns, paneHeight = 400 }: {
       }}
     >
       <div className={drawerStyles.positioner} data-nc-drawer-frame="">
-        <div className={drawerStyles.drawer} data-nc-drawer="" style={{ animation: 'none', transition: 'none' }}>
+        <CardFrame className={drawerStyles.drawer} data-nc-drawer="" style={{ animation: 'none', transition: 'none' }}>
           <div
             className={drawerStyles.scroll}
             data-nc-drawer-scroll=""
@@ -61,7 +62,7 @@ function RailPane({ turns, paneHeight = 400 }: {
               <ChatThread hasPendingMessages={false} canContinue={false} cards={{}} stalled={false} conversation={railConversation()} turns={turns} />
             </div>
           </div>
-        </div>
+        </CardFrame>
       </div>
       <div className={drawerStyles.seamPositioner} data-nc-drawer-frame="">
         <div className={drawerStyles.seam} data-nc-drawer-seam="" style={{ animation: 'none', transition: 'none' }} />
