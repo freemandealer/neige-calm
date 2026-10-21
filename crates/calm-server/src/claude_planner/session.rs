@@ -40,6 +40,7 @@ use provider::claude::translate::{ToolNames, TurnContext, TurnTranslator};
 use provider::events::PlannerEvent;
 
 mod execution_end;
+mod process;
 
 /// After an interrupt, the turn is stopped if the CLI has not ended it within this bound.
 pub const STOP_TIMER: Duration = Duration::from_secs(10);
@@ -152,6 +153,7 @@ pub(crate) struct FinishedTurn {
 #[cfg(feature = "fixtures")]
 #[derive(Default)]
 pub(crate) struct TestHooks {
+    pub(crate) instructions_fault: Option<spawn::InstructionsFault>,
     pub(crate) after_spawn: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(crate) before_turn_completed: Option<SettlePause>,
     pub(crate) user_flush_failure: Option<SettlePause>,
@@ -396,98 +398,115 @@ impl ClaudePlannerSession {
             Some(token) if self.row_hash_present().await? => token,
             _ => self.mint_mcp_token().await?,
         };
-        stop(&host.instance, &params.worker_session_id).await?;
+        let mut driver_slot = shared.driver.lock().await;
+        process::stop_for_start(shared, &mut driver_slot).await?;
 
-        let (line, client_id, items, truncation, execution) = match input {
-            SpawnInput::Turn {
-                items,
-                client_id,
-                truncation,
-            } => {
-                let line = invocation::user_line(thread_uuid, client_id, &items).await?;
-                (
-                    line,
-                    client_id.to_string(),
+        let prepared = async {
+            let (line, client_id, items, truncation, execution) = match input {
+                SpawnInput::Turn {
                     items,
+                    client_id,
                     truncation,
-                    execution_end::Association::Historical,
-                )
-            }
-            SpawnInput::Canonical {
-                items,
-                client_id,
-                execution,
-            } => {
-                let line = invocation::user_line(thread_uuid, client_id, &items).await?;
-                (
-                    line,
-                    client_id.to_string(),
+                } => {
+                    let line = invocation::user_line(thread_uuid, client_id, &items).await?;
+                    (
+                        line,
+                        client_id.to_string(),
+                        items,
+                        truncation,
+                        execution_end::Association::Historical,
+                    )
+                }
+                SpawnInput::Canonical {
                     items,
-                    None,
-                    execution_end::Association::Work(execution),
-                )
-            }
-            // No client sent this line: its uuid is fresh, and nothing of it is stored.
-            SpawnInput::Compaction => {
-                let uuid = Uuid::new_v4();
-                let line = UserLine::compact(thread_uuid, uuid);
-                (
-                    line,
-                    uuid.simple().to_string(),
-                    Vec::new(),
-                    None,
-                    execution_end::Association::Historical,
-                )
-            }
-            SpawnInput::CanonicalCompaction(target) => {
-                let uuid = Uuid::new_v4();
-                let line = UserLine::compact(thread_uuid, uuid);
-                (
-                    line,
-                    uuid.simple().to_string(),
-                    Vec::new(),
-                    None,
-                    execution_end::Association::Maintenance(target),
-                )
-            }
-        };
-        let line = serde_json::to_string(&line).map_err(|e| SpawnFailure::failed(e.into()))?;
-        let mut translator = TurnTranslator::new(
-            TurnContext {
-                thread_id: thread.to_string(),
-                turn_id: turn_id.clone(),
-                client_id,
-                input: items,
-                cwd: params.cwd.to_string_lossy().into_owned(),
-                prior_total_tokens,
-            },
-            params.calm_tools.clone(),
-        )
-        .map_err(|e| SpawnFailure::failed(CalmError::BadRequest(e.to_string())))?;
-        let instructions = InstructionsFile::write(
-            &host.instructions_dir,
-            &params.worker_session_id,
-            &turn_id,
-            &params.instructions,
-        )?;
-        let argv = spawn::argv(
-            thread_uuid,
-            purpose,
-            start,
-            truncation,
-            selection,
-            mode,
-            &params.cwd,
-            &host.mcp_shim,
-            instructions.path(),
-        );
-        let argv = match argv {
-            Ok(argv) => argv,
-            Err(error) => {
-                let failure = self.abort_before_ok(None, instructions, error).await;
-                return Err(SpawnFailure::failed(failure));
-            }
-        };
+                    client_id,
+                    execution,
+                } => {
+                    let line = invocation::user_line(thread_uuid, client_id, &items).await?;
+                    (
+                        line,
+                        client_id.to_string(),
+                        items,
+                        None,
+                        execution_end::Association::Work(execution),
+                    )
+                }
+                // No client sent this line: its uuid is fresh, and nothing of it is stored.
+                SpawnInput::Compaction => {
+                    let uuid = Uuid::new_v4();
+                    let line = UserLine::compact(thread_uuid, uuid);
+                    (
+                        line,
+                        uuid.simple().to_string(),
+                        Vec::new(),
+                        None,
+                        execution_end::Association::Historical,
+                    )
+                }
+                SpawnInput::CanonicalCompaction(target) => {
+                    let uuid = Uuid::new_v4();
+                    let line = UserLine::compact(thread_uuid, uuid);
+                    (
+                        line,
+                        uuid.simple().to_string(),
+                        Vec::new(),
+                        None,
+                        execution_end::Association::Maintenance(target),
+                    )
+                }
+            };
+            let line = serde_json::to_string(&line).map_err(|e| SpawnFailure::failed(e.into()))?;
+            let translator = TurnTranslator::new(
+                TurnContext {
+                    thread_id: thread.to_string(),
+                    turn_id: turn_id.clone(),
+                    client_id,
+                    input: items,
+                    cwd: params.cwd.to_string_lossy().into_owned(),
+                    prior_total_tokens,
+                },
+                params.calm_tools.clone(),
+            )
+            .map_err(|e| SpawnFailure::failed(CalmError::BadRequest(e.to_string())))?;
+            let instructions = InstructionsFile::write(
+                &host.instructions_dir,
+                &params.worker_session_id,
+                &turn_id,
+                &params.instructions,
+                #[cfg(feature = "fixtures")]
+                shared
+                    .hooks
+                    .lock()
+                    .expect("hooks")
+                    .instructions_fault
+                    .clone(),
+            )
+            .map_err(|failure| failure.map_error(SpawnFailure::from))?;
+            let argv = spawn::argv(
+                thread_uuid,
+                purpose,
+                start,
+                truncation,
+                selection,
+                mode,
+                &params.cwd,
+                &host.mcp_shim,
+                instructions.path(),
+            );
+            let argv = match argv {
+                Ok(argv) => argv,
+                Err(error) => {
+                    return Err(instructions.abort(error).map_error(SpawnFailure::failed));
+                }
+            };
+            Ok((line, translator, instructions, argv, execution))
+        }
+        .await;
+        let (line, mut translator, instructions, argv, execution) =
+            process::finish_preparation(&mut driver_slot, prepared)?;
+        // From this boundary a process may exist. Cancellation or uncertain
+        // cleanup must never expose the preceding driver's result.
+        let previous = driver_slot.take();
         let spawned = Command::new(&config.claude_binary)
             .args(argv)
             .env_clear()
@@ -506,10 +525,14 @@ impl ClaudePlannerSession {
                     "claude planner spawn of {} failed: {error}",
                     config.claude_binary.display()
                 ));
-                let failure = self.abort_before_ok(None, instructions, error).await;
+                let (failure, cleaned) = self.abort_before_ok(None, instructions, error).await;
+                if cleaned {
+                    *driver_slot = previous;
+                }
                 return Err(SpawnFailure::failed(failure));
             }
         };
+        drop(previous);
         #[cfg(feature = "fixtures")]
         {
             let hook = shared.hooks.lock().expect("hooks").after_spawn.clone();
@@ -521,6 +544,7 @@ impl ClaudePlannerSession {
             return Err(self
                 .abort_before_ok(Some(child), instructions, sealed(thread))
                 .await
+                .0
                 .into());
         }
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -530,9 +554,9 @@ impl ClaudePlannerSession {
             return Err(self
                 .abort_before_ok(Some(child), instructions, error)
                 .await
+                .0
                 .into());
         };
-        let mut driver_slot = shared.driver.lock().await;
         let slot = Arc::new(TurnSlot::new(stdin, settle_after_stop));
         #[cfg(feature = "fixtures")]
         {
@@ -548,13 +572,18 @@ impl ClaudePlannerSession {
                         .take_refusal()
                         .unwrap_or(CalmError::Conflict(message));
                     SpawnFailure::failed(
-                        self.abort_before_ok(Some(child), instructions, error).await,
+                        self.abort_before_ok(Some(child), instructions, error)
+                            .await
+                            .0,
                     )
                 }
                 LineWriteError::CrossedWrite(error) => {
                     let error = super::turn_slot::write_error(LineWriteError::CrossedWrite(error));
                     SpawnFailure::CrossedWrite {
-                        error: self.abort_before_ok(Some(child), instructions, error).await,
+                        error: self
+                            .abort_before_ok(Some(child), instructions, error)
+                            .await
+                            .0,
                         local_turn,
                     }
                 }
@@ -637,30 +666,6 @@ impl ClaudePlannerSession {
         .await?;
         self.shared.state().mcp_token = Some(token.clone());
         Ok(token)
-    }
-
-    /// Stop the marker (which ends a spawned child and anything it started), reap the child, and
-    /// drop the instructions guard; the caller's error is what `turn_start` returns.
-    async fn abort_before_ok(
-        &self,
-        child: Option<Child>,
-        instructions: InstructionsFile,
-        error: CalmError,
-    ) -> CalmError {
-        let params = &self.shared.params;
-        if let Err(stop_error) = stop(&params.host.instance, &params.worker_session_id).await {
-            tracing::warn!(
-                worker_session_id = %params.worker_session_id,
-                error = %stop_error,
-                "claude planner: stop after a failed turn start did not confirm"
-            );
-        }
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        }
-        drop(instructions);
-        error
     }
 
     /// Record `Interrupted`, ask the CLI to interrupt, and arm the stop timer; a turn that is not
