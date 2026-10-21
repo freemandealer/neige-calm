@@ -4574,7 +4574,7 @@ mod compact_command;
 mod compact_tests;
 mod durable_command;
 mod held;
-mod hibernation;
+pub(super) mod hibernation;
 mod input_commit;
 pub(crate) mod input_inspection;
 #[cfg(test)]
