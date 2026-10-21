@@ -1,18 +1,18 @@
 {
   "manifest_version": 5,
   "id": "archive",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "min_kernel_version": "0.0.1",
   "display_name": "Research archive",
   "description": "Read-only access to the point-in-time Longbridge archive (#2575): the capture's health, and archived values as of a past moment. The capture runs outside Neige as a systemd timer; this plugin only reads the archive and the capture's last exit, never the token, and never calls Longbridge.",
   "entrypoint": {
     "command": "bin/research-archive-plugin"
   },
-  "planner_instructions": "The archive plugin reports the health of the Longbridge archive capture, a systemd timer outside Neige; nothing here captures or changes the archive. plugin_archive_capture_status answers ok, attention or failing, with every reason and the recent runs. failing means a person has to act on the host (a lost day stays failing until a later day ends complete): ask the owner with neige_user_ask, one question quoting the reasons, and ask again only when the reasons change. attention means data was lost or is weaker than planned: say so in the Report, without asking. plugin_archive_capture_watch with on: true keeps this Track's live archive.status table, which the Report shows with a table block whose source is neige://plugin/archive/archive.status; on: false removes it. plugin_archive_read_at answers what the archive held at a past moment `at`: per symbol and endpoint, the latest successful fetch at or before `at`, narrowed by a JSON pointer. Use it for where consensus, ratings or target prices stood at a time, and call it twice to compare two times. The original six endpoints began capture on 2026-10-13 (UTC), for trading day 2026-10-12. Annual consensus starts only after its own first planned capture; never infer earlier annual history. A pair with no successful fetch by `at` gives no_value (not_archived if never planned).",
+  "planner_instructions": "This read-only plugin exposes the Longbridge archive; a separate systemd timer captures it. plugin_archive_capture_status reports Core health: ok, attention or failing. Core is the original eight endpoints; snapshots, financial reports, calendar and bars are Supplemental. Show both tiers in Reports. Supplemental quota/auth failures, timeouts and gaps never require an owner question. Overall run outcome can remain open/partial after Core completes. For failing Core/host health, ask the owner with neige_user_ask, quoting the reasons, and repeat only when reasons change. For attention, disclose weaker/lost data in the Report without asking. plugin_archive_capture_watch on:true keeps this Track's live archive.status table, rendered with source neige://plugin/archive/archive.status; on:false removes it. plugin_archive_read_at returns the latest successful fetch at/before at, narrowed by a JSON pointer; call twice to compare moments. Original six endpoints began capture 2026-10-13 UTC for trading day 2026-10-12; annual and new endpoint history starts only with their own captures. Never infer archive history from a fiscal period or trade date. No successful fetch yields no_value; never planned yields not_archived. Calendar uses market:US; other endpoints use symbol. Financial reports are summaries: do not invent missing TBVPS, finance-lease additions or segment revenue. Align stock/benchmark bars by explicit trade_date; never substitute an older benchmark session. Calendar reported_counts are provider statistics, not returned-event cardinality; variants may normalize. Group dates are upstream labels and can differ from ext.local_date/datetime; do not infer NY earnings timing from group keys.",
   "exposes_tools": [
     {
       "name": "capture_status",
-      "description": "The archive's health now: ok, attention or failing, every reason, how the last capture start ended, and the last 7 runs with their pair counts (ok, tried with no ok, not tried, planned) and index membership. failing: a recent run ended partial or degraded (fewer than half its pairs ok) and no later day has ended complete since, missed days included; the last start had no usable token or stopped on a fatal error; no start has recorded its exit for longer than the configured bound; or the archive cannot be read. attention: a partial or degraded run that a later complete day followed, a recent day was missed, a run ended complete with pairs that have no ok, the latest universe is not observed, or the missed-day scan was incomplete. Reads local files only.",
+      "description": "The archive's health now: ok, attention or failing, every reason, how the last capture start ended, and the last 7 runs with their pair counts (ok, tried with no ok, not tried, planned) and index membership. failing: recent Core capture ended partial or degraded (fewer than half its Core pairs ok) and no later day has ended complete since, missed days included; the last start had no usable token or stopped on a fatal error; no start has recorded its exit for longer than the configured bound; or the archive cannot be read. attention: partial or degraded Core that a later complete Core day followed, a recent day was missed, Core ended complete with pairs that have no ok, the latest universe is not observed, or the missed-day scan was incomplete. Reads local files only. Per-run core/supplemental counts, core_outcome/core_finished_at, total counts and endpoint tier classifications are returned. Supplemental gaps never change health; overall outcome still describes all capture.",
       "input_schema": {
         "type": "object",
         "properties": {},
@@ -26,7 +26,7 @@
     },
     {
       "name": "read_at",
-      "description": "What the archive held at a past moment: for each read, the body of the latest successful fetch of that symbol and endpoint at or before `at`, at the JSON pointer. A later fetch is invisible, a failed fetch never replaces an earlier value, and an empty-shaped body is a value. Each read answers result value (with as_of, the capture's trading day, and fetched_at, UTC), not_archived (the archive never planned this symbol and endpoint), no_value (planned, but nothing fetched by `at`; the original six endpoints began capture 2026-10-13 UTC, for trading day 2026-10-12; annual starts only with its own first capture) or pointer_missing (the body has nothing at the pointer). Bodies are large (consensus ~20 KB, forecast_eps ~26 KB, rating_detail ~51 KB, valuation ~14 KB); an answer over 40 KiB fails with each read's size, so select with a pointer. Body shapes: consensus (default quarterly) and consensus_annual (period_type=af) {list[{fiscal_year, fiscal_period, period_text, details[{key, name, estimate, actual, ...}]}], current_index, currency, opt_periods, current_period}; forecast_eps {items[{forecast_eps_median, forecast_eps_mean, forecast_eps_lowest, forecast_eps_highest, institution_total, institution_up, institution_down, forecast_start_date, forecast_end_date}]}; rating_latest {evaluate{buy, over, hold, under, sell, no_opinion, total, start_date, end_date}, target{highest_price, lowest_price, prev_close, start_date, end_date}, industry_*}; ratings {evaluate{strong_buy, buy, hold, sell, under, date}, recommend, target, change, ccy_symbol, updated_at}; rating_detail {evaluate{list[{strong_buy, buy, hold, sell, under, no_opinion, date}]}, target{updated_at, prediction_accuracy, data_percent, list[{timestamp, price, meet, avg_target, min_target, max_target, date}]}, ccy_symbol}; valuation {metrics{pe{low, median, high, desc, list[...]}}, range}. Reads local files only.",
+      "description": "What the archive held at a past moment: for each read, the body of the latest successful fetch of that symbol and endpoint at or before `at`, at the JSON pointer. A later fetch is invisible, a failed fetch never replaces an earlier value, and an empty-shaped body is a value. Each read answers result value (with as_of, the capture's trading day, and fetched_at, UTC), not_archived (the archive never planned this symbol and endpoint), no_value (planned, but nothing fetched by `at`; the original six endpoints began capture 2026-10-13 UTC, for trading day 2026-10-12; annual starts only with its own first capture) or pointer_missing (the body has nothing at the pointer). Bodies are large (consensus ~20 KB, forecast_eps ~26 KB, rating_detail ~51 KB, valuation ~14 KB); an answer over 40 KiB fails with each read's size, so select with a pointer. Body shapes: consensus (default quarterly) and consensus_annual (period_type=af) {list[{fiscal_year, fiscal_period, period_text, details[{key, name, estimate, actual, ...}]}], current_index, currency, opt_periods, current_period}; forecast_eps {items[{forecast_eps_median, forecast_eps_mean, forecast_eps_lowest, forecast_eps_highest, institution_total, institution_up, institution_down, forecast_start_date, forecast_end_date}]}; rating_latest {evaluate{buy, over, hold, under, sell, no_opinion, total, start_date, end_date}, target{highest_price, lowest_price, prev_close, start_date, end_date}, industry_*}; ratings {evaluate{strong_buy, buy, hold, sell, under, date}, recommend, target, change, ccy_symbol, updated_at}; rating_detail {evaluate{list[{strong_buy, buy, hold, sell, under, no_opinion, date}]}, target{updated_at, prediction_accuracy, data_percent, list[{timestamp, price, meet, avg_target, min_target, max_target, date}]}, ccy_symbol}; valuation {metrics{pe{low, median, high, desc, list[...]}}, range}. Reads local files only. New endpoints: earnings_snapshot {report, fiscal_year, fiscal_period, fp_start, fp_end, currency, fo_revenue, fo_ebit, fo_eps, fr_*}; financial_reports {report, symbol, list{IS,BS,CF}}, each kind has indicators[].accounts[{field,name,values[{year,fp_end,period,value,...}]}]. These are standardized summaries, not full filings; absent TBVPS, lease additions or segments must not be invented. daily_candlesticks is a typed projection {format:daily_bars_v1, symbol, timezone:America/New_York, adjust:none, session:regular, start,end,bars[{trade_date,timestamp,open,high,low,close,volume,turnover}]}; prices are decimal strings, at most six closes. Read stock and benchmark in one call, align by trade_date, report missing sessions. finance_calendar uses market:US instead of symbol and returns {format:earnings_calendar_v1,market,start,end,days{YYYY-MM-DD:{SYMBOL:{EVENT_ID:event}}},pages[{date,offset,fetched_at,raw_json}]}; select /days/YYYY-MM-DD/SYMBOL for a small answer. Empty calendar days are explicit. New data begins only with its first successful capture. Daily snapshots can precede later upstream earnings updates. Calendar coverage=upstream_group_company_dates is published company/group-label coverage, not exhaustive fiscal variants or verified NY event dates. reported_counts are provider statistics, not the number of returned IDs; company_counts describe published companies. pages also record the actual requested count. Group labels, event date/datetime and ext.local_date can disagree; preserve and inspect them rather than infer a NY date.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -55,21 +55,53 @@
                     "ratings",
                     "rating_detail",
                     "valuation",
-                    "consensus_annual"
+                    "consensus_annual",
+                    "earnings_snapshot",
+                    "financial_reports",
+                    "finance_calendar",
+                    "daily_candlesticks"
                   ],
                   "description": "The archived Longbridge endpoint."
                 },
                 "pointer": {
                   "type": "string",
                   "description": "An RFC 6901 JSON pointer into the body, such as /target/highest_price; \"\" for the whole body."
+                },
+                "market": {
+                  "type": "string",
+                  "enum": [
+                    "US"
+                  ],
+                  "description": "Market target for finance_calendar; omit symbol."
                 }
               },
               "required": [
-                "symbol",
                 "endpoint",
                 "pointer"
               ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "oneOf": [
+                {
+                  "required": [
+                    "symbol"
+                  ],
+                  "not": {
+                    "required": [
+                      "market"
+                    ]
+                  }
+                },
+                {
+                  "required": [
+                    "market"
+                  ],
+                  "not": {
+                    "required": [
+                      "symbol"
+                    ]
+                  }
+                }
+              ]
             }
           }
         },

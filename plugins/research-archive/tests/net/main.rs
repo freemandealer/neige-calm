@@ -25,7 +25,10 @@ mod hermetic;
 mod interrupt;
 mod login;
 mod logs;
+mod market_capture;
 mod membership;
+mod quote_fences;
+mod recording;
 mod refresh;
 mod runner;
 mod scan;
@@ -35,3 +38,4 @@ mod source;
 #[path = "../suite/support.rs"]
 #[allow(dead_code)]
 mod support;
+mod tiers;

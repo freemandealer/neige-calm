@@ -75,7 +75,7 @@ fn an_unknown_key_is_refused() {
 }
 
 #[test]
-fn every_field_is_required() {
+fn all_existing_fields_remain_required() {
     for field in [
         "data_dir",
         "oauth_client_id",
@@ -213,4 +213,29 @@ fn the_carry_deadline_ends_before_the_shortest_window() {
         assert_eq!(field_of(&err), "carry_deadline_minutes", "{ws} {carry}");
         assert!(err.to_string().contains("at most 510"), "{err}");
     }
+}
+
+#[test]
+fn configured_benchmark_selection_is_validated() {
+    let configured = with("benchmarks", "benchmarks = [\"IWM.US\"]");
+    let c = Config::parse(&configured).expect("benchmark choices belong to configuration");
+    assert_eq!(
+        c.benchmarks.iter().map(Key::as_str).collect::<Vec<_>>(),
+        ["IWM.US"]
+    );
+    Config::parse(&with("benchmarks", "benchmarks = []")).unwrap();
+    for line in [
+        "benchmarks = [\"IWM.US\", \"IWM.US\"]",
+        "benchmarks = [\".SPX.US\"]",
+    ] {
+        assert_eq!(field_of(&refused(&with("benchmarks", line))), "benchmarks");
+    }
+}
+
+#[test]
+fn a_deployed_config_without_benchmarks_loads_with_no_extra_symbols() {
+    let legacy = Config::parse(&with("benchmarks", ""))
+        .expect("new benchmark capture is opt-in, not a startup requirement");
+    assert!(legacy.benchmarks.is_empty());
+    assert_eq!(legacy.research, Config::parse(EXAMPLE).unwrap().research);
 }

@@ -12,6 +12,9 @@ use research_archive::calendar::TradingCalendar;
 use research_archive::config::Config;
 use research_archive::types::UnixMs;
 
+#[path = "quote.rs"]
+pub(crate) mod quote;
+
 pub const CLIENT: &str = "test-client";
 
 /// Unix ms of an RFC 3339 instant.
@@ -36,6 +39,7 @@ pub fn closed_port() -> u16 {
 #[derive(Clone)]
 pub struct Knobs {
     pub research: Vec<&'static str>,
+    pub benchmarks: Vec<&'static str>,
     pub indexes: Vec<&'static str>,
     pub attempt_cap: u32,
     pub attempt_timeout_minutes: u32,
@@ -49,6 +53,7 @@ impl Default for Knobs {
     fn default() -> Self {
         Knobs {
             research: vec!["AAPL.US"],
+            benchmarks: vec!["QQQ.US", "SOXX.US", "KBE.US", "SPY.US", "SMH.US"],
             indexes: vec![],
             attempt_cap: 3,
             attempt_timeout_minutes: 25,
@@ -66,6 +71,7 @@ pub struct Archive {
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub http_url: String,
+    quote_url: String,
 }
 
 fn quoted(items: &[impl AsRef<str>]) -> String {
@@ -85,6 +91,7 @@ impl Archive {
             data_dir,
             root,
             http_url: http_url.to_owned(),
+            quote_url: quote::start(),
         };
         archive.write_config(knobs);
         archive
@@ -97,9 +104,10 @@ impl Archive {
 oauth_client_id = "{CLIENT}"
 access_region = "cn"
 http_url = "{}"
-quote_ws_url = "wss://127.0.0.1:{}/v2"
+quote_ws_url = "{}"
 callback_port = {}
 research = [{}]
+benchmarks = [{}]
 indexes = [{}]
 rps = {}
 attempt_cap = {}
@@ -110,9 +118,10 @@ notify_command = [{}]
 "#,
             self.data_dir.display(),
             self.http_url,
-            closed_port(),
+            self.quote_url,
             closed_port(),
             quoted(&knobs.research),
+            quoted(&knobs.benchmarks),
             quoted(&knobs.indexes),
             knobs.rps,
             knobs.attempt_cap,
@@ -183,5 +192,12 @@ pub fn members(symbols: &[&str]) -> String {
 pub fn security_count() -> usize {
     research_archive::Catalog::compiled()
         .for_kind(research_archive::KeyKind::Security)
+        .count()
+}
+
+pub fn core_security_count() -> usize {
+    research_archive::Catalog::compiled()
+        .for_kind(research_archive::KeyKind::Security)
+        .filter(|e| e.tier == research_archive::catalog::CaptureTier::Core)
         .count()
 }

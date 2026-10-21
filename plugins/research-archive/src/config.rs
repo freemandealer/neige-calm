@@ -1,5 +1,5 @@
-//! The typed TOML config (#2575, "Typed config"). Every field is required:
-//! a value missing from the file is an error, never a default. See
+//! The typed TOML config (#2575, "Typed config"). Existing fields are required;
+//! optional additional benchmark capture defaults to an empty list. See
 //! `research-archive.example.toml` for a commented sample.
 //!
 //! The config is the only input that steers the job. The environment is
@@ -31,6 +31,9 @@ struct RawConfig {
     quote_ws_url: String,
     callback_port: u16,
     research: Vec<String>,
+    /// New optional capture scope: absent means no additional benchmark symbols.
+    #[serde(default)]
+    benchmarks: Vec<String>,
     indexes: Vec<String>,
     rps: u32,
     attempt_cap: u32,
@@ -56,6 +59,8 @@ pub struct Config {
     pub callback_port: CallbackPort,
     /// Security keys (`AAPL.US`), unique.
     pub research: Vec<Key>,
+    /// Configured bar-only comparison symbols, frozen with the daily plan.
+    pub benchmarks: Vec<Key>,
     /// Index symbols in dotted form (`.SPX.US`), unique. The membership
     /// request asks for `limit=1000`, so an index with more than 1,000
     /// members never yields a complete membership.
@@ -151,6 +156,7 @@ impl RawConfig {
         let callback_port = CallbackPort::new(self.callback_port)
             .ok_or_else(|| invalid("callback_port", "must be the registered port, not 0"))?;
         let research = keys("research", &self.research, KeyForm::Security)?;
+        let benchmarks = keys("benchmarks", &self.benchmarks, KeyForm::Security)?;
         let indexes = keys("indexes", &self.indexes, KeyForm::Index)?;
         if research.is_empty() && indexes.is_empty() {
             return Err(invalid("research", "research and indexes are both empty"));
@@ -206,6 +212,7 @@ impl RawConfig {
             quote_ws_url: ws_url("quote_ws_url", &self.quote_ws_url)?,
             callback_port,
             research,
+            benchmarks,
             indexes,
             rps,
             attempt_cap,
@@ -315,7 +322,15 @@ fn base_url(field: &'static str, value: &str, scheme: &str) -> Result<String, Co
 }
 
 fn ws_url(field: &'static str, value: &str) -> Result<String, ConfigError> {
-    parse_url(field, value, "wss").map(|_| value.to_owned())
+    let loopback = url::Url::parse(value).is_ok_and(|u| {
+        u.scheme() == "ws"
+            && match u.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            }
+    });
+    parse_url(field, value, if loopback { "ws" } else { "wss" }).map(|_| value.to_owned())
 }
 
 fn parse_url(field: &'static str, value: &str, scheme: &str) -> Result<url::Url, ConfigError> {

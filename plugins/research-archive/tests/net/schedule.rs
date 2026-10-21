@@ -62,7 +62,7 @@ fn a_short_outage_loses_no_pair() {
         let outcome = capture(&a, &clock).await;
         assert_eq!(outcome.kind, ExitKind::Complete, "{outcome:?}");
         let coverage = a.store().await.coverage(RunId(1)).await.unwrap();
-        assert_eq!(coverage.len(), 2 * security_count() + 1);
+        assert_eq!(coverage.len(), 2 * security_count() + 7);
         assert!(coverage.iter().all(|p| p.has_ok));
     })
 }
@@ -325,6 +325,7 @@ fn a_resume_after_the_carry_deadline_freezes_at_once_despite_a_hanging_attempt()
                 window: Window::new(tue_start(), tue_end()).unwrap(),
                 started_at: UnixMs(tue_start().0 + 5 * 60_000),
                 config: vec![Key::new("AAPL.US").unwrap()],
+                benchmarks: a.config().benchmarks,
                 indexes: vec![Key::new(".SPX.US").unwrap()],
             })
             .await
@@ -332,7 +333,7 @@ fn a_resume_after_the_carry_deadline_freezes_at_once_despite_a_hanging_attempt()
         store.close().await;
         let (outcome, ()) = tokio::join!(capture(&a, &clock), async {
             // The security pairs land while the constituents hang.
-            wait_for_rows(&a, security_count() as i64).await;
+            wait_for_rows(&a, crate::archive::core_security_count() as i64).await;
             gate.add_permits(1);
         });
         assert_eq!(outcome.kind, ExitKind::Complete, "{outcome:?}");
@@ -344,7 +345,7 @@ fn a_resume_after_the_carry_deadline_freezes_at_once_despite_a_hanging_attempt()
         // The security rows were recorded before the constituents
         // answered (the barrier above); then the constituents row.
         let recorded = rows(&a).await;
-        assert_eq!(recorded.len(), security_count() + 1);
+        assert_eq!(recorded.len(), security_count() + 7);
         let constituents: Vec<_> = recorded
             .iter()
             .filter(|r| r.1 == "index_constituents")

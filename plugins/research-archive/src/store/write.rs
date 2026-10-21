@@ -40,10 +40,12 @@ const INCOMPLETE_MEMBERSHIP: &str = "incomplete_membership";
 /// `index-symbol` key takes the index endpoints; `config` and `index:<sym>`
 /// keys take the security endpoints. The one definition of that rule.
 pub(super) const PLANNED_PAIRS: &str = "
-    SELECT DISTINCT rk.run_id AS run_id, rk.key AS key, e.endpoint_id AS endpoint_id
+    SELECT DISTINCT rk.run_id AS run_id, rk.key AS key, e.endpoint_id AS endpoint_id, 'core' AS capture_tier
     FROM run_key rk JOIN run_endpoint re ON re.run_id = rk.run_id
     JOIN endpoint e ON e.endpoint_id = re.endpoint_id AND e.key_kind =
-        CASE rk.origin WHEN 'index-symbol' THEN 'index' ELSE 'security' END";
+        CASE rk.origin WHEN 'index-symbol' THEN 'index' ELSE 'security' END
+    WHERE NOT EXISTS(SELECT 1 FROM run_plan_v3 v WHERE v.run_id = rk.run_id)
+    UNION ALL SELECT run_id,key,endpoint_id,capture_tier FROM run_pair";
 
 /// What `plan_run` writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub struct PlanRequest {
     pub started_at: UnixMs,
     /// The research list as configured now (`origin = config`).
     pub config: Vec<Key>,
+    /// Additional comparison securities, bars only.
+    pub benchmarks: Vec<Key>,
     /// The configured index symbols (`origin = index-symbol`).
     pub indexes: Vec<Key>,
 }
@@ -69,6 +73,8 @@ pub struct RunPlan {
     pub started_at: UnixMs,
     /// Sorted `config` keys.
     pub config: Vec<Key>,
+    /// Additional comparison securities, bars only.
+    pub benchmarks: Vec<Key>,
     /// Sorted `index-symbol` keys.
     pub indexes: Vec<Key>,
     /// Whether the freeze has committed.
@@ -100,11 +106,44 @@ impl Store {
         }
         require_window_order(&mut tx, req.source, req.as_of, req.window).await?;
         let run_id = insert_run(&mut tx, req.source, req.as_of, req.window, req.started_at).await?;
+        sqlx::query("INSERT INTO run_plan_v3(run_id) VALUES (?)")
+            .bind(run_id.0)
+            .execute(&mut *tx)
+            .await?;
         for key in &req.config {
             insert_run_key(&mut tx, run_id, key, &Origin::Config).await?;
+            super::planning::append_pairs(&mut tx, run_id, key, &Origin::Config, &self.catalog)
+                .await?;
         }
         for key in &req.indexes {
             insert_run_key(&mut tx, run_id, key, &Origin::IndexSymbol).await?;
+            super::planning::append_pairs(
+                &mut tx,
+                run_id,
+                key,
+                &Origin::IndexSymbol,
+                &self.catalog,
+            )
+            .await?;
+        }
+        if self.catalog.get("daily_candlesticks").is_some() {
+            for key in &req.benchmarks {
+                insert_run_key(&mut tx, run_id, key, &Origin::Benchmark).await?;
+                super::planning::append_pairs(
+                    &mut tx,
+                    run_id,
+                    key,
+                    &Origin::Benchmark,
+                    &self.catalog,
+                )
+                .await?;
+            }
+        }
+        if self.catalog.get("finance_calendar").is_some() {
+            let key = Key::new("market:US")?;
+            insert_run_key(&mut tx, run_id, &key, &Origin::Market).await?;
+            super::planning::append_pairs(&mut tx, run_id, &key, &Origin::Market, &self.catalog)
+                .await?;
         }
         let plan = load_plan(&mut tx, run_id, true).await?;
         tx.commit().await?;
@@ -258,7 +297,7 @@ impl Store {
         let clock = require_open(&mut tx, run_id).await?;
         clock.not_before_mark(finished_at)?;
         if outcome == Finish::Complete {
-            require_complete(&mut tx, run_id).await?;
+            require_complete(&mut tx, run_id, None).await?;
         }
         insert_run_end(&mut tx, run_id, finished_at, outcome.into(), reason).await?;
         tx.commit().await?;
@@ -470,6 +509,7 @@ pub(super) async fn require_open(conn: &mut SqliteConnection, run_id: RunId) -> 
         "SELECT r.window_start, r.window_end,
                 EXISTS (SELECT 1 FROM run_end e WHERE e.run_id = r.run_id) AS ended,
                 MAX(r.started_at,
+                    COALESCE((SELECT finished_at FROM run_core_complete c WHERE c.run_id=r.run_id), r.started_at),
                     COALESCE((SELECT MAX(o.fetched_at) FROM observation o
                               WHERE o.run_id = r.run_id), r.started_at),
                     COALESCE((SELECT MAX(m.frozen_at) FROM run_membership m
@@ -495,23 +535,30 @@ pub(super) async fn require_open(conn: &mut SqliteConnection, run_id: RunId) -> 
 
 /// Refuses `complete` for a run with an unfrozen planned index or a planned
 /// pair without any row.
-async fn require_complete(conn: &mut SqliteConnection, run_id: RunId) -> Result<()> {
-    let row = sqlx::query(&format!(
-        "SELECT
+pub(super) async fn require_complete(
+    conn: &mut SqliteConnection,
+    run_id: RunId,
+    selected: Option<crate::catalog::CaptureTier>,
+) -> Result<()> {
+    let mut sql = sqlx::QueryBuilder::<sqlx::Sqlite>::new("WITH selected_run AS (SELECT ");
+    sql.push_bind(run_id.0);
+    sql.push(format!(" AS run_id) SELECT
             NOT EXISTS (SELECT 1 FROM run_key k
-                        WHERE k.run_id = ?1 AND k.origin = 'index-symbol'
+                        WHERE k.run_id = (SELECT run_id FROM selected_run) AND k.origin = 'index-symbol'
                           AND NOT EXISTS (SELECT 1 FROM run_membership m
                                           WHERE m.run_id = k.run_id AND m.index_sym = k.key))
                 AS frozen,
             (SELECT COUNT(*) FROM ({PLANNED_PAIRS}) p
-             WHERE p.run_id = ?1
+             WHERE p.run_id = (SELECT run_id FROM selected_run)
                AND NOT EXISTS (SELECT 1 FROM observation o
                                WHERE o.run_id = p.run_id AND o.key = p.key
-                                 AND o.endpoint_id = p.endpoint_id)) AS missing"
-    ))
-    .bind(run_id.0)
-    .fetch_one(conn)
-    .await?;
+                                 AND o.endpoint_id = p.endpoint_id)"
+    ));
+    if let Some(tier) = selected {
+        sql.push(" AND p.capture_tier = ").push_bind(tier.as_str());
+    }
+    sql.push(") AS missing");
+    let row = sql.build().fetch_one(conn).await?;
     let frozen: bool = row.try_get("frozen")?;
     let missing: i64 = row.try_get("missing")?;
     if frozen && missing == 0 {
@@ -541,17 +588,20 @@ pub(super) async fn load_plan(
     .ok_or(StoreError::UnknownRun(run_id))?;
     let keys = sqlx::query(
         "SELECT key, origin FROM run_key
-         WHERE run_id = ? AND origin IN ('config', 'index-symbol') ORDER BY key",
+         WHERE run_id = ? AND origin IN ('config', 'index-symbol', 'benchmark') ORDER BY key",
     )
     .bind(run_id.0)
     .fetch_all(&mut *conn)
     .await?;
     let mut config = Vec::new();
     let mut indexes = Vec::new();
+    let mut benchmarks = Vec::new();
     for k in &keys {
         let key = Key::new(k.try_get::<String, _>("key")?)?;
         match Origin::parse(&k.try_get::<String, _>("origin")?)? {
             Origin::Config => config.push(key),
+            Origin::Benchmark => benchmarks.push(key),
+            Origin::Market => {}
             _ => indexes.push(key),
         }
     }
@@ -566,6 +616,7 @@ pub(super) async fn load_plan(
         )?,
         started_at: UnixMs(row.try_get("started_at")?),
         config,
+        benchmarks,
         indexes,
         frozen: row.try_get("frozen")?,
         ended: ended.as_deref().map(RunOutcome::parse).transpose()?,

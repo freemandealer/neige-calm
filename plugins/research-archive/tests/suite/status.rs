@@ -4,7 +4,6 @@
 use std::path::Path;
 
 use research_archive::Store;
-use research_archive::catalog::{Catalog, KeyKind};
 use research_archive::plugin::view;
 use research_archive::state::{ClosedDangling, ExitKind, LastExit};
 use research_archive::status::{self, ArchiveStatus, Health, Policy};
@@ -70,6 +69,21 @@ async fn a_healthy_archive_is_ok() {
     let run = &status.runs[0];
     assert_eq!(run.as_of, "2026-01-02");
     assert_eq!(run.outcome, "complete");
+    let bars = run
+        .endpoints
+        .iter()
+        .find(|e| e.endpoint == "daily_candlesticks")
+        .unwrap();
+    assert_eq!(
+        (bars.planned, bars.ok, bars.failed, bars.untried),
+        (7, 7, 0, 0)
+    );
+    let market = run
+        .endpoints
+        .iter()
+        .find(|e| e.endpoint == "finance_calendar")
+        .unwrap();
+    assert_eq!((market.planned, market.ok), (1, 1));
     assert_eq!(
         (
             run.pairs_planned,
@@ -77,7 +91,7 @@ async fn a_healthy_archive_is_ok() {
             run.pairs_failed,
             run.pairs_untried
         ),
-        (15, 15, 0, 0)
+        (27, 27, 0, 0)
     );
     assert_eq!(run.frozen.len(), 1);
     assert_eq!(
@@ -177,20 +191,24 @@ async fn end_day(dir: &Path, n: i64, oks: usize, finish: Finish) {
         &[(".SPX.US", &["AAPL.US", "MSFT.US"])],
     )
     .await;
-    let mut t = 20;
-    for security in ["AAPL.US", "MSFT.US"] {
-        for e in Catalog::compiled().for_kind(KeyKind::Security) {
-            let response = if t - 20 < oks as i64 {
-                ok(b"{}")
-            } else {
-                failed(FailureClass::Permanent)
-            };
-            store
-                .record_observation(plan.run_id, &key(security), e.id, at(n, t), &response)
-                .await
-                .unwrap();
-            t += 1;
-        }
+    let mut pairs = store.coverage(plan.run_id).await.unwrap();
+    pairs.sort_by_key(|p| p.tier != research_archive::catalog::CaptureTier::Core);
+    for (i, pair) in pairs.into_iter().filter(|p| !p.has_ok).enumerate() {
+        let response = if i < oks {
+            ok(b"{}")
+        } else {
+            failed(FailureClass::Permanent)
+        };
+        store
+            .record_observation(
+                plan.run_id,
+                &pair.key,
+                pair.endpoint,
+                at(n, 20 + i as i64),
+                &response,
+            )
+            .await
+            .unwrap();
     }
     store
         .end_run(plan.run_id, at(n, 10_000), finish, None)
@@ -205,7 +223,7 @@ const LOST: &str = ". Data of that day is lost for good; check `journalctl --use
 #[tokio::test]
 async fn a_degraded_day_fails_until_a_later_day_completes() {
     let dir = healthy_dir().await;
-    // 4 of 15 pairs ok: below half.
+    // 4 of 27 pairs ok: below half.
     end_day(dir.path(), 2, 3, Finish::Complete).await;
     let degraded = "2026-01-03 ended degraded: only 4 of 15 pairs have an ok";
     // The capture's own exit, then later starts that overwrite it.
@@ -319,7 +337,7 @@ async fn complete_with_failures_needs_attention_from_the_rows() {
     );
     assert_eq!(
         (status.runs[0].pairs_ok, status.runs[0].pairs_failed),
-        (14, 1)
+        (14, 13)
     );
 }
 
@@ -421,7 +439,7 @@ async fn a_missed_day_does_not_demote_a_partial_one() {
             day2.pairs_failed,
             day2.pairs_untried
         ),
-        (8, 1, 0, 7)
+        (17, 1, 0, 16)
     );
     assert_eq!(
         texts(&status),
@@ -484,4 +502,46 @@ async fn an_unreadable_archive_is_failing() {
         status.findings
     );
     assert!(status.runs.is_empty());
+}
+
+#[tokio::test]
+async fn supplemental_only_failures_do_not_change_core_health() {
+    let dir = healthy_dir().await;
+    let store = Store::open(&Store::path(dir.path())).await.unwrap();
+    let plan = store
+        .plan_run(&plan_request(2, &["AAPL.US"], &[]))
+        .await
+        .unwrap();
+    store
+        .freeze_membership(plan.run_id, at(2, 2))
+        .await
+        .unwrap();
+    for pair in store.coverage(plan.run_id).await.unwrap() {
+        let supplemental = matches!(
+            pair.endpoint.as_str(),
+            "earnings_snapshot" | "financial_reports" | "finance_calendar" | "daily_candlesticks"
+        );
+        let response = if supplemental {
+            failed(FailureClass::Permanent)
+        } else {
+            ok(b"{}")
+        };
+        store
+            .record_observation(plan.run_id, &pair.key, pair.endpoint, at(2, 3), &response)
+            .await
+            .unwrap();
+    }
+    store
+        .end_run(plan.run_id, at(2, 4), Finish::Complete, None)
+        .await
+        .unwrap();
+    store.close().await;
+    let status = read(dir.path()).await;
+    assert_eq!(
+        status.health,
+        Health::Ok,
+        "auxiliary quota failures must stay in the report: {:?}",
+        status.findings
+    );
+    assert!(status.runs[0].endpoints.iter().any(|e| e.failed > 0));
 }
