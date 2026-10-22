@@ -6,7 +6,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use support::*;
@@ -55,6 +55,7 @@ fn the_browser_sees_only_its_sandbox() {
     let list: String = expected.keys().map(|p| format!("{p}\n")).collect();
     std::fs::write(plugin.home().join("probe-paths"), list).unwrap();
 
+    std::fs::write(plugin.home().join("hold-window"), b"").unwrap();
     let fake = launch_fake(&mut plugin);
     let seen: BTreeMap<String, &str> = std::fs::read_to_string(plugin.home().join("probe-result"))
         .unwrap()
@@ -84,8 +85,20 @@ fn the_browser_sees_only_its_sandbox() {
         Some("/run/wayland")
     );
     assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    // PID/CDP readiness does not imply that Wayland has published a window.
+    let held = plugin.tool("window_ls", json!({})).unwrap()["structuredContent"].clone();
+    assert!(held["windows"].as_array().unwrap().is_empty(), "{held}");
+    std::fs::remove_file(plugin.home().join("hold-window")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let ls = loop {
+        let ls = plugin.tool("window_ls", json!({})).unwrap()["structuredContent"].clone();
+        if !ls["windows"].as_array().unwrap().is_empty() {
+            break ls;
+        }
+        assert!(Instant::now() < deadline, "no window within 5s: {ls}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
     // Its window is the app's, although bwrap is the launched process.
-    let ls = plugin.tool("window_ls", json!({})).unwrap()["structuredContent"].clone();
     assert_eq!(ls["windows"][0]["app"], "chrome", "{ls}");
 }
 
