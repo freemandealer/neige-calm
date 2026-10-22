@@ -38,7 +38,7 @@ struct Boot {
     repo: Arc<SqlxRepo>,
     track_id: String,
     cwd: PathBuf,
-    codex_homes_dir: PathBuf,
+    sidecar_root: PathBuf,
     _supervisor: Option<calm_proc_supervisor::test_support::InProcessProcSupervisor>,
     _path: RestorePath,
     _tmp: TempDir,
@@ -148,8 +148,13 @@ async fn boot_with_shared_daemon(start_appserver: bool) -> Boot {
         }),
     });
     let events = EventBus::new();
+    let cfg = cfg(&tmp);
     let codex = Arc::new(CodexClient::new_stub());
-    let codex_homes_dir = codex.codex_homes_dir.clone();
+    let sidecar_root = codex
+        .claude_settings_dir
+        .parent()
+        .expect("stub sidecar root")
+        .to_path_buf();
     let mut state = AppState::from_parts(
         repo.clone(),
         events.clone(),
@@ -171,10 +176,8 @@ async fn boot_with_shared_daemon(start_appserver: bool) -> Boot {
         None,
     );
 
-    let cfg = cfg(&tmp);
     let home = calm_server::shared_codex_home::SharedCodexHome::new(
         cfg.data_dir_resolved().join("codex-home"),
-        cfg.data_dir_resolved().join("codex-homes"),
     );
     home.seed_from(None).unwrap();
     let pending = Arc::new(PendingThreadStartRegistry::new(
@@ -205,7 +208,7 @@ async fn boot_with_shared_daemon(start_appserver: bool) -> Boot {
         repo,
         track_id: track.id.to_string(),
         cwd,
-        codex_homes_dir,
+        sidecar_root,
         // Drop the owned supervisor (and its PTY children) before the PATH guard and workspace.
         _supervisor: supervisor,
         _path: saved_path,
@@ -377,7 +380,7 @@ async fn create_prompt_card_skips_per_card_codex_home_seeding() {
     assert_eq!(status, StatusCode::CREATED, "body={card:?}");
     let card_id = card["id"].as_str().unwrap();
     assert!(
-        !boot.codex_homes_dir.join(card_id).exists(),
+        !boot.sidecar_root.join(card_id).exists(),
         "shared prompt path must not create a per-card CODEX_HOME"
     );
 }
@@ -420,7 +423,7 @@ async fn create_empty_card_with_empty_cards_flag_enabled_uses_shared_daemon_pend
     );
     let card_id = card["id"].as_str().unwrap();
     assert!(
-        !boot.codex_homes_dir.join(card_id).exists(),
+        !boot.sidecar_root.join(card_id).exists(),
         "shared empty-card path must not create a per-card CODEX_HOME"
     );
     assert_eq!(boot.state.pending_codex_threads.pending_count().await, 1);
