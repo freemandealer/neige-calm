@@ -143,6 +143,16 @@ impl<'a> PlannerFactory<'a> {
         })
     }
 
+    /// Eligibility for conventional event replay before restoring a receipt checkpoint.
+    /// ACP replays only after its receipt checkpoint has retired dispatched entries.
+    /// Planner role admission and queue/watermark updates remain in the harness.
+    pub(crate) fn pre_checkpoint_replay_eligible(provider: &AgentProvider) -> bool {
+        match provider.protocol() {
+            AgentProtocol::Codex | AgentProtocol::Claude => true,
+            AgentProtocol::Acp => false,
+        }
+    }
+
     /// Restore-only policy, at the original post-reservation/pre-open point. Operation replay
     /// deliberately uses prepare_checkpoint alone.
     pub(crate) async fn prepare_restore(
@@ -211,5 +221,26 @@ impl<'a> PlannerFactory<'a> {
                 self.shutdown_codex_replay(runtime).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_pre_checkpoint_replay_excludes_acp_receipt_recovery() {
+        assert!(PlannerFactory::pre_checkpoint_replay_eligible(
+            &AgentProvider::Codex
+        ));
+        assert!(PlannerFactory::pre_checkpoint_replay_eligible(
+            &AgentProvider::Claude
+        ));
+        assert!(!PlannerFactory::pre_checkpoint_replay_eligible(
+            &AgentProvider::OpenCode
+        ));
+        assert!(!PlannerFactory::pre_checkpoint_replay_eligible(
+            &AgentProvider::Grok
+        ));
     }
 }
