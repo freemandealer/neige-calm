@@ -107,17 +107,33 @@ impl State {
         for slot in self.slots.values_mut() {
             slot.settled_activity = None;
             slot.unresolved_candidates.clear();
-            slot.retired.clear();
+            // Retired maintenance is still evidence of an uncertain operation,
+            // never current control authority. Keep it across source loss too.
+            slot.retired.retain(|_, execution| match execution.input {
+                NativeInput::Maintenance(_) => true,
+                NativeInput::Legacy | NativeInput::Canonical(_) => false,
+            });
             if let Some(current) = &mut slot.current {
-                current.input = NativeInput::Legacy;
+                match current.input {
+                    NativeInput::Legacy | NativeInput::Canonical(_) => {
+                        current.input = NativeInput::Legacy
+                    }
+                    NativeInput::Maintenance(_) => {}
+                }
             }
             if slot.steering.take().is_some() {
                 slot.unresolved = true;
             }
             if let Some(pending) = slot.pending.take() {
                 slot.unresolved = true;
-                if slot.current.as_ref().is_none_or(|current| current.ended) {
-                    slot.current = pending.candidate;
+                match &pending.ticket.input {
+                    // Keep this operation's uncertainty, never a reusable grant.
+                    NativeInput::Maintenance(_) => slot.pending = Some(pending),
+                    NativeInput::Legacy | NativeInput::Canonical(_) => {
+                        if slot.current.as_ref().is_none_or(|current| current.ended) {
+                            slot.current = pending.candidate;
+                        }
+                    }
                 }
             }
         }
