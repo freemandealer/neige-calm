@@ -28,26 +28,124 @@ pub(crate) struct RecoveryRead {
     pub(crate) terminal: Option<Value>,
 }
 
+enum RecoveryClient {
+    Native(Arc<CodexAppServer>),
+    #[cfg(feature = "fixtures")]
+    Fixture,
+}
+impl RecoveryClient {
+    fn native(&self) -> Result<&Arc<CodexAppServer>> {
+        match self {
+            Self::Native(client) => Ok(client),
+            #[cfg(feature = "fixtures")]
+            Self::Fixture => Err(CalmError::Internal(
+                "fixture recovery has no native client".into(),
+            )),
+        }
+    }
+}
+
 pub(crate) struct RecoveryThread<'a> {
+    client: RecoveryClient,
     daemon: &'a SharedCodexAppServer,
     thread_id: &'a str,
     card_id: &'a str,
 }
 
+#[cfg(all(test, feature = "fixtures"))]
+pub(super) struct ExactLookupWaiter {
+    card_id: String,
+    thread_id: String,
+    entered: tokio::sync::oneshot::Sender<()>,
+}
+
 impl SharedCodexAppServer {
+    #[cfg(all(test, feature = "fixtures"))]
+    pub(crate) fn expect_exact_lookup_waiter_for_test(
+        &self,
+        card_id: &str,
+        thread_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (entered, receiver) = tokio::sync::oneshot::channel();
+        let mut waiter = self.exact_lookup_waiter.lock().unwrap();
+        assert!(waiter.is_none(), "exact lookup observer already armed");
+        *waiter = Some(ExactLookupWaiter {
+            card_id: card_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            entered,
+        });
+        receiver
+    }
+
+    #[cfg(all(test, feature = "fixtures"))]
+    async fn acquire_exact_client(
+        &self,
+        target: &RecoveryTarget,
+    ) -> std::result::Result<Arc<CodexAppServer>, ControlError> {
+        let connection = self.connected_client();
+        tokio::pin!(connection);
+        std::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(connection.as_mut(), cx);
+            if result.is_pending() {
+                let mut waiter = self.exact_lookup_waiter.lock().unwrap();
+                if waiter.as_ref().is_some_and(|waiter| {
+                    waiter.card_id == target.card_id() && waiter.thread_id == target.thread_id()
+                }) {
+                    let _ = waiter.take().unwrap().entered.send(());
+                }
+            }
+            result
+        })
+        .await
+    }
+
+    #[cfg(not(all(test, feature = "fixtures")))]
+    async fn acquire_exact_client(
+        &self,
+        _target: &RecoveryTarget,
+    ) -> std::result::Result<Arc<CodexAppServer>, ControlError> {
+        self.connected_client().await
+    }
+
     pub(crate) async fn with_exact_thread<T>(
         &self,
         target: &RecoveryTarget,
         run: impl for<'scope> AsyncFnOnce(RecoveryThread<'scope>) -> Result<T>,
     ) -> Result<T> {
+        // Recover before entering the exact-thread boundary. No operation inside
+        // this scope may acquire the recovery coordinator or change native source.
+        #[cfg(feature = "fixtures")]
+        let client = if self.fake.is_some() {
+            RecoveryClient::Fixture
+        } else {
+            RecoveryClient::Native(self.acquire_exact_client(target).await?)
+        };
+        #[cfg(not(feature = "fixtures"))]
+        let client = RecoveryClient::Native(self.acquire_exact_client(target).await?);
         let _transition = self.transition_serial.lock().await;
         let _replay = self.resume_replay_serial.lock().await;
+        match &client {
+            RecoveryClient::Native(expected) => {
+                let current = self.ready_client().await;
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, expected))
+                {
+                    return Err(CalmError::Conflict(
+                        "Codex source changed before exact-thread recovery; retry".into(),
+                    ));
+                }
+            }
+            #[cfg(feature = "fixtures")]
+            RecoveryClient::Fixture => {}
+        }
         let thread_id = target.thread_id();
         let card_id = target.card_id();
         if self.thread_seals.is_sealed(thread_id) {
             return Err(CalmError::Conflict("conversation is being deleted".into()));
         }
         run(RecoveryThread {
+            client,
             daemon: self,
             thread_id,
             card_id,
@@ -56,6 +154,7 @@ impl SharedCodexAppServer {
     }
     async fn read_recovery_thread(
         &self,
+        client: &RecoveryClient,
         thread_id: &str,
         admit: &NativePromptAdmission<'_>,
     ) -> Result<Value> {
@@ -69,7 +168,7 @@ impl SharedCodexAppServer {
             };
             return Ok(json!({"id":thread_id,"status":{"type":status}}));
         }
-        let client = self.connected_client().await?;
+        let client = client.native()?;
         let gate = admit;
         Ok(gate
             .finish(client.thread_read_full_gated(thread_id, gate.gate()).await)?
@@ -78,6 +177,7 @@ impl SharedCodexAppServer {
 
     async fn resume_recovery_thread(
         &self,
+        client: &RecoveryClient,
         thread_id: &str,
         config: ThreadConfig,
         admit: &NativePromptAdmission<'_>,
@@ -100,7 +200,7 @@ impl SharedCodexAppServer {
             return Ok(json!({"id":thread_id,"status":{"type":"idle"}}));
         }
         let config = config.to_wire_config()?;
-        let client = self.connected_client().await?;
+        let client = client.native()?;
         let gate = admit;
         Ok(gate
             .finish(
@@ -146,11 +246,11 @@ impl RecoveryThread<'_> {
             admit.check_local().await?;
             return Ok(false);
         }
-        let client = self.daemon.connected_client().await?;
+        let client = self.client.native()?;
         let expected = self
             .daemon
             .native_turns
-            .settlement_fence(&client, self.thread_id)?;
+            .settlement_fence(client, self.thread_id)?;
         let thread = admit
             .finish(
                 client
@@ -178,7 +278,7 @@ impl RecoveryThread<'_> {
         Ok(RecoveryState::from_thread(
             &self
                 .daemon
-                .read_recovery_thread(self.thread_id, admit)
+                .read_recovery_thread(&self.client, self.thread_id, admit)
                 .await?,
         ))
     }
@@ -189,7 +289,7 @@ impl RecoveryThread<'_> {
     ) -> Result<RecoveryRead> {
         let thread = self
             .daemon
-            .read_recovery_thread(self.thread_id, admit)
+            .read_recovery_thread(&self.client, self.thread_id, admit)
             .await?;
         let terminal = expected_turn
             .and_then(|id| {
@@ -219,7 +319,7 @@ impl RecoveryThread<'_> {
     ) -> Result<RecoveryState> {
         let thread = self
             .daemon
-            .resume_recovery_thread(self.thread_id, config, admit)
+            .resume_recovery_thread(&self.client, self.thread_id, config, admit)
             .await?;
         Ok(RecoveryState::from_thread(&thread))
     }
