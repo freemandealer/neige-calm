@@ -152,11 +152,13 @@ async fn area_crud_round_trip() {
     assert!(repo.area_get(c.id.as_str()).await.unwrap().is_none());
 
     let err = repo.area_delete(c.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
     let err = repo
         .area_update(c.id.as_str(), AreaPatch::default())
         .await
         .unwrap_err();
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 }
 
@@ -244,6 +246,7 @@ async fn track_crud_round_trip() {
         })
         .await
         .unwrap_err();
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 }
 
@@ -423,6 +426,7 @@ async fn card_crud_round_trip() {
     repo.card_delete(card.id.as_str()).await.unwrap();
     assert!(repo.card_get(card.id.as_str()).await.unwrap().is_none());
     let err = repo.card_delete(card.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 }
 
@@ -699,6 +703,7 @@ async fn fk_restrict_card_delete_blocked_by_terminal() {
     let term = make_terminal(&repo, card.id.as_str()).await;
 
     let err = repo.card_delete(card.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(
         matches!(err, CalmError::Db(_)),
         "expected an FK constraint error from sqlx, got: {err:?}"
@@ -725,6 +730,7 @@ async fn fk_restrict_track_delete_blocked_by_terminal_under_card() {
     let other_term = make_terminal(&repo, other_card.id.as_str()).await;
 
     let err = repo.track_delete(w.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(
         matches!(err, CalmError::Db(_)),
         "expected an FK constraint error from sqlx, got: {err:?}"
@@ -767,6 +773,7 @@ async fn fk_restrict_area_delete_blocked_by_terminal_under_subtree() {
     let term = make_terminal(&repo, card.id.as_str()).await;
 
     let err = repo.area_delete(c.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(
         matches!(err, CalmError::Db(_)),
         "expected an FK constraint error from sqlx, got: {err:?}"
@@ -930,6 +937,7 @@ async fn overlay_upsert_is_idempotent_on_unique_key() {
         .overlay_delete("p", "track", w.id.as_str(), "status")
         .await
         .unwrap_err();
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 }
 
@@ -1020,6 +1028,7 @@ async fn terminal_create_rejects_duplicate_card_id() {
     assert_eq!(by_card.id, t.id);
 
     let err = repo.card_delete(card.id.as_str()).await.unwrap_err();
+    let err = CalmError::from(err);
     assert!(
         matches!(err, CalmError::Db(_)),
         "card delete with live terminal must fail with an FK error, got: {err:?}"
@@ -1036,7 +1045,7 @@ async fn card_with_terminal_create_tx_atomic_writes_card_terminal_and_runtime() 
     let w = make_track(&repo, c.id.as_str(), "W").await;
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let (card, term) = calm_server::db::sqlite::card_with_terminal_create_tx(
+    let (card, term) = calm_truth::db::sqlite::card_with_terminal_create_tx(
         &mut tx,
         calm_server::model::new_id(),
         &calm_server::model::new_id(),
@@ -1107,7 +1116,7 @@ async fn card_with_terminal_create_tx_rolls_back_on_invalid_track() {
     assert!(repo.cards_by_track(w.id.as_str()).await.unwrap().is_empty());
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let err = calm_server::db::sqlite::card_with_terminal_create_tx(
+    let err = calm_truth::db::sqlite::card_with_terminal_create_tx(
         &mut tx,
         calm_server::model::new_id(),
         &calm_server::model::new_id(),
@@ -1129,6 +1138,7 @@ async fn card_with_terminal_create_tx_rolls_back_on_invalid_track() {
     .expect_err("unknown track must error");
     tx.rollback().await.unwrap();
 
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 
     let cards_in_w = repo.cards_by_track(w.id.as_str()).await.unwrap();
@@ -1150,7 +1160,7 @@ async fn card_with_terminal_create_tx_uses_caller_supplied_sort() {
     let w = make_track(&repo, c.id.as_str(), "W").await;
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let (card, _term) = calm_server::db::sqlite::card_with_terminal_create_tx(
+    let (card, _term) = calm_truth::db::sqlite::card_with_terminal_create_tx(
         &mut tx,
         calm_server::model::new_id(),
         &calm_server::model::new_id(),
@@ -1187,7 +1197,7 @@ async fn card_with_terminal_create_tx_defaults_sort_when_none() {
     let _c2 = make_card(&repo, w.id.as_str(), "terminal", json!({"hello":"world","terminal_presentation":{"source":"unrecorded","in_workbench":false}})).await;
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let (card, _term) = calm_server::db::sqlite::card_with_terminal_create_tx(
+    let (card, _term) = calm_truth::db::sqlite::card_with_terminal_create_tx(
         &mut tx,
         calm_server::model::new_id(),
         &calm_server::model::new_id(),
@@ -1221,7 +1231,7 @@ async fn terminal_create_tx_enforces_unique_card_id() {
     let _seeded = make_terminal(&repo, card.id.as_str()).await;
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let err = calm_server::db::sqlite::terminal_create_tx(
+    let err = calm_truth::db::sqlite::terminal_create_tx(
         &mut tx,
         NewTerminal {
             card_id: card.id.clone(),
@@ -1235,6 +1245,7 @@ async fn terminal_create_tx_enforces_unique_card_id() {
     .expect_err("duplicate terminal for same card must conflict");
     tx.rollback().await.unwrap();
 
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::Conflict(_)));
 }
 
@@ -1243,7 +1254,7 @@ async fn terminal_create_tx_rejects_unknown_card_id() {
     let repo = fresh_repo().await;
 
     let mut tx = repo.pool().begin().await.unwrap();
-    let err = calm_server::db::sqlite::terminal_create_tx(
+    let err = calm_truth::db::sqlite::terminal_create_tx(
         &mut tx,
         NewTerminal {
             card_id: "no-such-card".into(),
@@ -1257,6 +1268,7 @@ async fn terminal_create_tx_rejects_unknown_card_id() {
     .expect_err("unknown card must error");
     tx.rollback().await.unwrap();
 
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 }
 
@@ -1268,7 +1280,7 @@ async fn card_with_codex_create_tx_atomic_writes_card_terminal_and_runtime() {
 
     let card_id = calm_server::model::new_id();
     let mut tx = repo.pool().begin().await.unwrap();
-    let (card, term, mcp_token) = calm_server::db::sqlite::card_with_codex_create_tx(
+    let (card, term, mcp_token) = calm_truth::db::sqlite::card_with_codex_create_tx(
         &mut tx,
         card_id.clone(),
         &calm_server::model::new_id(),
@@ -1343,7 +1355,7 @@ async fn card_with_codex_create_tx_rolls_back_on_invalid_track() {
 
     let card_id = calm_server::model::new_id();
     let mut tx = repo.pool().begin().await.unwrap();
-    let err = calm_server::db::sqlite::card_with_codex_create_tx(
+    let err = calm_truth::db::sqlite::card_with_codex_create_tx(
         &mut tx,
         card_id,
         &calm_server::model::new_id(),
@@ -1365,6 +1377,7 @@ async fn card_with_codex_create_tx_rolls_back_on_invalid_track() {
     .expect_err("unknown track must error");
     tx.rollback().await.unwrap();
 
+    let err = CalmError::from(err);
     assert!(matches!(err, CalmError::NotFound(_)));
 
     let cards_in_w = repo.cards_by_track(w.id.as_str()).await.unwrap();
@@ -1387,7 +1400,7 @@ async fn card_with_codex_create_tx_uses_caller_supplied_sort() {
 
     let card_id = calm_server::model::new_id();
     let mut tx = repo.pool().begin().await.unwrap();
-    let (card, _term, _mcp_token) = calm_server::db::sqlite::card_with_codex_create_tx(
+    let (card, _term, _mcp_token) = calm_truth::db::sqlite::card_with_codex_create_tx(
         &mut tx,
         card_id,
         &calm_server::model::new_id(),

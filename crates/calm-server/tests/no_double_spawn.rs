@@ -11,9 +11,6 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use calm_server::db::prelude::*;
-use calm_server::db::sqlite::{
-    SqlxRepo, card_with_claude_create_tx, card_with_codex_create_tx, card_with_terminal_create_tx,
-};
 use calm_server::db::write_in_tx_typed;
 use calm_server::error::{CalmError, Result as CalmResult};
 use calm_server::event::{BroadcastEnvelope, Event, EventBus};
@@ -41,6 +38,9 @@ use calm_server::session_projection_lookup::project_runtime_into_card_payload;
 use calm_server::session_projection_repo::{WorkerSessionKind, WorkerSessionProjectionRepo};
 use calm_server::shared_codex_appserver::SharedCodexAppServer;
 use calm_server::state::{AppState, CodexClient, DaemonClient};
+use calm_truth::db::sqlite::{
+    SqlxRepo, card_with_claude_create_tx, card_with_codex_create_tx, card_with_terminal_create_tx,
+};
 use futures::future::BoxFuture;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -1253,6 +1253,7 @@ async fn terminal_create_recovery_from_tx_committed_replays_spawn_once() {
                 calm_types::card_presentation::CardCreationSource::Manual,
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
@@ -1376,6 +1377,7 @@ async fn codex_create_recovery_from_tx_committed_reaches_terminal_phase() {
                 calm_server::routes::theme::RequestTheme::default_dark(),
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
@@ -1501,6 +1503,7 @@ async fn claude_create_recovery_from_tx_committed_reaches_terminal_phase_and_wri
                 calm_server::routes::theme::RequestTheme::default_dark(),
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
@@ -2238,6 +2241,7 @@ async fn terminal_create_recovery_spawn_failure_clears_stale_pid_before_compensa
                 calm_types::card_presentation::CardCreationSource::Manual,
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
@@ -2736,6 +2740,7 @@ async fn apply_recovery_continues_after_drive_error_between_items() {
                 calm_types::card_presentation::CardCreationSource::Manual,
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
@@ -3361,6 +3366,7 @@ async fn seed_codex_card_for_operation(
                 calm_server::routes::theme::RequestTheme::default_dark(),
             )
             .await
+            .map_err(CalmError::from)
         })
     })
     .await
