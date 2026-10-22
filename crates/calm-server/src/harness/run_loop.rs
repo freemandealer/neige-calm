@@ -53,6 +53,8 @@ use provider::TurnModelSelection;
 use provider::events::{ItemPhase, PlannerEvent, PlannerEventKind};
 
 mod canonical;
+#[cfg(test)]
+mod compact_task_tests;
 mod content_observer;
 mod input_contract;
 mod self_compact;
@@ -1876,7 +1878,7 @@ async fn settle_owner_input_before_release(inner: &Arc<Inner>) -> Result<()> {
 async fn persist_owned_input_snapshot(inner: &Arc<Inner>) -> Result<()> {
     // A terminal transition may have reached memory while the active checkpoint failed.
     // Let that original guard commit the transition before trying the failed-current guard.
-    if persist_guarded_snapshot(inner, None, None).await? {
+    if persist_guarded_snapshot(inner, None, None, false).await? {
         return Ok(());
     }
     if matches!(&*inner.state.lock().await,
@@ -2292,7 +2294,9 @@ async fn restore_steered_entries_codex_dropped(
     let persisted = if failed_owner {
         persist_failed_system_error_snapshot(inner).await
     } else {
-        persist_snapshot_inner(inner, None, None).await.map(|_| ())
+        persist_snapshot_inner(inner, None, None, false)
+            .await
+            .map(|_| ())
     };
     if let Err(error) = persisted {
         tracing::warn!(
@@ -3876,7 +3880,7 @@ async fn runtime_is_still_the_live_carrier(inner: &Arc<Inner>) -> Result<bool> {
 /// The original issuance writer keeps its closing/retired boundary. Its caller must check
 /// whether either guarded transaction actually wrote; a skipped checkpoint is not settlement.
 async fn persist_issuance_outcome(inner: &Arc<Inner>) -> Result<bool> {
-    let active_written = persist_snapshot_inner(inner, None, None).await?;
+    let active_written = persist_snapshot_inner(inner, None, None, false).await?;
     if !inner.shutting_down.load(Ordering::SeqCst)
         && runtime_is_still_the_live_carrier(inner).await?
     {
@@ -4023,7 +4027,9 @@ async fn persist_guarded_failed_system_error_snapshot(inner: &Arc<Inner>) -> Res
 }
 
 async fn persist_snapshot(inner: &Arc<Inner>) -> Result<()> {
-    persist_snapshot_inner(inner, None, None).await.map(|_| ())
+    persist_snapshot_inner(inner, None, None, false)
+        .await
+        .map(|_| ())
 }
 
 /// Persist a durable user send, and REFUSE it if the row was not written: the writer matches
@@ -4037,7 +4043,7 @@ async fn persist_snapshot_for_durable_send(
 ) -> Result<()> {
     let mut bind = DurableSendBinding::new(inner, key, entry_id);
     bind.source = source;
-    if persist_guarded_snapshot(inner, None, Some(bind)).await? {
+    if persist_guarded_snapshot(inner, None, Some(bind), false).await? {
         return Ok(());
     }
     Err(CalmError::PlannerHarnessRuntimeSuperseded(
@@ -4047,7 +4053,7 @@ async fn persist_snapshot_for_durable_send(
 
 async fn persist_snapshot_stamping_issued_head(inner: &Arc<Inner>) -> Result<()> {
     let issued_head = inner.issued_turn_head.lock().await.clone();
-    let _written = persist_snapshot_inner(inner, issued_head.clone(), None).await?;
+    let _written = persist_snapshot_inner(inner, issued_head.clone(), None, false).await?;
     if issued_head.is_some() {
         *inner.last_seen_head.lock().await = issued_head;
     }
@@ -4097,11 +4103,12 @@ async fn persist_snapshot_inner(
     inner: &Arc<Inner>,
     last_seen_head_override: Option<track_vcs::CommitHash>,
     send: Option<DurableSendBinding>,
+    compact_start: bool,
 ) -> Result<bool> {
     if inner.shutting_down.load(Ordering::SeqCst) {
         return Ok(false);
     }
-    persist_guarded_snapshot(inner, last_seen_head_override, send).await
+    persist_guarded_snapshot(inner, last_seen_head_override, send, compact_start).await
 }
 
 /// The existing guarded transaction, also used by the shared owner release entry.
@@ -4110,6 +4117,7 @@ async fn persist_guarded_snapshot(
     inner: &Arc<Inner>,
     last_seen_head_override: Option<track_vcs::CommitHash>,
     send: Option<DurableSendBinding>,
+    compact_start: bool,
 ) -> Result<bool> {
     if inner.inputs.canonical().is_some() {
         if send.is_some() || last_seen_head_override.is_some() {
@@ -4150,6 +4158,9 @@ async fn persist_guarded_snapshot(
     let status = run_status_for(&state_for_status);
     let new_phase = snapshot.phase;
     let wake = self_compact::prepare_wake(inner, &mut snapshot);
+    let compact_request = snapshot.planner_compaction.clone();
+    let compact_track = inner.track_id.clone();
+    let compact_scope = harness_event_scope(inner, "task.completed");
     let snapshot_value = serde_json::to_value(&snapshot)?;
     let repo = Arc::clone(&inner.repo);
     let bound_card_id = inner.card_id.to_string();
@@ -4189,12 +4200,24 @@ async fn persist_guarded_snapshot(
                 )
                 .await?;
             }
+            let task_events = if written {
+                self_compact::append_task_lifecycle(
+                    tx,
+                    &compact_track,
+                    compact_request.as_ref(),
+                    &compact_scope,
+                    compact_start,
+                )
+                .await?
+            } else {
+                vec![]
+            };
             let wake = if written {
                 self_compact::append_wake(tx, wake).await?
             } else {
                 None
             };
-            Ok((written, wake))
+            Ok((written, (wake, task_events)))
         })
     })
     .await;
@@ -4204,11 +4227,15 @@ async fn persist_guarded_snapshot(
         inner.card_id.as_str(),
     )
     .await;
-    let (written, wake) = written?;
+    let (written, (wake, task_events)) = written?;
     if !written {
         return Ok(false);
     }
     *completion = None;
+    // Publish lifecycle before wake, preserving committed event order.
+    for event in task_events {
+        inner.events.emit_envelope(event);
+    }
     self_compact::publish_wake(inner, snapshot.planner_compaction, wake).await;
     drop(completion);
     inner
