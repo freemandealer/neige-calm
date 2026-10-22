@@ -250,7 +250,9 @@ pub(super) async fn publish(inner: &Inner, next: CommittedFrame) {
         )),
     );
     let phase = header.phase;
+    let usage_header = header.clone();
     inputs.publish_committed(next).await;
+    objective_usage::observe_canonical(inner, usage_header).await;
     emit_phase_refresh(inner, phase, emitted).await;
 }
 
