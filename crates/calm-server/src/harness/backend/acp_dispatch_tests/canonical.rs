@@ -3,6 +3,7 @@
 mod attach;
 mod carrier;
 mod cleanup;
+mod completion;
 mod continuation;
 mod control;
 mod failures;
@@ -24,7 +25,7 @@ struct Fixture {
     backend: PlannerBackend,
     session: Arc<AcpPlannerSession>,
     owner: super::super::dispatch_fixture::Owner,
-    dir: tempfile::TempDir,
+    dir: crate::test_support::execution::Directory,
     source: crate::auth::HumanInputSource,
     auth: AuthState,
     login: String,
@@ -151,7 +152,17 @@ impl Fixture {
                 .session
                 .active_turn_id_for_thread(&self.owner.thread)
                 .is_some()
+                || !self.session.driver_finished_for_test()
             {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    async fn wait_driver_finished(&self) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !self.session.driver_finished_for_test() {
                 tokio::task::yield_now().await;
             }
         })
