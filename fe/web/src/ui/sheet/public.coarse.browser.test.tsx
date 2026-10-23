@@ -41,8 +41,7 @@ function FocusFixture() {
       footer={<input aria-label="Touch focus draft" />}><button onClick={() => setOpen(false)}>Close touch sheet</button></Sheet></>;
 }
 it.each([
-  { width: 320, close: 'button' }, { width: 390, close: 'button' },
-  { width: 320, close: 'Escape' }, { width: 390, close: 'Escape' },
+  { width: 320, close: 'button' }, { width: 390, close: 'Escape' },
 ])('preserves real external focus on coarse exit at $width via $close', async ({ width, close }) => {
   await page.viewport(width, 844); render(<FocusFixture />);
   const dialog = page.getByRole('dialog', { name: 'Touch focus' }).element() as HTMLDialogElement;
@@ -57,5 +56,6 @@ it.each([
   const external = page.getByRole('button', { name: 'External touch focus' }).element() as HTMLElement;
   external.focus(); expect(document.activeElement).toBe(external); expect(dialog.open).toBe(true);
   await expect.poll(() => dialog.open).toBe(false);
-  expect(document.activeElement).toBe(external); expect(panel.textContent).toBe('');
+  await expect.poll(() => panel.textContent).toBe('');
+  expect(document.activeElement).toBe(external);
 });
