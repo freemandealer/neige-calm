@@ -131,6 +131,7 @@ impl Executor {
             .lock()
             .map_err(poison)?
             .insert(request.execution_id.clone(), output_log.clone());
+        #[cfg(target_os = "linux")]
         let context = scope_helper::HelperContext {
             execution_id: request.execution_id.clone(),
             executor_boot: self.boot.clone(),
@@ -152,6 +153,7 @@ impl Executor {
             self.persist(record.clone())?;
             return Ok(reply(&record));
         }
+        #[cfg(target_os = "linux")]
         let result = process::spawn(
             &self.helper_image,
             cwd.directory(),
@@ -159,6 +161,14 @@ impl Executor {
             context,
             output_log,
         );
+        #[cfg(target_os = "macos")]
+        let result = process::spawn(
+            cwd.directory(),
+            &record.request.specification,
+            CapabilityToken::fresh()?,
+            output_log,
+        )
+        .map(|(process, native)| (process, native, ()));
         let (process, native, reports) = match result {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -171,6 +181,8 @@ impl Executor {
                 return Ok(reply(&record));
             }
         };
+        #[cfg(target_os = "macos")]
+        let mut startup = process::StartupCleanup(Some(process.clone()));
         let receipt = ExecutionReceipt {
             identity: record.request.identity.clone(),
             slot_version: version,
@@ -191,7 +203,27 @@ impl Executor {
             // Unknown is not a durable success acknowledgement. Preserve native ownership for reconciliation.
             record = self.latch(record)?;
         }
+        #[cfg(target_os = "linux")]
         self.monitor(request.execution_id, reports, process);
+        #[cfg(target_os = "macos")]
+        {
+            let () = reports;
+            // A suspended owned child cannot execute payload code before its durable receipt.
+            if matches!(record.phase, Phase::Spawned(_))
+                && let Err(error) = process.resume()
+            {
+                record.phase = Phase::Unknown {
+                    slot_version: version,
+                    receipt: record.phase.receipt().cloned(),
+                    reason: format!("native resume failed: {error}"),
+                };
+                self.persist(record.clone())?;
+            }
+            if matches!(record.phase, Phase::Spawned(_)) {
+                startup.0.take();
+                self.monitor_native(request.execution_id, process);
+            }
+        }
         Ok(reply(&record))
     }
 }

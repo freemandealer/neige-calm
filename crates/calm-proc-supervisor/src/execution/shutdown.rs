@@ -103,5 +103,15 @@ impl Executor {
         {
             tracing::error!("executor shutdown timed out without durable settlement");
         }
+        #[cfg(target_os = "macos")]
+        if let Ok(processes) = self.processes.lock() {
+            // Unknown lifecycle observations must not strand children whose
+            // original ownership is still held when the supervisor exits.
+            for process in processes.values() {
+                if let Err(error) = process.cleanup() {
+                    tracing::error!(%error, "native shutdown cleanup incomplete");
+                }
+            }
+        }
     }
 }

@@ -250,7 +250,7 @@ pub(crate) async fn drive(shared: Arc<Shared>, run: TurnRun) -> bool {
             },
             _ = ticks.tick(), if exited.is_none() => {
                 if matches!(engine.output(&id, None).await, Ok(ExecutionReply::Observation {
-                    state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, ..
+                    state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, ..
                 })) { exited = Some(Instant::now()); }
             }
             _ = sleep_until_opt(drain_until), if drain_until.is_some() => {
@@ -585,7 +585,7 @@ struct SettleInput {
     approvals: Approvals,
 }
 
-/// Every protocol end requests Stop. Only Drained settlement qualifies a known result.
+/// Every protocol end requests Stop. Only confirmed foreground settlement qualifies a known result.
 async fn settle(shared: &Arc<Shared>, input: SettleInput, ending: Ending) -> bool {
     let SettleInput {
         claim,
@@ -634,6 +634,7 @@ async fn settle(shared: &Arc<Shared>, input: SettleInput, ending: Ending) -> boo
                         Ok(ExecutionReply::Observation {
                             state: ExecutionState::Exited { .. }
                                 | ExecutionState::Drained { .. }
+                                | ExecutionState::OriginalGroupEmpty { .. }
                                 | ExecutionState::NoChild { .. }
                                 | ExecutionState::Revoked,
                             ..

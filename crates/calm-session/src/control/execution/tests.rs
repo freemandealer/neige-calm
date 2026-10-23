@@ -192,43 +192,75 @@ fn retired_cleanup_does_not_move_stop_wire_ordinal() {
 }
 
 #[tokio::test]
-async fn c2a_registered_current_rejects_v8_typed_peer() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("typed-v8.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    let peer = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        assert!(
-            matches!(read_frame::<ControlMsg, _>(&mut stream).await.unwrap(),
+async fn c2a_registered_negotiates_current_and_rejects_old_typed_peers() {
+    for version in [8, 9, EXECUTION_ENVELOPE_VERSION] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("typed-version.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(
+                matches!(read_frame::<ControlMsg, _>(&mut stream).await.unwrap(),
             ControlMsg::Execution(request) if matches!(*request, ExecutionRequest::Handshake(
                 ExecutionHandshake { required_contract: EXECUTION_ENVELOPE_VERSION, mode: ExecutionProtocolMode::RegisteredV3, .. })))
-        );
-        write_frame(
-            &mut stream,
-            &ControlReply::Execution(Box::new(ExecutionReply::Handshake {
-                envelope_version: 8,
-                executor_boot: ExecutorBootId::fresh().unwrap(),
-                mode: ExecutionProtocolMode::RegisteredV3,
-            })),
-        )
-        .await
-        .unwrap();
-    });
-    assert!(
-        RegisteredExecutorConnection::connect(&path, CapabilityToken::fresh().unwrap())
+            );
+            write_frame(
+                &mut stream,
+                &ControlReply::Execution(Box::new(ExecutionReply::Handshake {
+                    envelope_version: version,
+                    executor_boot: ExecutorBootId::fresh().unwrap(),
+                    mode: ExecutionProtocolMode::RegisteredV3,
+                })),
+            )
             .await
-            .is_err()
-    );
-    peer.await.unwrap();
+            .unwrap();
+        });
+        let negotiated =
+            RegisteredExecutorConnection::connect(&path, CapabilityToken::fresh().unwrap()).await;
+        assert_eq!(negotiated.is_ok(), version == EXECUTION_ENVELOPE_VERSION);
+        peer.await.unwrap();
+    }
 }
 
 #[test]
 fn c2a_close_stdin_appends_wire_ordinal_and_preserves_persisted_contract() {
-    assert_eq!(EXECUTION_ENVELOPE_VERSION, 9);
+    assert_eq!(EXECUTION_ENVELOPE_VERSION, 10);
     assert_eq!(PERSISTED_RECEIPT_CONTRACT_VERSION, 4);
     assert_eq!(
         bincode::serde::encode_to_vec(ProcessAction::CloseStdin, bincode::config::standard())
             .unwrap(),
         vec![6]
     );
+}
+
+#[test]
+fn native_macos_v10_wire_roundtrips_both_identity_variants() {
+    let legacy: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../calm-proc-supervisor/src/execution/fixtures/linux-v4.execution.json"
+    )))
+    .unwrap();
+    let linux: ExecutionReceipt =
+        serde_json::from_value(legacy["phase"]["Drained"]["receipt"].clone()).unwrap();
+    assert!(matches!(
+        linux.process,
+        NativeProcessIdentity::LinuxHelper(_)
+    ));
+    let mut mac = linux.clone();
+    mac.process = NativeProcessIdentity::MacOwnedGroup(MacProcessIdentity {
+        pid: 12345,
+        birth_seconds: 456,
+        birth_microseconds: 789,
+        nonce: linux.process.nonce().clone(),
+    });
+    mac.scope_mechanism = ScopeMechanismIdentity::MacOwnedGroup {
+        protocol_version: 1,
+    };
+    for receipt in [linux, mac] {
+        let bytes = bincode::serde::encode_to_vec(&receipt, bincode::config::standard()).unwrap();
+        let (decoded, used): (ExecutionReceipt, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(decoded, receipt);
+    }
 }

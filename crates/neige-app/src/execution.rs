@@ -14,7 +14,7 @@ pub(crate) enum ExecutionSupport {
 
 impl ExecutionSupport {
     pub(crate) const fn current() -> Self {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             Self::Registered
         } else {
             Self::LegacyOnly
@@ -146,7 +146,7 @@ mod tests {
         cfg.child.data_dir = Some(temp.path().join("data"));
         cfg.tailnet = None;
         ensure_key_file(&cfg).unwrap();
-        let expected = cfg!(target_os = "linux");
+        let expected = cfg!(any(target_os = "linux", target_os = "macos"));
         assert_eq!(key_path(&cfg).exists(), expected);
         let supervisor = crate::supervisor::proc_supervisor_config(&cfg);
         let server = crate::supervisor::calm_server_supervisor_config(&cfg);

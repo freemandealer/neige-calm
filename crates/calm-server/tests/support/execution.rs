@@ -1,6 +1,16 @@
 use std::path::{Path, PathBuf};
 use workspace_runtime::execution::CapabilityToken;
 
+// Both production-entry suites use the same single-owner watchdog. Keep its
+// implementation and panic/timeout regression in the supervisor's test layer.
+#[cfg(target_os = "macos")]
+#[path = "../../../calm-proc-supervisor/tests/execution_support/native_child.rs"]
+mod native_child;
+#[cfg(target_os = "macos")]
+use native_child::SupervisorChild;
+#[cfg(not(target_os = "macos"))]
+use std::process::Child as SupervisorChild;
+
 pub fn supervisor(
     journal_root: &Path,
 ) -> (
@@ -38,26 +48,61 @@ pub struct Fixture {
     pub lifecycle: calm_server::execution_quiesce::ExecutionLifecycle,
     _socket: tempfile::TempDir,
     _root: tempfile::TempDir,
-    server: std::process::Child,
+    server: SupervisorChild,
+}
+
+/// Observation only: the fixture retains the sole shutdown/reap responsibility.
+pub struct CleanupProbe {
+    pid: u32,
+    root: PathBuf,
+    socket: PathBuf,
+}
+impl CleanupProbe {
+    pub fn assert_closed(self) {
+        assert_eq!(
+            unsafe { libc::waitpid(self.pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1,
+            "fixture must have reaped its supervisor"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(!self.root.exists(), "private journal/key root remains");
+        assert!(!self.socket.exists(), "private socket root remains");
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // The supervisor's existing executor shutdown owns TERM/KILL and descendant reap.
-        unsafe {
-            libc::kill(self.server.id() as i32, libc::SIGTERM);
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if self.server.try_wait().ok().flatten().is_some() {
-                return;
+        #[cfg(target_os = "macos")]
+        self.server.close();
+        #[cfg(not(target_os = "macos"))]
+        {
+            // The supervisor's existing executor shutdown owns TERM/KILL and descendant reap.
+            unsafe {
+                libc::kill(self.server.id() as i32, libc::SIGTERM);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if self.server.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = self.server.kill();
+            let _ = self.server.wait();
         }
-        let _ = self.server.kill();
-        let _ = self.server.wait();
     }
 }
 impl Fixture {
+    pub fn cleanup_probe(&self) -> CleanupProbe {
+        CleanupProbe {
+            pid: self.server.id(),
+            root: self._root.path().to_owned(),
+            socket: self._socket.path().to_owned(),
+        }
+    }
+
     pub fn assert_journal_excludes(&self, needle: &str) {
         assert!(
             !self.journal_contains(needle),
@@ -101,8 +146,8 @@ impl Fixture {
         ]
     }
 
-    fn spawn(root: &Path, socket: &Path, key: &Path) -> std::process::Child {
-        std::process::Command::new(env!("CARGO_BIN_EXE_osc-probe-child"))
+    fn spawn(root: &Path, socket: &Path, key: &Path) -> SupervisorChild {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_osc-probe-child"))
             .arg("--execution-supervisor")
             .arg(root.join("journal"))
             .arg(socket)
@@ -110,18 +155,30 @@ impl Fixture {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .spawn()
-            .unwrap()
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        let child = SupervisorChild::with_timeout(child, root, std::time::Duration::from_secs(180));
+        child
     }
     pub async fn restart(&mut self) {
-        self.server.kill().unwrap();
-        self.server.wait().unwrap();
-        while self.lifecycle.engine().unwrap().available() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Never discard a native supervisor's payload pins during test cleanup.
+        // Lost-handle recovery uses a reaped receipt and controlled journal injection.
+        #[cfg(target_os = "macos")]
+        self.server.close();
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.server.kill().unwrap();
+            self.server.wait().unwrap();
         }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while self.lifecycle.engine().unwrap().available() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("executor disconnect after owned-child reap");
         self.server = Self::spawn(self._root.path(), &self.socket, &self.key);
-        while !self.lifecycle.engine().unwrap().available() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        Self::wait_available(self.lifecycle.engine().unwrap()).await;
     }
     /// Start the supervisor independently of any kernel or database lifetime.
     pub fn start() -> Self {

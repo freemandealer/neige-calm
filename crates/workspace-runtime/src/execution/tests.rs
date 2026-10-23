@@ -115,6 +115,44 @@ fn next_step_full_table() {
         }
     }
 }
+
+#[test]
+fn native_macos_settlement_requires_complete_output_and_keeps_unknown() {
+    for desired in [Desired::Run, Desired::Stop, Desired::Retire] {
+        for output in [
+            OutputEnd::Open,
+            OutputEnd::Incomplete {
+                reason: "reader failed".into(),
+            },
+            OutputEnd::Complete { final_cursor: 7 },
+        ] {
+            let fact = journal(
+                ExecutionState::OriginalGroupEmpty { status: Some(0) },
+                output.clone(),
+            );
+            assert_eq!(
+                next_step(desired, &fact),
+                if matches!(output, OutputEnd::Complete { .. }) {
+                    Step::Settle
+                } else {
+                    Step::Wait
+                }
+            );
+            assert_eq!(
+                next_step(
+                    desired,
+                    &journal(
+                        ExecutionState::Unknown {
+                            reason: "lost handle".into()
+                        },
+                        output
+                    )
+                ),
+                Step::Wait
+            );
+        }
+    }
+}
 #[tokio::test]
 async fn absent_stop_unknown_revoke_finishes() {
     let (intent, store, executor, engine) = setup(Desired::Stop, vec![Ok(Fact::Absent)]);
@@ -374,16 +412,20 @@ mod port_contract {
                 process_alias: launch.metadata.alias.0.clone(),
             },
             slot_version: 1,
-            process: NativeProcessIdentity {
-                pid: 1,
-                start_time_ticks: 1,
-                nonce: CapabilityToken::fresh().unwrap(),
-            },
-            scope_mechanism: ScopeMechanismIdentity {
-                executable_device: 1,
-                executable_inode: 1,
-                protocol_version: 1,
-            },
+            process: NativeProcessIdentity::LinuxHelper(
+                workspace::execution::LinuxProcessIdentity {
+                    pid: 1,
+                    start_time_ticks: 1,
+                    nonce: CapabilityToken::fresh().unwrap(),
+                },
+            ),
+            scope_mechanism: ScopeMechanismIdentity::LinuxHelper(
+                workspace::execution::LinuxHelperIdentity {
+                    executable_device: 1,
+                    executable_inode: 1,
+                    protocol_version: 1,
+                },
+            ),
         };
         let mut retired = match tombstone(&launch) {
             Fact::Retired(t) => t,

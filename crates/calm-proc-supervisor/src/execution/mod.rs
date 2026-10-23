@@ -5,22 +5,32 @@ mod controls;
 mod directory;
 mod journal;
 mod launch;
+#[cfg(target_os = "linux")]
 mod monitor;
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+#[path = "monitor_macos.rs"]
+mod monitor;
+#[cfg(all(test, target_os = "linux"))]
 mod monitor_tests;
+#[cfg(target_os = "linux")]
 mod native_child;
 mod output;
 mod preparation;
 mod private;
+#[cfg(target_os = "linux")]
+mod process;
+#[cfg(target_os = "macos")]
+#[path = "process_macos.rs"]
 mod process;
 mod protocol;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod protocol_tests;
+#[cfg(target_os = "linux")]
 mod scope_helper;
 mod shutdown;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod stop_tests;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tombstone_tests;
 mod validation;
 use validation::*;
@@ -62,6 +72,7 @@ pub struct Executor {
     config: ExecutorConfig,
     boot: ExecutorBootId,
     host_boot_id: String,
+    #[cfg(target_os = "linux")]
     helper_image: std::fs::File,
     mechanism: ScopeMechanismIdentity,
     legacy_persistence: StdMutex<()>,
@@ -88,25 +99,37 @@ impl Executor {
             "helper program must be absolute"
         );
         let store = Store::open(config.journal_directory.clone())?;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let helper_image = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&config.helper_program)?;
-        let image = helper_image.metadata()?;
-        anyhow::ensure!(
-            image.is_file() && image.mode() & 0o111 != 0,
-            "helper executable not usable"
-        );
-        let mechanism = ScopeMechanismIdentity {
-            executable_device: image.dev(),
-            executable_inode: image.ino(),
-            protocol_version: 1,
+        #[cfg(target_os = "linux")]
+        let (helper_image, mechanism, host_boot_id) = {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let helper_image = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&config.helper_program)?;
+            let image = helper_image.metadata()?;
+            anyhow::ensure!(
+                image.is_file() && image.mode() & 0o111 != 0,
+                "helper executable not usable"
+            );
+            let mechanism =
+                ScopeMechanismIdentity::LinuxHelper(workspace::execution::LinuxHelperIdentity {
+                    executable_device: image.dev(),
+                    executable_inode: image.ino(),
+                    protocol_version: 1,
+                });
+            let host_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+                .trim()
+                .to_owned();
+            anyhow::ensure!(!host_boot_id.is_empty(), "missing host boot identity");
+            (helper_image, mechanism, host_boot_id)
         };
-        let host_boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-            .trim()
-            .to_owned();
-        anyhow::ensure!(!host_boot_id.is_empty(), "missing host boot identity");
+        #[cfg(target_os = "macos")]
+        let (mechanism, host_boot_id) = (
+            ScopeMechanismIdentity::MacOwnedGroup {
+                protocol_version: 1,
+            },
+            process::host_boot_id()?,
+        );
         let mut outputs = HashMap::new();
         let mut records = HashMap::new();
         let mut aliases: HashMap<String, AliasSlot> = HashMap::new();
@@ -136,19 +159,8 @@ impl Executor {
                 continue;
             }
             let identity = record.request.identity.clone();
-            if let Some(receipt) = record.phase.receipt() {
-                anyhow::ensure!(
-                    receipt.identity == identity,
-                    "receipt identity does not match its journal"
-                );
-            }
-            if let Phase::Drained { receipt, proof, .. } = &record.phase {
-                anyhow::ensure!(
-                    proof.helper_process == receipt.process
-                        && proof.mechanism == receipt.scope_mechanism,
-                    "drain proof does not bind original scope receipt"
-                );
-            }
+            record.validate()?;
+            record.version = journal::JOURNAL_VERSION;
             let path = store.output_path(&identity.execution_id);
             if record.phase.receipt().is_some() || path.exists() {
                 // Persisted completion must agree with the actual durable log.
@@ -279,6 +291,7 @@ impl Executor {
             config,
             boot: ExecutorBootId::fresh()?,
             host_boot_id,
+            #[cfg(target_os = "linux")]
             helper_image,
             mechanism,
             legacy_persistence: Default::default(),
@@ -497,6 +510,7 @@ impl Executor {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn run_scope_helper(config_fd: i32, report_fd: i32) -> anyhow::Result<()> {
     scope_helper::run(config_fd, report_fd)
 }
@@ -514,4 +528,9 @@ fn refused(reason: &str) -> ExecutionReply {
 }
 fn poison<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
     anyhow::anyhow!("executor state poisoned")
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_scope_helper(_: i32, _: i32) -> anyhow::Result<()> {
+    anyhow::bail!("native macOS execution owns the payload directly; Linux helper unavailable")
 }

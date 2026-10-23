@@ -163,7 +163,7 @@ pub(crate) async fn check(
                         let _ = tokio::time::timeout(Duration::from_secs(5), async {
                             loop {
                                 if matches!(engine.output(&id, None).await, Ok(ExecutionReply::Observation {
-                                    state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, .. })) { break }
+                                    state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, .. })) { break }
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }).await;
@@ -172,7 +172,7 @@ pub(crate) async fn check(
                 }
                 _ = ticks.tick() => {
                     if matches!(engine.output(&id, None).await, Ok(ExecutionReply::Observation {
-                        state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, .. })) { break }
+                        state: ExecutionState::Exited { .. } | ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. } | ExecutionState::NoChild { .. } | ExecutionState::Revoked, .. })) { break }
                 }
             }
         }
@@ -277,10 +277,13 @@ fn verdict(
     plan: NativeEditPlan,
 ) -> EditPreparation<CalmError> {
     match settlement {
-        Settlement::Journal(ExecutionState::Drained { status: Some(0) }) => {
-            EditPreparation::Prepared { plan }
-        }
-        Settlement::Journal(ExecutionState::Drained { status }) => EditPreparation::Failed {
+        Settlement::Journal(
+            ExecutionState::Drained { status: Some(0) }
+            | ExecutionState::OriginalGroupEmpty { status: Some(0) },
+        ) => EditPreparation::Prepared { plan },
+        Settlement::Journal(
+            ExecutionState::Drained { status } | ExecutionState::OriginalGroupEmpty { status },
+        ) => EditPreparation::Failed {
             error: CalmError::Conflict(format!(
                 "Claude refused to remove this turn: {}",
                 refusal_reason(stdout, stderr, *status)

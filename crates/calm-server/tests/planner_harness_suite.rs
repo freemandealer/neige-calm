@@ -1,11 +1,15 @@
 #[path = "cases/c4_lost_completion.rs"]
 mod c4_lost_completion;
+#[path = "cases/c4_native_completion.rs"]
+mod c4_native_completion;
 #[path = "cases/c4_provider_alias.rs"]
 mod c4_provider_alias;
 #[path = "cases/c4_provider_boot.rs"]
 mod c4_provider_boot;
 #[path = "cases/c4_provider_execution.rs"]
 mod c4_provider_execution;
+#[path = "cases/c4_provider_fixture.rs"]
+mod c4_provider_fixture;
 #[path = "cases/c4_provider_stderr.rs"]
 mod c4_provider_stderr;
 #[path = "cases/c4_provider_turn.rs"]

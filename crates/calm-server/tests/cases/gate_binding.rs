@@ -2396,9 +2396,14 @@ async fn parked_scope(fx: &Fx, op: &Operation) -> ScopeEvidence {
         panic!("scope receipt")
     };
     ScopeEvidence {
-        pid: receipt.process.pid as i32,
-        pgid: receipt.process.pid as i32,
-        start_time: receipt.process.start_time_ticks,
+        pid: receipt.process.pid() as i32,
+        pgid: receipt.process.pid() as i32,
+        start_time: match &receipt.process {
+            workspace_runtime::execution::NativeProcessIdentity::LinuxHelper(p) => {
+                p.start_time_ticks
+            }
+            _ => panic!("Linux helper required"),
+        },
         boot_id: calm_server::proc_identity::read_boot_id().unwrap(),
     }
 }
@@ -2987,3 +2992,7 @@ async fn live_reattached_gate_result_discarded_when_tree_changed() {
 
 #[path = "gate_binding/prepare_writer_tests.rs"]
 mod prepare_writer_tests;
+
+#[cfg(target_os = "macos")]
+#[path = "gate_binding/native_macos.rs"]
+mod native_macos;

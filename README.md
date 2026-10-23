@@ -128,9 +128,16 @@ This is a limited local-development path, not Linux feature parity. The Tailnet
 helper and the `make prod` build path remain Linux-only. Configure a local
 `neige-app` installation with Tailnet disabled and `child.fe_dist` pointing to
 the absolute `fe/web/dist` path; the frontend is served at `/next/`.
-Registered workspace execution remains Linux-only. On macOS, `neige-app` uses
-the legacy supervisor service without provisioning executor keys or adding
-executor-only child arguments. Explicit registered-executor requests remain refused.
+New builds support native registered **Private ExternalDir + Pipe** execution
+on macOS for `task-verify`, `task-gate-run`, forge commands and probes, and the
+registered provider rewind checks. Claude turns and compaction now also use the
+registered executor; their completion owner accepts the same foreground
+settlement contract. This does not establish full native Claude feature parity.
+`neige-app` provisions one private executor key and passes it to both the kernel
+and supervisor. See [macOS execution](docs/macos-execution.md) for the supported
+scope, permission inheritance, cleanup limits, and isolated verification steps.
+Registered strong Worktree execution and registered PTY execution remain unsupported
+on macOS; the existing legacy terminal path remains available.
 Secure workspace file access requiring `openat2` and `/proc`-based process-group
 enumeration and descendant cleanup are not ported. Unsupported file operations
 fail closed; they never fall back to less restrictive filesystem access. This
@@ -154,10 +161,10 @@ leader exits there is no per-member straggler sweep: macOS has no `/proc`
 process-group enumeration. A member that ignores SIGTERM and outlives that
 leader can remain running; if it inherited the listening socket, the next
 daemon start can fail closed until that process and the socket are removed by
-hand. Gate execution (`task-verify` and `task-gate-run`) still requires Linux
-`/proc` to prove descendant cleanup. Native process identity does not provide
-that capability: macOS and other unsupported platforms return `gate-infra`
-before spawning a gate wrapper or executing any gate step.
+hand. Registered foreground execution uses a separate, continuously owned child
+handle and observes its original process group. This weaker macOS fact does not
+provide Linux's full descendant-drain proof. An already running installation does
+not gain these changes until it starts the newly built binaries.
 
 `cargo test -p calm-server --lib` as a whole is not expected to pass on macOS:
 some Linux-only fixtures are not `cfg`-gated. Only filtered subsets were run

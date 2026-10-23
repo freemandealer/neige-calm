@@ -1,12 +1,35 @@
 use super::*;
+#[cfg(target_os = "linux")]
 use crate::{
     execution::objects::{DirectoryContainment, HeldObjectComparison},
     identity::WorkspaceCwd,
 };
-use std::{
-    os::fd::{AsRawFd, OwnedFd},
-    process::Command,
-};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::process::Command;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_macos_private_directory_facts_do_not_qualify_as_strong_worktree() {
+    let temp = tempfile::tempdir().unwrap();
+    let held = HeldSourceObjects::open(temp.path(), false).unwrap();
+    assert_eq!(
+        held.shape().mount_namespace,
+        PlatformIdentity::MacOsPrivateDirectory
+    );
+    assert_eq!(
+        held.shape().objects[0].mount,
+        PlatformIdentity::MacOsPrivateDirectory
+    );
+    held.validate().unwrap();
+    assert!(matches!(
+        held.qualify_local(),
+        Err(ObjectQualificationFailure::Unsupported(
+            ObjectQualificationUnsupported::Platform
+        ))
+    ));
+    assert!(held.live_identity().is_err());
+}
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -162,11 +185,16 @@ fn object_qualification_missing_and_invalid_mount_records_are_unknown_only() {
     let table =
         MountTable::parse("17 1 8:1 / /scratch\\040directory rw shared:2 - ext4 /dev/test rw\n")
             .unwrap();
-    assert_eq!(table.get(17).unwrap().filesystem, "ext4");
+    assert_eq!(
+        table.get(PlatformIdentity::Linux(17)).unwrap().filesystem,
+        "ext4"
+    );
     assert!(matches!(
-        table.get(18),
+        table.get(PlatformIdentity::Linux(18)),
         Err(ObjectQualificationFailure::Unknown(
-            ObjectQualificationUnknown::MountInformationMissing { mount: 18 }
+            ObjectQualificationUnknown::MountInformationMissing {
+                mount: PlatformIdentity::Linux(18)
+            }
         ))
     ));
     for invalid in [
@@ -176,7 +204,7 @@ fn object_qualification_missing_and_invalid_mount_records_are_unknown_only() {
     ] {
         // Parsing is input validation only; no fake record is passed to the live qualifier.
         let parsed = MountTable::parse(invalid);
-        assert!(parsed.is_err() || parsed.unwrap().get(17).is_err());
+        assert!(parsed.is_err() || parsed.unwrap().get(PlatformIdentity::Linux(17)).is_err());
     }
 }
 

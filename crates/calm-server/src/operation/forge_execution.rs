@@ -386,7 +386,9 @@ pub(crate) fn eligible(probe: &Probe, settlement: &Settlement) -> bool {
         && matches!(probe.release, Release::Released { .. })
         && matches!(
             settlement,
-            Settlement::Journal(ExecutionState::Drained { .. })
+            Settlement::Journal(
+                ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. }
+            )
         )
 }
 pub(crate) async fn retire(tx: &mut Tx<'_>, op: &Operation) -> Result<()> {

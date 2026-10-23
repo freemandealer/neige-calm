@@ -379,6 +379,11 @@ fn main() {
         return;
     }
     if helper_args.get(1).map(String::as_str) == Some("--execution-supervisor") {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .init();
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

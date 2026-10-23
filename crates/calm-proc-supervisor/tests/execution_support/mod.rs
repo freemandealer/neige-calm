@@ -1,10 +1,16 @@
 use calm_session::control::{IoMode, execution::*};
+#[cfg(not(target_os = "macos"))]
+use std::process::Child;
 use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     time::Duration,
 };
+#[cfg(target_os = "macos")]
+mod native_child;
+#[cfg(target_os = "macos")]
+use native_child::SupervisorChild as Child;
 use workspace::identity::WorkspaceCwd;
 
 pub(super) struct Harness {
@@ -35,7 +41,7 @@ impl Harness {
         harness
     }
     pub(super) fn spawn(root: &Path, socket: &Path) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_calm-proc-supervisor"))
+        let child = Command::new(env!("CARGO_BIN_EXE_calm-proc-supervisor"))
             .arg("--control-sock")
             .arg(socket)
             .arg("--execution-state-dir")
@@ -45,10 +51,13 @@ impl Harness {
             .env("NEIGE_EXECUTION_AMBIENT_SENTINEL", "must-not-reach-target")
             .env("TOKIO_WORKER_THREADS", "2")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .unwrap()
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        let child = Child::new(child, root);
+        child
     }
     pub(super) async fn connect(&self) -> RegisteredExecutorConnection {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -92,11 +101,16 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        // This concrete child handle remains unreaped, so its PID cannot be reused.
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
+        #[cfg(target_os = "macos")]
+        self.child.close();
+        #[cfg(not(target_os = "macos"))]
+        {
+            // This concrete child handle remains unreaped, so its PID cannot be reused.
+            unsafe {
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+            let _ = self.child.wait();
         }
-        let _ = self.child.wait();
     }
 }
 

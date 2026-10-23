@@ -1,10 +1,17 @@
 //! C4.1 uses the production owner, Engine, SessionExecutor and real supervisor.
-use super::claude_planner_session_fixture::{Rig, request};
+use super::claude_planner_session_fixture::{RegisteredRig, Rig, request};
 use calm_server::{error::CalmError, provider_execution as owner};
 use calm_truth::db::sqlite::{provider_execution as sql, workspace_execution as executions};
 use provider::control::{CompactSubmission, EditPreparation};
 use std::{sync::Arc, time::Duration};
 use workspace_runtime::execution::*;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_macos_fake_provider_pipe_and_explicit_environment() {
+    c4_rewind_has_one_engine_construction();
+    c4_release_continues_partial_payload_writes();
+}
 
 async fn wait(mut ready: impl AsyncFnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -15,28 +22,28 @@ async fn wait(mut ready: impl AsyncFnMut() -> bool) {
     .await
     .expect("C4 progress");
 }
-fn script(rig: &Rig, source: &str) {
+fn script(rig: &RegisteredRig, source: &str) {
     std::fs::write(rig.bin("claude"), format!("#!/bin/sh\n{source}\n")).unwrap();
 }
-async fn claim(rig: &Rig) -> Option<sql::Claim> {
+async fn claim(rig: &RegisteredRig) -> Option<sql::Claim> {
     sql::load(rig.repo.db().read_pool(), &rig.worker_session_id)
         .await
         .unwrap()
 }
-async fn check(rig: &Rig) -> EditPreparation<CalmError> {
+async fn check(rig: &RegisteredRig) -> EditPreparation<CalmError> {
     rig.session()
         .prepare_edit_for_test(&rig.thread)
         .await
         .unwrap()
 }
-async fn sweep(rig: &Rig) {
+async fn sweep(rig: &RegisteredRig) {
     rig.host
         .provider_execution
         .sweep(rig.repo.db(), rig.host.execution.engine())
         .await
         .unwrap();
 }
-async fn desired(rig: &Rig, id: &ExecutionId) -> String {
+async fn desired(rig: &RegisteredRig, id: &ExecutionId) -> String {
     executions::load(rig.repo.db().read_pool(), id.as_str())
         .await
         .unwrap()
@@ -46,7 +53,7 @@ async fn desired(rig: &Rig, id: &ExecutionId) -> String {
 
 #[tokio::test]
 async fn c4_rewind_has_one_engine_construction() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     assert!(matches!(
         check(&rig).await,
         EditPreparation::Prepared { .. }
@@ -67,7 +74,7 @@ async fn c4_rewind_has_one_engine_construction() {
 
 #[tokio::test]
 async fn c4_rewind_refuses_unavailable_executor() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let session = rig.open_session_with_environment(vec![], None).await;
     assert!(matches!(
         session.prepare_edit_for_test(&rig.thread).await,
@@ -79,7 +86,7 @@ async fn c4_rewind_refuses_unavailable_executor() {
 
 #[tokio::test]
 async fn c4_rewind_credentials_never_enter_intent_or_journal() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(
         &rig,
         "printf '%s' \"$HTTP_PROXY\" > proxy-received; printf '%s' \"$HTTPS_PROXY\" > public-received; printf '%s' \"$ALL_PROXY\" > normalized-received; touch ready; while [ ! -f finish ]; do sleep 0.01; done; exit 0",
@@ -147,7 +154,7 @@ async fn c4_rewind_credentials_never_enter_intent_or_journal() {
 
 #[tokio::test]
 async fn c4_rewind_no_proxy_credentials_never_enter_intent_or_journal() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(
         &rig,
         "printf '%s' \"$NO_PROXY\" > upper-received; printf '%s' \"$no_proxy\" > lower-received; touch ready; while [ ! -f finish ]; do sleep 0.01; done; exit 0",
@@ -210,7 +217,7 @@ async fn c4_rewind_no_proxy_credentials_never_enter_intent_or_journal() {
 
 #[tokio::test]
 async fn c4_rewind_verdict_waits_for_settlement() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(
         &rig,
         "setsid sh -c 'echo escaped > descendant; sleep 0.3; echo done > drained' </dev/null >/dev/null 2>/dev/null &\nwhile [ ! -f descendant ]; do sleep 0.01; done\nexit 0",
@@ -234,7 +241,7 @@ async fn c4_rewind_verdict_waits_for_settlement() {
 
 #[tokio::test]
 async fn c4_rewind_timeout_stops_through_engine() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(&rig, "touch ready; exec sleep 120");
     let before = std::time::Instant::now();
     let result = check(&rig).await;
@@ -257,7 +264,7 @@ async fn c4_rewind_timeout_stops_through_engine() {
 
 #[tokio::test]
 async fn c4_dropped_rewind_request_is_stopped_by_sweep() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(&rig, "touch ready; exec sleep 120");
     let task = {
         let session = rig.session().clone();
@@ -358,7 +365,7 @@ touch ready; exec sleep 120"#,
 
 #[tokio::test]
 async fn c4_repeated_rewind_launches_with_distinct_execution_aliases() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     for _ in 0..2 {
         assert!(matches!(
             check(&rig).await,
@@ -377,7 +384,7 @@ async fn c4_repeated_rewind_launches_with_distinct_execution_aliases() {
     assert_eq!(rig.read_bin("checks").unwrap().lines().count(), 2);
 }
 
-async fn admit(rig: &Rig) -> (sql::Claim, owner::DriverGuard) {
+async fn admit(rig: &RegisteredRig) -> (sql::Claim, owner::DriverGuard) {
     let mut intent = test_support::intent(rig.dir.path().join("ws"));
     intent.metadata.consumer = "claude-planner".into();
     intent.metadata.alias = ProcessAlias(owner::sweep::alias(
@@ -400,7 +407,7 @@ async fn admit(rig: &Rig) -> (sql::Claim, owner::DriverGuard) {
 }
 #[tokio::test]
 async fn c4_provider_admission_is_exclusive_per_session() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let mut intent = test_support::intent(rig.dir.path().join("ws"));
     intent.metadata.consumer = "claude-planner".into();
@@ -435,7 +442,7 @@ async fn c4_provider_admission_is_exclusive_per_session() {
 
 #[tokio::test]
 async fn c4_inventory_err_never_drives_stop_retire_or_clear() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let id = owner::execution_id(old.record()).unwrap();
     drop(guard);
@@ -455,7 +462,7 @@ async fn c4_inventory_err_never_drives_stop_retire_or_clear() {
 
 #[tokio::test]
 async fn c4_orphan_execution_without_record_is_retired() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let id = owner::execution_id(old.record()).unwrap();
     drop(guard);
@@ -521,7 +528,7 @@ impl owner::ProviderExecutionOwner for CompletionProbe {
 }
 #[tokio::test]
 async fn c4_retire_only_after_settlement_and_owner_completion() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let id = owner::execution_id(old.record()).unwrap();
     let probe = Arc::new(CompletionProbe {
@@ -620,7 +627,7 @@ async fn c4_boot_stops_recorded_provider_execution() {
 
 #[tokio::test]
 async fn c4_planner_lost_post_commit_drive_recovers_by_tick() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let id = owner::execution_id(old.record()).unwrap();
     wait(async || {
@@ -678,7 +685,7 @@ async fn c4_planner_lost_post_commit_drive_recovers_by_tick() {
 }
 #[tokio::test]
 async fn c4_planner_committed_retire_recovers_by_tick() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (old, guard) = admit(&rig).await;
     let id = owner::execution_id(old.record()).unwrap();
     rig.host
@@ -731,7 +738,7 @@ async fn c4_planner_committed_retire_recovers_by_tick() {
 
 #[tokio::test]
 async fn c4_release_authorization_precedes_first_byte() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(&rig, "touch ready; exit 0");
     let pause = calm_server::test_seams::PausePoint::default();
     calm_server::test_seams::install_pause_for_test(
@@ -761,7 +768,7 @@ async fn c4_release_authorization_precedes_first_byte() {
 
 #[tokio::test]
 async fn c4_release_continues_partial_payload_writes() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(&rig, "printf '%s' \"$HTTP_PROXY\" > received; exit 0");
     let proxy = format!("http://{}:password@proxy.invalid", "u".repeat(12000));
     let session = rig
@@ -782,7 +789,7 @@ async fn c4_release_continues_partial_payload_writes() {
 
 #[tokio::test]
 async fn c4_rewind_proxy_override_order_is_preserved() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     script(&rig, "printf '%s' \"$HTTP_PROXY\" > received; exit 0");
     for (first, last) in [
         ("http://user:secret@proxy.invalid", "http://public.invalid"),

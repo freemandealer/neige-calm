@@ -243,11 +243,11 @@ fn spawn_with_pin(
     drop(report_writer);
     let pid = child.id();
     let pidfd = pin(pid)?;
-    let identity = NativeProcessIdentity {
+    let identity = NativeProcessIdentity::LinuxHelper(workspace::execution::LinuxProcessIdentity {
         pid,
         start_time_ticks: start_time(pid)?,
         nonce,
-    };
+    });
     nonblocking(input.as_raw_fd())?;
     let process = Arc::new(Process {
         ready: std::sync::atomic::AtomicBool::new(false),
@@ -403,11 +403,13 @@ mod tests {
             execution_id: ExecutionId::fresh().unwrap(),
             executor_boot: ExecutorBootId::fresh().unwrap(),
             nonce: CapabilityToken::fresh().unwrap(),
-            mechanism: ScopeMechanismIdentity {
-                executable_device: 0,
-                executable_inode: 0,
-                protocol_version: 1,
-            },
+            mechanism: ScopeMechanismIdentity::LinuxHelper(
+                workspace::execution::LinuxHelperIdentity {
+                    executable_device: 0,
+                    executable_inode: 0,
+                    protocol_version: 1,
+                },
+            ),
         };
         let specification = ExecutionSpecification {
             program: "/bin/true".into(),

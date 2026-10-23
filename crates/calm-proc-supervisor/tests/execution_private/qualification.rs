@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::{os::unix::fs::MetadataExt, path::Path, process::Command};
 #[cfg(target_os = "linux")]
 #[test]

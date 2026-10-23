@@ -124,8 +124,10 @@ impl Executor {
                 );
                 // Settlement released the private source. Authenticate the retained receipt above,
                 // but do not resolve that source again for an exact terminal retry.
-                if matches!(record.phase.state(), ExecutionState::Drained { .. })
-                    && record.durably_settled()
+                if matches!(
+                    record.phase.state(),
+                    ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. }
+                ) && record.durably_settled()
                 {
                     return Ok(ExecutionReply::ActionComplete);
                 }

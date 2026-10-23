@@ -75,12 +75,7 @@ impl ProviderExecutionOwner for Owner {
         match &record.purpose {
             Purpose::RewindCheck => {}
             Purpose::Turn { turn_id } | Purpose::Compaction { turn_id } => {
-                let terminal = matches!(
-                    &evidence,
-                    CompletionEvidence::Settled(Settlement::Journal(
-                        ExecutionState::Drained { .. }
-                    ))
-                );
+                let terminal = foreground_settled(&evidence);
                 match known {
                     Some(KnownEnd::ClaudeTurn(mut end)) => {
                         if end.turn != *turn_id || end.shared.params.worker_session_id != session {
@@ -374,4 +369,52 @@ pub(super) async fn intent(
         },
         payload,
     ))
+}
+
+// Claude runs as a foreground command. This consumer accepts platform-specific
+// settlement without turning an original-group observation into a descendant proof.
+fn foreground_settled(evidence: &CompletionEvidence) -> bool {
+    matches!(
+        evidence,
+        CompletionEvidence::Settled(Settlement::Journal(
+            ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. }
+        ))
+    )
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn native_macos_foreground_completion_is_terminal() {
+        // Protocol success must not become Interrupted just because the host is Mac.
+        for status in [Some(0), Some(1), None] {
+            assert!(foreground_settled(&CompletionEvidence::Settled(
+                Settlement::Journal(ExecutionState::OriginalGroupEmpty { status })
+            )));
+            assert!(foreground_settled(&CompletionEvidence::Settled(
+                Settlement::Journal(ExecutionState::Drained { status })
+            )));
+        }
+    }
+
+    #[test]
+    fn foreground_completion_requires_confirmed_settlement() {
+        assert!(!foreground_settled(&CompletionEvidence::Unconfirmed));
+        for state in [
+            ExecutionState::Exited { status: Some(0) },
+            ExecutionState::Unknown {
+                reason: "lost ownership".into(),
+            },
+            ExecutionState::NoChild {
+                reason: "not launched".into(),
+            },
+            ExecutionState::Revoked,
+        ] {
+            assert!(!foreground_settled(&CompletionEvidence::Settled(
+                Settlement::Journal(state)
+            )));
+        }
+    }
 }

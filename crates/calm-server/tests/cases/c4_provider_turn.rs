@@ -1,6 +1,6 @@
 //! Claude turns and compaction use the real Engine -> SessionExecutor -> executor rig.
 use super::claude_planner_session_fixture::{
-    Rig, client_id, completed_turn, request, until_completed,
+    RegisteredRig, Rig, client_id, completed_turn, request, until_completed,
 };
 use calm_server::planner_permission_mode::PlannerPermissionMode;
 use calm_truth::db::sqlite::provider_execution as sql;
@@ -10,7 +10,7 @@ use provider::{
 };
 use std::time::Duration;
 
-async fn cleared(rig: &Rig) {
+async fn cleared(rig: &RegisteredRig) {
     tokio::time::timeout(Duration::from_secs(15), async {
         while sql::load(rig.repo.pool(), &rig.worker_session_id)
             .await
@@ -23,7 +23,7 @@ async fn cleared(rig: &Rig) {
     .await
     .unwrap();
 }
-async fn turn(rig: &Rig) -> String {
+async fn turn(rig: &RegisteredRig) -> String {
     let mut events = rig.session().subscribe_events();
     let start = rig
         .session()
@@ -48,7 +48,7 @@ async fn turn(rig: &Rig) -> String {
     cleared(rig).await;
     turn.into_string()
 }
-async fn aliases(rig: &Rig, count: usize) {
+async fn aliases(rig: &RegisteredRig, count: usize) {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT execution_id, alias FROM workspace_executions")
             .fetch_all(rig.repo.pool())
@@ -81,8 +81,12 @@ async fn c4_rewind_then_turn_launches_with_distinct_execution_aliases() {
 }
 #[tokio::test]
 async fn c4_turn_compaction_turn_launches_with_distinct_execution_aliases() {
-    let rig = Rig::new("exit").await;
-    turn(&rig).await;
+    let rig = RegisteredRig::new("exit").await;
+    turn_compaction_turn(&rig).await;
+}
+
+pub(super) async fn turn_compaction_turn(rig: &RegisteredRig) {
+    turn(rig).await;
     std::fs::write(rig.bin("scenario"), "compact").unwrap();
     let mut events = rig.session().subscribe_events();
     assert!(matches!(
@@ -95,10 +99,10 @@ async fn c4_turn_compaction_turn_launches_with_distinct_execution_aliases() {
         completed_turn(&until_completed(&mut events).await)["status"],
         "completed"
     );
-    cleared(&rig).await;
+    cleared(rig).await;
     std::fs::write(rig.bin("scenario"), "exit").unwrap();
-    turn(&rig).await;
-    aliases(&rig, 3).await;
+    turn(rig).await;
+    aliases(rig, 3).await;
     assert_eq!(rig.read_bin("spawns").unwrap().lines().count(), 3);
     assert_eq!(
         rig.outcomes().await.len(),

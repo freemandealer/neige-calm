@@ -102,6 +102,9 @@ pub(super) fn run_with_command_hook(
     let mechanism = match &plan {
         HelperPlan::Execution { context, .. } => &context.mechanism,
     };
+    let ScopeMechanismIdentity::LinuxHelper(mechanism) = &mechanism else {
+        anyhow::bail!("native group is not a Linux helper mechanism");
+    };
     anyhow::ensure!(
         mechanism.executable_device == image.dev()
             && mechanism.executable_inode == image.ino()

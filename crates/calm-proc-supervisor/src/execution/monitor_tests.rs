@@ -33,7 +33,7 @@ async fn retire_waits_output_open() {
     )
     .unwrap();
     drop(real_reports);
-    let pid = native.pid;
+    let pid = native.pid();
     let receipt = ExecutionReceipt {
         identity: identity.clone(),
         slot_version: 1,
@@ -187,11 +187,12 @@ async fn c2a_live_unknown_refuses_interaction_without_closing_writer() {
         })
         .unwrap();
         let image = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
-        Arc::get_mut(&mut executor).unwrap().mechanism = ScopeMechanismIdentity {
-            executable_device: image.dev(),
-            executable_inode: image.ino(),
-            protocol_version: 1,
-        };
+        Arc::get_mut(&mut executor).unwrap().mechanism =
+            ScopeMechanismIdentity::LinuxHelper(workspace::execution::LinuxHelperIdentity {
+                executable_device: image.dev(),
+                executable_inode: image.ino(),
+                protocol_version: 1,
+            });
         let (mut request, held) = protocol_tests::private(&executor, temp.path());
         request.specification.program = "/bin/sh".into();
         request.specification.args =
@@ -233,7 +234,7 @@ async fn c2a_live_unknown_refuses_interaction_without_closing_writer() {
         // End the actual helper report stream without a drain proof. The monitor must
         // retain Unknown and the native Process; no synthetic phase transition.
         assert_eq!(
-            unsafe { libc::kill(receipt.process.pid as i32, libc::SIGKILL) },
+            unsafe { libc::kill(receipt.process.pid() as i32, libc::SIGKILL) },
             0
         );
         loop {
