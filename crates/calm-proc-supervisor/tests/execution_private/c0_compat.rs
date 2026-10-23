@@ -74,8 +74,11 @@ async fn recover(changed_boot: bool, settled: bool, shared: bool) {
     }
     h.child.wait().unwrap();
     let mut old = if settled { journal(&h, &r) } else { active };
-    // Frozen pre-C0 JSON contracts, deliberately independent of the new wire constant.
-    assert_eq!(old["version"], 4);
+    // Linux v5 retains the v4 JSON payload (the frozen serializer fixture is checked
+    // in execution::journal::contract_tests). Replay it with the released v4 envelope,
+    // keeping this test's real directory, capabilities and output log bindings.
+    assert_eq!(old["version"], 5);
+    old["version"] = 4.into();
     if changed_boot {
         old["host_boot_id"] = "pre-upgrade-host-boot".into();
     }
@@ -121,6 +124,11 @@ async fn recover(changed_boot: bool, settled: bool, shared: bool) {
     } else {
         c.prepare_private(r.clone(), &held).await.unwrap()
     };
+    assert_eq!(
+        journal(&h, &r)["version"],
+        5,
+        "v4 journal must normalize on open"
+    );
     if !changed_boot && !settled {
         assert!(
             matches!(replay, ExecutionReply::Receipt { state: ExecutionState::Unknown { .. }, receipt: Some(ref original) } if original == &receipt)

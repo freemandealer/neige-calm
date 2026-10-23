@@ -115,7 +115,9 @@ impl TaskVerifyAdapter {
         };
         let drained = matches!(
             settled,
-            Some(Settlement::Journal(ExecutionState::Drained { .. }))
+            Some(Settlement::Journal(
+                ExecutionState::Drained { .. } | ExecutionState::OriginalGroupEmpty { .. }
+            ))
         );
         let verdict = match record.decision {
             Decision::Stopping {
@@ -131,9 +133,12 @@ impl TaskVerifyAdapter {
                 frozen.attempt,
             ),
             Decision::Observing => match settled {
-                Some(Settlement::Journal(ExecutionState::Drained {
-                    status: Some(code), ..
-                })) => verdict_from_exit_code(code, &evidence, frozen.attempt),
+                Some(Settlement::Journal(
+                    ExecutionState::Drained {
+                        status: Some(code), ..
+                    }
+                    | ExecutionState::OriginalGroupEmpty { status: Some(code) },
+                )) => verdict_from_exit_code(code, &evidence, frozen.attempt),
                 _ => infra_verdict("execution has no child status", &evidence, frozen.attempt),
             },
         };

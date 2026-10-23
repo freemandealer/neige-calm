@@ -1,6 +1,8 @@
 //! Execution identity and sealed executor inputs. Kernel policy supplies authorization.
 
+mod native;
 pub mod objects;
+pub use native::*;
 
 use std::{fmt, io::Read};
 
@@ -127,21 +129,6 @@ pub struct ExecutionIdentity {
     pub operation_id: String,
     pub specification_id: SpecificationId,
     pub process_alias: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeProcessIdentity {
-    /// The owned scope helper; payload PID/PGID values are not control targets.
-    pub pid: u32,
-    pub start_time_ticks: u64,
-    pub nonce: CapabilityToken,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScopeMechanismIdentity {
-    pub executable_device: u64,
-    pub executable_inode: u64,
-    pub protocol_version: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

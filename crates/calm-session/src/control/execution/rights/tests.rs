@@ -25,7 +25,7 @@ async fn execution_ancillary_fragmentation_and_coalesced_frames_preserve_rights_
         }
         send(&sender, &"next", &[]).await.unwrap();
     });
-    let (value, files) = receive::<String>(&receiver).await.unwrap();
+    let (value, files) = bounded(receive::<String>(&receiver)).await.unwrap();
     assert_eq!(value.len(), 65536);
     assert_eq!(files.len(), 1);
     let flags = unsafe { libc::fcntl(files[0].as_raw_fd(), libc::F_GETFD) };
@@ -36,7 +36,7 @@ async fn execution_ancillary_fragmentation_and_coalesced_frames_preserve_rights_
             .unwrap()
             .is_dir()
     );
-    let (next, files) = receive::<String>(&receiver).await.unwrap();
+    let (next, files) = bounded(receive::<String>(&receiver)).await.unwrap();
     assert_eq!(next, "next");
     assert!(files.is_empty());
     task.await.unwrap();
@@ -59,7 +59,7 @@ async fn execution_ancillary_truncation_closes_all_received_descriptors() {
     );
     drop(files);
     drop(passed);
-    assert!(receive::<String>(&receiver).await.is_err());
+    assert!(bounded(receive::<String>(&receiver)).await.is_err());
     let mut byte = [0];
     assert_eq!(
         peer.read(&mut byte).unwrap(),
@@ -81,7 +81,7 @@ async fn execution_ancillary_rights_in_middle_of_frame_are_rejected_and_closed()
         1
     );
     drop(passed);
-    assert!(receive::<String>(&receiver).await.is_err());
+    assert!(bounded(receive::<String>(&receiver)).await.is_err());
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
 }
 #[tokio::test]
@@ -97,6 +97,75 @@ async fn execution_ancillary_peer_crash_mid_frame_closes_transferred_objects() {
     );
     drop(passed);
     drop(sender);
-    assert!(receive::<String>(&receiver).await.is_err());
+    assert!(bounded(receive::<String>(&receiver)).await.is_err());
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(2), future)
+        .await
+        .expect("ancillary receive exceeded deadline")
+}
+
+#[tokio::test]
+async fn execution_ancillary_reply_rights_are_rejected_without_inheritance() {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let (passed, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    send(&sender, &"reply", &[passed.as_fd()]).await.unwrap();
+    drop(passed);
+    assert!(
+        bounded(receive_without_rights::<String>(&receiver))
+            .await
+            .is_err()
+    );
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn execution_ancillary_rights_on_last_byte_are_rejected_and_closed() {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let (passed, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let bytes = frame("tail");
+    sender.writable().await.unwrap();
+    assert_eq!(
+        send_once(&sender, &bytes[..bytes.len() - 1], &[]).unwrap(),
+        bytes.len() - 1
+    );
+    assert_eq!(
+        send_once(&sender, &bytes[bytes.len() - 1..], &[passed.as_fd()]).unwrap(),
+        1
+    );
+    drop(passed);
+    assert!(bounded(receive::<String>(&receiver)).await.is_err());
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn execution_ancillary_later_rejection_closes_first_byte_rights_too() {
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let (first, mut first_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (later, mut later_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    for peer in [&first_peer, &later_peer] {
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+    }
+    let bytes = frame("misplaced");
+    sender.writable().await.unwrap();
+    assert_eq!(
+        send_once(&sender, &bytes[..1], &[first.as_fd()]).unwrap(),
+        1
+    );
+    assert_eq!(
+        send_once(&sender, &bytes[1..2], &[later.as_fd()]).unwrap(),
+        1
+    );
+    drop(first);
+    drop(later);
+    assert!(bounded(receive::<String>(&receiver)).await.is_err());
+    assert_eq!(first_peer.read(&mut [0]).unwrap(), 0);
+    assert_eq!(later_peer.read(&mut [0]).unwrap(), 0);
 }

@@ -21,7 +21,7 @@ impl RegisteredExecutorConnection {
         )
         .await?;
         let (reply, descriptors) =
-            rights::receive::<super::super::ControlReply>(&self.stream).await?;
+            rights::receive_without_rights::<super::super::ControlReply>(&self.stream).await?;
         if !descriptors.is_empty() {
             return Err(io::Error::other("unexpected prepare descriptors"));
         }

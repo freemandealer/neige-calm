@@ -11,6 +11,7 @@ use std::{
 pub(super) struct OutputLog {
     data: Mutex<Data>,
     wake: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    stop_reader: std::sync::atomic::AtomicBool,
     reader_end: tokio::sync::watch::Sender<Option<Result<(), String>>>,
 }
 struct Data {
@@ -32,6 +33,7 @@ impl OutputLog {
         let cursor = file.metadata()?.len();
         let (reader_end, _) = tokio::sync::watch::channel(None);
         Ok(Arc::new(Self {
+            stop_reader: std::sync::atomic::AtomicBool::new(false),
             wake: Mutex::new(None),
             data: Mutex::new(Data {
                 file,
@@ -71,6 +73,9 @@ impl OutputLog {
             let mut bytes = [0; 8192];
             let mut failure = None;
             let result = loop {
+                if log.stop_reader.load(std::sync::atomic::Ordering::SeqCst) {
+                    break Err("output remained open beyond native completion budget".into());
+                }
                 match reader.read(&mut bytes) {
                     Ok(0) => break Ok(()),
                     Ok(count) => {
@@ -99,6 +104,18 @@ impl OutputLog {
             log.reader_end
                 .send_replace(Some(failure.map_or(result, Err)));
         });
+    }
+    #[cfg(target_os = "macos")]
+    pub async fn finish_bounded(&self, budget: std::time::Duration) -> OutputEnd {
+        match tokio::time::timeout(budget, self.finish()).await {
+            Ok(end) => end,
+            Err(_) => {
+                self.stop_reader
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // The native reader is nonblocking and polls for at most 100ms.
+                self.finish().await
+            }
+        }
     }
     /// Called only after persisted Drained and helper reap; never while holding a scope gate.
     pub async fn finish(&self) -> OutputEnd {
@@ -133,6 +150,25 @@ impl OutputLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_macos_output_held_open_finishes_incomplete_within_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = OutputLog::open(&temp.path().join("log"), 1024).unwrap();
+        // A private held writer reproduces missing EOF without creating an escaped child.
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let fd: std::os::fd::OwnedFd = reader.into();
+        log.read(File::from(fd), false);
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            log.finish_bounded(std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("native output reader must end even without EOF");
+        assert!(matches!(end, OutputEnd::Incomplete { .. }), "{end:?}");
+    }
 
     #[tokio::test]
     async fn output_read_error_is_incomplete() {

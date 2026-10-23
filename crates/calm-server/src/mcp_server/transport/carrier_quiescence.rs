@@ -18,7 +18,7 @@ pub struct ToolCallGuard {
     identity: Arc<()>,
 }
 impl ToolCallAdmission {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux", feature = "fixtures"))]
     pub(crate) fn entry_count(&self) -> usize {
         self.0.lock().expect("tool admission").len()
     }

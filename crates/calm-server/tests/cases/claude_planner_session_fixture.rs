@@ -4,7 +4,9 @@
 //!
 //! Safety: every rig mints a fresh `data_dir` (so a fresh marker instance) and a fresh worker
 //! session id, so the host-wide sweep of one test can only match processes that test started. The
-//! rig's `Drop` kills whatever still carries its own marker.
+//! default `Rig` kills whatever still carries its own marker. Registered-only tests use
+//! `RegisteredRig`: its execution fixture owns supervisor shutdown and payload reap. Both
+//! variants share the same session, host and database construction below.
 
 use calm_types::organization::LEGACY_OWNER_USER_ID;
 use std::collections::HashSet;
@@ -45,6 +47,51 @@ pub const P_D_FIXTURE: &str = concat!(
 );
 
 pub struct Rig {
+    registered: RegisteredRig,
+}
+
+impl Rig {
+    pub async fn new(scenario: &str) -> Self {
+        Self::with_instructions(scenario, "Planner instructions for the fake.").await
+    }
+
+    pub async fn with_instructions(scenario: &str, instructions: &str) -> Self {
+        Self {
+            registered: RegisteredRig::with_execution_interval(
+                scenario,
+                instructions,
+                Duration::from_secs(1),
+            )
+            .await,
+        }
+    }
+
+    pub fn marker(&self) -> String {
+        self.host.instance.marker(&self.worker_session_id)
+    }
+
+    /// Live (non-zombie) processes carrying this rig's exact marker.
+    pub fn marked_pids(&self) -> Vec<i32> {
+        self.marked().into_iter().map(|(pid, _)| pid).collect()
+    }
+
+    fn marked(&self) -> Vec<(i32, u64)> {
+        marked(&HashSet::from([self.marker()]))
+    }
+}
+
+impl std::ops::Deref for Rig {
+    type Target = RegisteredRig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.registered
+    }
+}
+
+/// For tests whose commands all run through the registered executor, including turns,
+/// compaction and rewind. Tests that inspect the Linux marker lifecycle use `Rig`.
+/// This owns the existing execution fixture directly; it has no legacy marker cleanup.
+pub struct RegisteredRig {
     _execution: crate::support::execution::Fixture,
     pub dir: tempfile::TempDir,
     /// The held-request channel every session of this rig is installed with, as a harness's is.
@@ -62,18 +109,45 @@ pub struct Rig {
     pub thread: String,
 }
 
-impl Rig {
+impl RegisteredRig {
     pub async fn new(scenario: &str) -> Self {
-        Self::with_instructions(scenario, "Planner instructions for the fake.").await
-    }
-
-    pub async fn with_instructions(scenario: &str, instructions: &str) -> Self {
-        Self::with_execution_interval(scenario, instructions, Duration::from_secs(1)).await
+        Self::with_execution_interval(
+            scenario,
+            "Planner instructions for the fake.",
+            Duration::from_secs(1),
+        )
+        .await
     }
     pub async fn with_execution_interval(
         scenario: &str,
         instructions: &str,
         interval: Duration,
+    ) -> Self {
+        Self::build(scenario, instructions, interval, |owner| owner).await
+    }
+
+    pub async fn with_completion_owner(
+        scenario: &str,
+        wrap: impl FnOnce(
+            Arc<dyn calm_server::provider_execution::ProviderExecutionOwner>,
+        ) -> Arc<dyn calm_server::provider_execution::ProviderExecutionOwner>,
+    ) -> Self {
+        Self::build(
+            scenario,
+            "Planner instructions for the fake.",
+            Duration::from_secs(1),
+            wrap,
+        )
+        .await
+    }
+
+    async fn build(
+        scenario: &str,
+        instructions: &str,
+        interval: Duration,
+        wrap: impl FnOnce(
+            Arc<dyn calm_server::provider_execution::ProviderExecutionOwner>,
+        ) -> Arc<dyn calm_server::provider_execution::ProviderExecutionOwner>,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("bin");
@@ -95,15 +169,15 @@ impl Rig {
             claude_version: "2.1.280".into(),
             config_dir: dir.path().join("claude-config"),
         };
-        let host = Arc::new(
-            ClaudePlannerHost::new(
-                Some(config),
-                &data,
-                PathBuf::from("/nonexistent/neige-mcp-stdio-shim"),
-                dir.path().join("mcp.sock"),
-            )
-            .expect("host"),
-        );
+        let mut host = ClaudePlannerHost::new(
+            Some(config),
+            &data,
+            PathBuf::from("/nonexistent/neige-mcp-stdio-shim"),
+            dir.path().join("mcp.sock"),
+        )
+        .expect("host");
+        host.provider_execution.owner = wrap(host.provider_execution.owner.clone());
+        let host = Arc::new(host);
         host.execution
             .bind(Arc::new(execution.lifecycle.engine().unwrap().clone()));
         let daemon = SharedCodexAppServer::new_stub(repo.clone());
@@ -146,6 +220,10 @@ impl Rig {
 
     pub fn assert_execution_journal_excludes(&self, needle: &str) {
         self._execution.assert_journal_excludes(needle);
+    }
+
+    pub fn execution_cleanup_probe(&self) -> crate::support::execution::CleanupProbe {
+        self._execution.cleanup_probe()
     }
 
     pub fn execution_journal_contains(&self, needle: &str) -> bool {
@@ -260,19 +338,6 @@ impl Rig {
 
     pub fn read_bin(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.bin(name)).ok()
-    }
-
-    pub fn marker(&self) -> String {
-        self.host.instance.marker(&self.worker_session_id)
-    }
-
-    /// Live (non-zombie) processes carrying this rig's exact marker.
-    pub fn marked_pids(&self) -> Vec<i32> {
-        self.marked().into_iter().map(|(pid, _)| pid).collect()
-    }
-
-    fn marked(&self) -> Vec<(i32, u64)> {
-        marked(&HashSet::from([self.marker()]))
     }
 
     pub fn instructions_files(&self) -> Vec<PathBuf> {

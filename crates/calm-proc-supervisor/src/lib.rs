@@ -1,7 +1,7 @@
 mod child_environment;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod execution;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "execution_unsupported.rs"]
 pub mod execution;
 
@@ -1365,11 +1365,22 @@ async fn try_spawn_pipe(
     // Tokio may fail building its child handle after std::process::Command has
     // successfully exec'd (Tokio 1.52.3 process/mod.rs and unix::build_child).
     // An opaque spawn error therefore cannot prove that no child was created.
+    #[cfg(target_os = "macos")]
+    let inheritance =
+        calm_session::control::execution::rights::inheritance_guard().map_err(|e| {
+            EnsureProcFailure {
+                disposition: calm_session::control::SpawnFailedDisposition::NoChildCreated,
+                error: e.to_string(),
+                child_already_reaped: false,
+            }
+        })?;
     let child = cmd.spawn().map_err(|e| EnsureProcFailure {
         disposition: calm_session::control::SpawnFailedDisposition::Unknown,
         error: format!("spawn pty bootstrap process: {e}"),
         child_already_reaped: false,
     })?;
+    #[cfg(target_os = "macos")]
+    drop(inheritance);
     drop(ready_writer);
 
     // Hard-fail rather than `unwrap_or_default()`: a pid of 0 becomes `Pgid(0)` and shutdown would `kill(-0, SIGTERM)` the supervisor's own process group. Unreachable on unix today.
@@ -1490,6 +1501,15 @@ async fn try_spawn_pty(
     // successful spawn. This proves no executable child, not no fork. Re-audit
     // on portable-pty/Rust upgrades; Tokio's pipe spawn above differs because
     // its async handle construction can fail after successful exec.
+    #[cfg(target_os = "macos")]
+    let inheritance =
+        calm_session::control::execution::rights::inheritance_guard().map_err(|e| {
+            EnsureProcFailure {
+                disposition: calm_session::control::SpawnFailedDisposition::NoChildCreated,
+                error: e.to_string(),
+                child_already_reaped: false,
+            }
+        })?;
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1498,6 +1518,8 @@ async fn try_spawn_pty(
             error: format!("spawn pty child for {}: {e}", request.proc_id),
             child_already_reaped: false,
         })?;
+    #[cfg(target_os = "macos")]
+    drop(inheritance);
     drop(pair.slave);
 
     // Hard-fail rather than `unwrap_or_default()`: a pid of 0 makes `kill(-0, sig)` signal the supervisor's own process group. Unreachable on unix today.

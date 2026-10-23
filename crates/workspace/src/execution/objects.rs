@@ -1,5 +1,7 @@
 //! Live object leases. Serialized facts are validation inputs, never reopened leases.
 mod containment;
+mod platform;
+pub use platform::PlatformIdentity;
 mod qualification;
 mod relation;
 pub use containment::{
@@ -45,7 +47,7 @@ pub struct ObjectFact {
     pub role: ObjectRole,
     pub device: u64,
     pub inode: u64,
-    pub mount: u64,
+    pub mount: PlatformIdentity,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkFact {
@@ -74,7 +76,7 @@ pub enum ObjectLayout {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectShape {
     pub root: PathBuf,
-    pub mount_namespace: u64,
+    pub mount_namespace: PlatformIdentity,
     pub layout: ObjectLayout,
     pub objects: Vec<ObjectFact>,
 }
@@ -83,7 +85,7 @@ pub struct ObjectShape {
 /// This is never a serialized authority or Ready proof.
 #[derive(Clone, Debug)]
 pub struct HeldRootKey<'lease> {
-    namespace: u64,
+    namespace: PlatformIdentity,
     root: ObjectFact,
     lease: std::marker::PhantomData<&'lease HeldSourceObjects>,
 }
@@ -149,6 +151,12 @@ pub struct HeldSourceObjects {
 impl HeldSourceObjects {
     /// Trusted registration owner opens once, then transfers these exact held descriptions.
     pub fn open(root: &Path, worktree: bool) -> io::Result<Self> {
+        if cfg!(target_os = "macos") && worktree {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "macOS supports private ExternalDir only",
+            ));
+        }
         let namespace = NamespaceContext::capture()?;
         let mut files = vec![open_directory(root)?];
         let mut roles = vec![ObjectRole::Root];
@@ -207,6 +215,12 @@ impl HeldSourceObjects {
     }
     /// Ownership transfers only from recvmsg. No path-open may fill a missing role.
     pub fn receive(shape: ObjectShape, descriptors: Vec<OwnedFd>) -> io::Result<Self> {
+        if cfg!(target_os = "macos") && !matches!(shape.layout, ObjectLayout::ExternalDir) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "macOS supports private ExternalDir only",
+            ));
+        }
         let held = Self {
             shape,
             files: descriptors.into_iter().map(File::from).collect(),
@@ -411,6 +425,7 @@ fn read_link(file: &File) -> io::Result<Vec<u8>> {
     file.read_exact_at(&mut bytes, 0)?;
     Ok(bytes)
 }
+#[cfg(target_os = "linux")]
 fn fact(file: &File, role: ObjectRole) -> io::Result<ObjectFact> {
     let stat = file.metadata()?;
     let info = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", file.as_raw_fd()))?;
@@ -425,11 +440,13 @@ fn fact(file: &File, role: ObjectRole) -> io::Result<ObjectFact> {
         role,
         device: stat.dev(),
         inode: stat.ino(),
-        mount,
+        mount: PlatformIdentity::Linux(mount),
     })
 }
-fn namespace() -> io::Result<u64> {
-    Ok(qualification::namespace_file()?.metadata()?.ino())
+fn namespace() -> io::Result<PlatformIdentity> {
+    Ok(PlatformIdentity::Linux(
+        qualification::namespace_file()?.metadata()?.ino(),
+    ))
 }
 fn git_path(root: &Path, flag: &str) -> io::Result<PathBuf> {
     let output = crate::command::neige_git_command()
@@ -454,10 +471,25 @@ fn open_named_object(path: &Path) -> io::Result<File> {
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_named_object(_: &Path) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "held executor objects require Linux",
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn fact(file: &File, role: ObjectRole) -> io::Result<ObjectFact> {
+    let stat = file.metadata()?;
+    Ok(ObjectFact {
+        role,
+        device: stat.dev(),
+        inode: stat.ino(),
+        mount: PlatformIdentity::MacOsPrivateDirectory,
+    })
+}
+#[cfg(target_os = "macos")]
+fn open_named_object(path: &Path) -> io::Result<File> {
+    open_directory(path)
 }

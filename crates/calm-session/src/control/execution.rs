@@ -10,9 +10,9 @@ use super::{IoMode, ProcSignal};
 
 pub mod attachment;
 mod attachment_client;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod rights;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "execution/rights_unsupported.rs"]
 pub mod rights;
 mod watch;
@@ -22,7 +22,7 @@ pub use watch::ExecutionWatcher;
 pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 pub const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
 
-pub const EXECUTION_ENVELOPE_VERSION: u32 = 9;
+pub const EXECUTION_ENVELOPE_VERSION: u32 = 10;
 
 /// Persisted registration receipt contract; independent of bincode wire ordinals.
 pub const PERSISTED_RECEIPT_CONTRACT_VERSION: u32 = 4;
@@ -204,17 +204,33 @@ pub enum ExecutionState {
     Revoked,
     Forking,
     Spawned,
-    Exited { status: Option<i32> },
-    Drained { status: Option<i32> },
-    NoChild { reason: String },
-    Unknown { reason: String },
+    Exited {
+        status: Option<i32>,
+    },
+    Drained {
+        status: Option<i32>,
+    },
+    NoChild {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+    /// Owned root exited and its pinned original process group was observed empty.
+    /// Does not prove absence of descendants which deliberately left that group.
+    OriginalGroupEmpty {
+        status: Option<i32>,
+    },
 }
 
 impl ExecutionState {
     pub fn permits_handoff(&self) -> bool {
         matches!(
             self,
-            Self::Revoked | Self::Drained { .. } | Self::NoChild { .. }
+            Self::Revoked
+                | Self::Drained { .. }
+                | Self::OriginalGroupEmpty { .. }
+                | Self::NoChild { .. }
         )
     }
 }
@@ -441,7 +457,8 @@ impl RegisteredExecutorConnection {
             &[],
         )
         .await?;
-        let (message, descriptors) = rights::receive::<super::ControlReply>(&self.stream).await?;
+        let (message, descriptors) =
+            rights::receive_without_rights::<super::ControlReply>(&self.stream).await?;
         if !descriptors.is_empty() {
             return Err(std::io::Error::other("unexpected response descriptors"));
         }

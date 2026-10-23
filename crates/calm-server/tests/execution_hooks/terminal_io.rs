@@ -235,6 +235,9 @@ async fn legacy_renderer_never_claims_typed_alias() {
     assert!(term.is_typed(f.repo.as_ref()).await.unwrap());
 }
 
+// Registered PTY and Drained-before-output-EOF are Linux contracts. Native Mac
+// explicitly refuses registered PTY and requires complete output for settlement.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn renderer_drained_waits_for_output_eof_and_feeds_tail_before_exit() {
     use std::io::Write;

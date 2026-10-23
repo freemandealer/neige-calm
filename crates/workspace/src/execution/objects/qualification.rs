@@ -1,10 +1,15 @@
 //! Local held-object semantics, not authorization, Ready, ancestry or backing independence.
-use super::{HeldObjectIdentity, HeldRootKey, HeldSourceObjects, ObjectFact, ObjectRole, fact};
+use super::{
+    HeldObjectIdentity, HeldRootKey, HeldSourceObjects, ObjectFact, ObjectRole, PlatformIdentity,
+    fact,
+};
 mod directory_pair;
 pub use directory_pair::{QualifiedDirectoryPair, qualify_directory_pair};
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs::File, io, os::unix::fs::MetadataExt};
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
+use std::{collections::HashMap, fs::File, io};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalObjectProfile {
@@ -28,12 +33,12 @@ pub enum ObjectQualificationUnsupported {
         filesystem: String,
     },
     CwdMountBoundary {
-        root: u64,
-        cwd: u64,
+        root: PlatformIdentity,
+        cwd: PlatformIdentity,
     },
     DirectoryMountBoundary {
-        ancestor: u64,
-        subject: u64,
+        ancestor: PlatformIdentity,
+        subject: PlatformIdentity,
     },
 }
 
@@ -56,10 +61,10 @@ pub enum ObjectQualificationUnknown {
     RoleClosureChanged,
     ObjectChanged(ObjectRole),
     MountInformationMissing {
-        mount: u64,
+        mount: PlatformIdentity,
     },
     MountInformationChanged {
-        mount: u64,
+        mount: PlatformIdentity,
     },
     InvalidMountInformation,
     CwdChanged,
@@ -86,27 +91,44 @@ fn unknown_io(stage: ObjectQualificationStage, error: io::Error) -> ObjectQualif
 
 /// A passive retained current namespace. It is never transferred as an arbitrary join target.
 pub(super) struct NamespaceContext {
+    #[cfg(not(target_os = "macos"))]
     file: File,
 }
 
 impl NamespaceContext {
     pub fn capture() -> io::Result<Self> {
         Ok(Self {
+            #[cfg(not(target_os = "macos"))]
             file: namespace_file()?,
         })
     }
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
+            #[cfg(not(target_os = "macos"))]
             file: self.file.try_clone()?,
         })
     }
-    pub fn inode(&self) -> io::Result<u64> {
-        Ok(self.file.metadata()?.ino())
+    pub fn inode(&self) -> io::Result<PlatformIdentity> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(PlatformIdentity::MacOsPrivateDirectory)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(PlatformIdentity::Linux(self.file.metadata()?.ino()))
+        }
     }
     pub fn matches_current(&self) -> io::Result<bool> {
-        let expected = self.file.metadata()?;
-        let actual = namespace_file()?.metadata()?;
-        Ok((expected.dev(), expected.ino()) == (actual.dev(), actual.ino()))
+        #[cfg(target_os = "macos")]
+        {
+            Ok(true)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let expected = self.file.metadata()?;
+            let actual = namespace_file()?.metadata()?;
+            Ok((expected.dev(), expected.ino()) == (actual.dev(), actual.ino()))
+        }
     }
 }
 
@@ -172,12 +194,15 @@ impl MountTable {
         }
         Ok(Self(records))
     }
-    fn get(&self, mount: u64) -> Result<&MountRecord> {
-        self.0
-            .get(&mount)
-            .ok_or(ObjectQualificationFailure::Unknown(
-                ObjectQualificationUnknown::MountInformationMissing { mount },
-            ))
+    fn get(&self, mount: PlatformIdentity) -> Result<&MountRecord> {
+        let PlatformIdentity::Linux(id) = mount else {
+            return Err(ObjectQualificationFailure::Unsupported(
+                ObjectQualificationUnsupported::Platform,
+            ));
+        };
+        self.0.get(&id).ok_or(ObjectQualificationFailure::Unknown(
+            ObjectQualificationUnknown::MountInformationMissing { mount },
+        ))
     }
 }
 

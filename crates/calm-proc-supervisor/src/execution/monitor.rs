@@ -50,7 +50,7 @@ impl Executor {
                                 scope_helper::HelperContext {
                                     execution_id: id.clone(),
                                     executor_boot: receipt.identity.executor_boot.clone(),
-                                    nonce: receipt.process.nonce.clone(),
+                                    nonce: receipt.process.nonce().clone(),
                                     mechanism: receipt.scope_mechanism.clone(),
                                 }
                             },
@@ -109,7 +109,7 @@ impl Executor {
         anyhow::ensure!(
             report.context.execution_id == *id
                 && report.context.executor_boot == receipt.identity.executor_boot
-                && report.context.nonce.matches(&receipt.process.nonce)
+                && report.context.nonce.matches(receipt.process.nonce())
                 && report.context.mechanism == receipt.scope_mechanism,
             "helper report identity mismatch"
         );

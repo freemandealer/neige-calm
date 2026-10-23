@@ -1,0 +1,42 @@
+{
+  "contract": 4,
+  "id": "0123456789abcdef0123456789abcdef",
+  "transfer": {
+    "registration_id": "0123456789abcdef0123456789abcdef",
+    "executor_boot": "0123456789abcdef0123456789abcdef",
+    "nonce": "0123456789abcdef0123456789abcdef",
+    "incarnation": {
+      "ExternalDir": "0123456789abcdef0123456789abcdef"
+    },
+    "registration": {
+      "ExternalDir": {
+        "directory_id": "0123456789abcdef0123456789abcdef",
+        "root": {
+          "path": "/legacy/private",
+          "device": 2049,
+          "inode": 1234
+        },
+        "registration_version": 1,
+        "admission_open": true,
+        "authority": {
+          "grant_id": "0123456789abcdef0123456789abcdef",
+          "authorization_binding": "0123456789abcdef0123456789abcdef",
+          "authorization_version": 1
+        }
+      }
+    },
+    "shape": {
+      "root": "/legacy/private",
+      "mount_namespace": 4026531841,
+      "layout": "ExternalDir",
+      "objects": [
+        {
+          "role": "Root",
+          "device": 2049,
+          "inode": 1234,
+          "mount": 17
+        }
+      ]
+    }
+  }
+}

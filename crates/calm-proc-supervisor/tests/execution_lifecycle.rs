@@ -262,12 +262,13 @@ async fn escaped_output(
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = ancillary.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&ancillary);
+    message.msg_controllen = std::mem::size_of_val(&ancillary) as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
     let file = unsafe {
-        assert_eq!(
-            libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC),
-            1
-        );
+        assert_eq!(libc::recvmsg(socket.as_raw_fd(), &mut message, flags), 1);
         let header = libc::CMSG_FIRSTHDR(&message);
         assert!(!header.is_null());
         assert_eq!((*header).cmsg_type, libc::SCM_RIGHTS);

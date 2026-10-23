@@ -8,10 +8,10 @@ use std::{
 use calm_session::control::execution::ObjectRegistrationReceipt;
 use calm_session::control::execution::{ExecutionReceipt, ExecutionState, PrepareExecution};
 use serde::{Deserialize, Serialize};
-use workspace::execution::ExecutionId;
+use workspace::execution::{ExecutionId, NativeProcessIdentity, ScopeMechanismIdentity};
 
 // Pre-E1a opt-in journals are intentionally refused; required facts are never backfilled.
-pub(super) const JOURNAL_VERSION: u32 = 4;
+pub(super) const JOURNAL_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +28,53 @@ pub(super) struct Journal {
 }
 
 impl Journal {
+    /// Validate persisted facts without acquiring or reconstructing process authority.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(receipt) = self.phase.receipt() {
+            anyhow::ensure!(
+                receipt.identity == self.request.identity,
+                "receipt identity does not match its journal"
+            );
+        }
+        if self.version == 4 {
+            anyhow::ensure!(
+                !matches!(self.phase, Phase::OriginalGroupEmpty { .. })
+                    && self.phase.receipt().is_none_or(|r| matches!(
+                        r.process,
+                        NativeProcessIdentity::LinuxHelper(_)
+                    ) && matches!(
+                        r.scope_mechanism,
+                        ScopeMechanismIdentity::LinuxHelper(_)
+                    )),
+                "v4 journal cannot contain native macOS facts"
+            );
+        }
+        if let Phase::OriginalGroupEmpty { receipt, .. } = &self.phase {
+            anyhow::ensure!(
+                matches!(receipt.process, NativeProcessIdentity::MacOwnedGroup(_))
+                    && matches!(
+                        receipt.scope_mechanism,
+                        ScopeMechanismIdentity::MacOwnedGroup {
+                            protocol_version: 1
+                        }
+                    ),
+                "native group observation lacks native receipt identity"
+            );
+        }
+        if let Phase::Drained { receipt, proof, .. } = &self.phase {
+            anyhow::ensure!(
+                proof.helper_process == receipt.process
+                    && proof.mechanism == receipt.scope_mechanism
+                    && matches!(receipt.process, NativeProcessIdentity::LinuxHelper(_))
+                    && matches!(
+                        receipt.scope_mechanism,
+                        ScopeMechanismIdentity::LinuxHelper(_)
+                    ),
+                "drain proof does not bind original scope receipt"
+            );
+        }
+        Ok(())
+    }
     pub fn settle_unspawned_output(&mut self) {
         if self.phase.receipt().is_none()
             && self.phase.state().permits_handoff()
@@ -38,7 +85,13 @@ impl Journal {
         }
     }
     pub fn durably_settled(&self) -> bool {
-        !self.pending_persistence && self.phase.state().permits_handoff()
+        !self.pending_persistence
+            && self.phase.state().permits_handoff()
+            && (!matches!(self.phase, Phase::OriginalGroupEmpty { .. })
+                || matches!(
+                    self.output_end,
+                    calm_session::control::execution::OutputEnd::Complete { .. }
+                ))
     }
 }
 
@@ -62,6 +115,10 @@ pub(super) enum Phase {
         status: Option<i32>,
         proof: workspace::execution::ScopeDrainProof,
     },
+    OriginalGroupEmpty {
+        receipt: ExecutionReceipt,
+        status: Option<i32>,
+    },
     NoChild {
         slot_version: Option<u64>,
         reason: String,
@@ -82,6 +139,9 @@ impl Phase {
             Self::Spawned(_) => ExecutionState::Spawned,
             Self::Exited { status, .. } => ExecutionState::Exited { status: *status },
             Self::Drained { status, .. } => ExecutionState::Drained { status: *status },
+            Self::OriginalGroupEmpty { status, .. } => {
+                ExecutionState::OriginalGroupEmpty { status: *status }
+            }
             Self::NoChild { reason, .. } => ExecutionState::NoChild {
                 reason: reason.clone(),
             },
@@ -94,7 +154,8 @@ impl Phase {
         match self {
             Self::Spawned(receipt)
             | Self::Exited { receipt, .. }
-            | Self::Drained { receipt, .. } => Some(receipt),
+            | Self::Drained { receipt, .. }
+            | Self::OriginalGroupEmpty { receipt, .. } => Some(receipt),
             Self::Unknown { receipt, .. } => receipt.as_ref(),
             _ => None,
         }
@@ -235,7 +296,7 @@ impl Store {
                     }
                     let probe: Version = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(
-                        probe.version == JOURNAL_VERSION,
+                        probe.version == 4 || probe.version == JOURNAL_VERSION,
                         "unsupported execution journal version {}; expected {}; pre-E1a journals require a fresh state directory",
                         probe.version,
                         JOURNAL_VERSION
@@ -328,6 +389,10 @@ fn sync_ancestry_with(
 }
 
 #[cfg(test)]
+#[path = "journal_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -340,7 +405,7 @@ mod tests {
         let error = store.load().unwrap_err().to_string();
         assert_eq!(
             error,
-            "unsupported execution journal version 3; expected 4; pre-E1a journals require a fresh state directory"
+            "unsupported execution journal version 3; expected 5; pre-E1a journals require a fresh state directory"
         );
         std::fs::write(store.path().join("old.execution"), br#"{"version":4}"#).unwrap();
         assert!(

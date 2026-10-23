@@ -75,7 +75,7 @@ async fn stop_before_started_deadline_and_shutdown() {
     )
     .unwrap();
 
-    let pid = native.pid;
+    let pid = native.pid();
     let receipt = ExecutionReceipt {
         identity: identity.clone(),
         slot_version: 1,

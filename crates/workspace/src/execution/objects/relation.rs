@@ -5,7 +5,7 @@ use std::{fs::File, os::unix::fs::MetadataExt};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryPairFacts {
-    pub mount_namespace: u64,
+    pub mount_namespace: super::PlatformIdentity,
     pub ancestor: ObjectFact,
     pub subject: ObjectFact,
 }

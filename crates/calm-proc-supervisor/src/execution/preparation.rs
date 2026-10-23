@@ -119,6 +119,16 @@ impl Executor {
         request: PrepareExecution,
         descriptors: Vec<std::os::fd::OwnedFd>,
     ) -> anyhow::Result<ExecutionReply> {
+        #[cfg(target_os = "macos")]
+        anyhow::ensure!(
+            matches!(request.source, PreparedSource::Private(_))
+                && matches!(request.identity.scope, ExecutionScope::ExternalDir { .. })
+                && matches!(
+                    request.specification.io_mode,
+                    calm_session::control::IoMode::Pipe
+                ),
+            "native macOS supports Private ExternalDir + Pipe only"
+        );
         let id_gate = self.id_gate(&request.identity.execution_id)?;
         let _id = id_gate.lock().await;
         {

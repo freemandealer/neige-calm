@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn native_macos_forge_action_and_both_probes_use_pipe() {
+    c3_action_has_one_engine_construction();
+}
+
 pub(super) fn c3_record(op: &Operation) -> Value {
     op.tx_output.as_ref().unwrap().data["forge_execution"].clone()
 }
@@ -82,7 +88,7 @@ pub(super) async fn c3_held(
 async fn c3_action_has_one_engine_construction() {
     let boot = TestBoot::new().await;
     let mut input = c3_merge_input(&boot, "one-construction", "exit 7");
-    input["probe"] = json!({"probe_argv":["/bin/true"],"output_probe_argv":["/bin/sh","-c","echo '{\"oid\":\"abcdef\",\"headRefOid\":\"123456\"}'"]});
+    input["probe"] = json!({"probe_argv":["/bin/sh","-c","exit 0"],"output_probe_argv":["/bin/sh","-c","echo '{\"oid\":\"abcdef\",\"headRefOid\":\"123456\"}'"]});
     let id = boot
         .runtime
         .submit(FORGE_ACTION_KIND, op_key("one-construction"), input)
@@ -98,10 +104,11 @@ async fn c3_action_has_one_engine_construction() {
                 .unwrap();
         panic!("op={op:?} executions={rows:?}");
     }
-    assert!(matches!(
-        result.unwrap().unwrap().outcome,
-        OperationOutcome::Succeeded { .. }
-    ));
+    let OperationOutcome::Succeeded { result } = result.unwrap().unwrap().outcome else {
+        panic!("action and both probes did not succeed")
+    };
+    assert_eq!(result["event"]["merge_sha"], "abcdef");
+    assert_eq!(result["event"]["head_sha"], "123456");
     assert_eq!(c3_count(&boot, &id).await, 3);
     let op = c3_op(&boot, &id).await;
     assert!(op.spawn_artifacts.is_none());

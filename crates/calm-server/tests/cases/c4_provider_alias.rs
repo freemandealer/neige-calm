@@ -1,5 +1,5 @@
 //! Permanent executor alias slots survive hot records, tombstones and restarts.
-use super::claude_planner_session_fixture::Rig;
+use super::claude_planner_session_fixture::RegisteredRig;
 use calm_server::{
     provider_execution as owner,
     test_seams::{PausePoint, install_pause_for_test},
@@ -24,8 +24,12 @@ async fn c4_rewind_alias_slots_survive_hot_and_retired_predecessors_and_restarts
         for restart in ["none", "kernel", "supervisor"] {
             // The hot case controls when Retire is driven; this test does not
             // exercise recovery ticks (the two lost-drive tests do).
-            let mut rig =
-                Rig::with_execution_interval("exit", "alias test", Duration::from_secs(3600)).await;
+            let mut rig = RegisteredRig::with_execution_interval(
+                "exit",
+                "alias test",
+                Duration::from_secs(3600),
+            )
+            .await;
             std::fs::write(rig.bin("claude"), "#!/bin/sh\necho launched >> launches\ntouch ready\nwhile [ ! -f finish ]; do sleep 0.01; done\nexit 0\n").unwrap();
             let task = {
                 let session = rig.session().clone();

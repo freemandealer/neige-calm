@@ -16,7 +16,7 @@ impl ExecutionWatcher {
     }
     pub async fn changed(&mut self) -> io::Result<(u64, ExecutionId)> {
         let (reply, descriptors) =
-            rights::receive::<super::super::ControlReply>(&self.stream).await?;
+            rights::receive_without_rights::<super::super::ControlReply>(&self.stream).await?;
         if !descriptors.is_empty() {
             return Err(io::Error::other("unexpected watch descriptors"));
         }
@@ -43,7 +43,7 @@ impl RegisteredExecutorConnection {
         )
         .await?;
         let (reply, descriptors) =
-            rights::receive::<super::super::ControlReply>(&self.stream).await?;
+            rights::receive_without_rights::<super::super::ControlReply>(&self.stream).await?;
         if descriptors.is_empty()
             && let super::super::ControlReply::Execution(reply) = reply
             && let ExecutionReply::Watching { boot, seq } = *reply

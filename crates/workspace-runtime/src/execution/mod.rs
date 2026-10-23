@@ -108,6 +108,11 @@ pub fn next_step(desired: Desired, fact: &Fact) -> Step {
         Fact::Absent if desired == Desired::Run => Step::Prepare,
         Fact::Absent => Step::Revoke,
         Fact::Retired(_) => Step::Finish,
+        Fact::Journal {
+            state: ExecutionState::OriginalGroupEmpty { .. },
+            output,
+            ..
+        } if !matches!(output, OutputEnd::Complete { .. }) => Step::Wait,
         Fact::Journal { state, .. } => match state {
             ExecutionState::Prepared if desired == Desired::Run => Step::Launch,
             ExecutionState::Prepared => Step::Revoke,
@@ -122,7 +127,8 @@ pub fn next_step(desired: Desired, fact: &Fact) -> Step {
             | ExecutionState::Unknown { .. } => Step::Wait,
             ExecutionState::Revoked
             | ExecutionState::NoChild { .. }
-            | ExecutionState::Drained { .. } => Step::Settle,
+            | ExecutionState::Drained { .. }
+            | ExecutionState::OriginalGroupEmpty { .. } => Step::Settle,
         },
     }
 }

@@ -1,5 +1,5 @@
 //! Real Engine Stop covers the bounded sink and its EOF/overflow evidence.
-use super::claude_planner_session_fixture::Rig;
+use super::claude_planner_session_fixture::RegisteredRig;
 use calm_server::provider_execution::{
     self as owner,
     stderr::{self, Capture, DroppedBytes},
@@ -16,11 +16,11 @@ async fn wait(mut ready: impl FnMut() -> bool) {
     .await
     .unwrap();
 }
-async fn start(rig: &Rig, script: &str) -> (owner::Claim, owner::DriverGuard, PathBuf) {
+async fn start(rig: &RegisteredRig, script: &str) -> (owner::Claim, owner::DriverGuard, PathBuf) {
     start_with_prefix(rig, script, "").await
 }
 async fn start_with_prefix(
-    rig: &Rig,
+    rig: &RegisteredRig,
     script: &str,
     prefix: &str,
 ) -> (owner::Claim, owner::DriverGuard, PathBuf) {
@@ -59,7 +59,7 @@ async fn start_with_prefix(
         .unwrap();
     (claim, guard, dir)
 }
-async fn stop(rig: &Rig, claim: &owner::Claim) {
+async fn stop(rig: &RegisteredRig, claim: &owner::Claim) {
     let id = owner::execution_id(claim.record()).unwrap();
     rig.host
         .provider_execution
@@ -82,7 +82,7 @@ async fn stop(rig: &Rig, claim: &owner::Claim) {
 }
 #[tokio::test]
 async fn c4_stderr_sink_is_bounded_and_reports_overflow() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (claim, _guard, dir) = start(
         &rig,
         "head -c 1048576 /dev/zero >&2; printf 'protocol'; exit 0",
@@ -110,7 +110,7 @@ async fn c4_stderr_sink_is_bounded_and_reports_overflow() {
 }
 #[tokio::test]
 async fn c4_stderr_exact_cap_is_not_overflow() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (claim, _guard, dir) = start(&rig, "head -c 262144 /dev/zero >&2; exit 0").await;
     wait(|| dir.join("stderr.closed").exists()).await;
     stop(&rig, &claim).await;
@@ -119,7 +119,7 @@ async fn c4_stderr_exact_cap_is_not_overflow() {
     assert_eq!(diagnostic.capture, Capture::Complete);
 }
 async fn interrupted(script: &str) {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     // POSIX $! reports the wrapper's sink job. Inject loss of its EOF publisher
     // after head opens the file, before the provider starts. Head still retains
     // CAP bytes; the real Engine Stop owns teardown of the remaining scope.
@@ -146,7 +146,7 @@ kill -KILL "$!"
 #[tokio::test]
 async fn c4_stderr_overflow_survives_stop() {
     {
-        let rig = Rig::new("exit").await;
+        let rig = RegisteredRig::new("exit").await;
         let (claim, _guard, dir) = start(
             &rig,
             "head -c 1048576 /dev/zero >&2; exec 2>/dev/null; exec sleep 120",
@@ -178,7 +178,7 @@ wait"#,
 }
 #[tokio::test]
 async fn c4_stderr_unreadable_never_blocks_complete() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (claim, _guard, dir) = start(&rig, "exit 0").await;
     wait(|| dir.join("stderr.closed").exists()).await;
     stop(&rig, &claim).await;
@@ -199,7 +199,7 @@ async fn c4_stderr_unreadable_never_blocks_complete() {
 }
 #[tokio::test]
 async fn c4_stderr_sink_cleared_after_driver_loss() {
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (claim, guard, dir) = start(&rig, "exec sleep 120").await;
     wait(|| dir.join("stderr").exists()).await;
     drop(guard);
@@ -227,7 +227,7 @@ async fn c4_stderr_sink_cleared_after_driver_loss() {
 #[tokio::test]
 async fn c4_output_gap_fails_the_read_side() {
     use tokio::io::AsyncReadExt;
-    let rig = Rig::new("exit").await;
+    let rig = RegisteredRig::new("exit").await;
     let (claim, _guard, dir) = start(&rig, "head -c 5242880 /dev/zero; exit 0").await;
     wait(|| dir.join("stderr.closed").exists()).await;
     stop(&rig, &claim).await;

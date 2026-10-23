@@ -18,3 +18,9 @@ pub async fn receive<T: DeserializeOwned>(_: &UnixStream) -> io::Result<(T, Vec<
         "registered executor transport requires Linux",
     ))
 }
+
+pub async fn receive_without_rights<T: DeserializeOwned>(
+    stream: &UnixStream,
+) -> io::Result<(T, Vec<OwnedFd>)> {
+    receive(stream).await
+}

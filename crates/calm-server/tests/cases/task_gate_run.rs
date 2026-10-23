@@ -224,6 +224,22 @@ pub(super) fn passed(answer: &Value) -> &str {
 // R1: the checkpoint commits the checkout before the declared steps run.
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_macos_task_gate_run_succeeds() {
+    let fx = world(LONG_IDLE).await;
+    let attempt = running(
+        &fx,
+        "native-macos-success",
+        json!([{"name": "native", "cmd": "printf native-gate-output"}]),
+    )
+    .await;
+    let answer = gate_run(&fx, &attempt, Some("test: native checkpoint"))
+        .await
+        .unwrap();
+    passed(&answer);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gate_run_commits_new_files_before_its_steps_run() {
     let fx = world(LONG_IDLE).await;
@@ -631,3 +647,7 @@ mod reuse;
 
 #[path = "task_gate_run/c2b.rs"]
 mod c2b;
+
+#[cfg(target_os = "macos")]
+#[path = "task_gate_run/native_macos.rs"]
+mod native_macos;

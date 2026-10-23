@@ -7,6 +7,9 @@ mod execution_private;
 #[path = "execution_registration.rs"]
 mod execution_registration;
 mod execution_support;
+#[cfg(target_os = "macos")]
+#[path = "native_macos.rs"]
+mod native_macos;
 #[path = "port_contract.rs"]
 mod port_contract;
 mod proc_probe;

@@ -434,7 +434,10 @@ impl ProviderAdapter for TaskGateRunAdapter {
             steps: checkpoint::run_steps(&frozen),
         };
         let status = match settled.unwrap() {
-            Settlement::Journal(ExecutionState::Drained { status, .. }) => status,
+            Settlement::Journal(
+                ExecutionState::Drained { status, .. }
+                | ExecutionState::OriginalGroupEmpty { status, .. },
+            ) => status,
             _ => None,
         };
         let reason = match &record.decision {

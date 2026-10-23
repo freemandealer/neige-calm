@@ -553,11 +553,12 @@ async fn private_registration_released_at_drained_not_retire() {
     .unwrap();
     // The shim only routes bootstrap FDs; the actual helper image is this isolated test binary.
     let image = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
-    Arc::get_mut(&mut executor).unwrap().mechanism = ScopeMechanismIdentity {
-        executable_device: image.dev(),
-        executable_inode: image.ino(),
-        protocol_version: 1,
-    };
+    Arc::get_mut(&mut executor).unwrap().mechanism =
+        ScopeMechanismIdentity::LinuxHelper(workspace::execution::LinuxHelperIdentity {
+            executable_device: image.dev(),
+            executable_inode: image.ino(),
+            protocol_version: 1,
+        });
     let (request, held) = private(&executor, temp.path());
     let (_, mut changes) = executor.watch().unwrap();
     prepare(&executor, &request, &held).await;
