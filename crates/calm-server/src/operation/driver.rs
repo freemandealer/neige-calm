@@ -511,7 +511,28 @@ impl OperationRuntime {
     }
 
     pub async fn drive(&self) -> Result<()> {
-        let _g = self.drive_mutex.lock().await;
+        self.drive_under_lock(self.drive_mutex.clone().lock_owned().await)
+            .await
+    }
+
+    /// Periodic recovery must not wait behind a native lifecycle RPC holding
+    /// the drive fence. Busy ticks coalesce instead of queuing background waiters.
+    pub(crate) fn reconcile_drivable(&self) {
+        let Ok(guard) = self.drive_mutex.clone().try_lock_owned() else {
+            return;
+        };
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = runtime.drive_under_lock(guard).await {
+                tracing::warn!(%error, "operation reconcile failed; next tick retries");
+            }
+        });
+    }
+
+    async fn drive_under_lock(
+        &self,
+        _guard: tokio::sync::OwnedMutexGuard<HashSet<String>>,
+    ) -> Result<()> {
         loop {
             let batch = self.repo.claim_drive_batch(32).await?;
             if batch.is_empty() {
@@ -546,11 +567,13 @@ impl OperationRuntime {
             if let Some(result) = self.leave_write(
                 &op,
                 self.repo
-                    .mark_stuck(
+                    .settle_claimed(
                         &op,
-                        format!("operation drive failed: {error}"),
-                        from_phase,
-                        self.adapter(&op.kind)?.owns_parked_resource(),
+                        crate::operation::TerminalOutcome::Stuck {
+                            reason: format!("operation drive failed: {error}"),
+                            from_phase,
+                        },
+                        self.adapter(&op.kind)?.as_ref(),
                     )
                     .await?,
             ) {
@@ -636,6 +659,8 @@ impl OperationRuntime {
                 }
                 if let Err(error) = runtime.drive().await {
                     tracing::error!(%error, operation_id = %id, "Busy retry drive failed");
+                    #[cfg(feature = "fixtures")]
+                    crate::test_seams::pause_point("operation-busy-retry-failed", &id).await;
                 }
             });
         tokio::spawn(retry);
@@ -725,12 +750,16 @@ impl OperationRuntime {
                                 if let Some(result) = self.leave_write(
                                     &op,
                                     self.repo
-                                        .mark_failed(
+                                        .settle_claimed(
                                             &op,
-                                            last_error,
-                                            PhaseTag::Pending,
-                                            Some(last_error_class.to_string()),
-                                            self.adapter(&op.kind)?.owns_parked_resource(),
+                                            crate::operation::TerminalOutcome::Failed {
+                                                last_error,
+                                                from_phase: PhaseTag::Pending,
+                                                last_error_class: Some(
+                                                    last_error_class.to_string(),
+                                                ),
+                                            },
+                                            self.adapter(&op.kind)?.as_ref(),
                                         )
                                         .await?,
                                 ) {
@@ -783,16 +812,14 @@ impl OperationRuntime {
                             if let Some(result) = self.leave_write(
                                 &op,
                                 self.repo
-                                    .set_phase(
+                                    .settle_claimed(
                                         &op,
-                                        Phase::Succeeded,
-                                        self.adapter(&op.kind)?.owns_parked_resource(),
+                                        super::TerminalOutcome::Succeeded,
+                                        adapter.as_ref(),
                                     )
                                     .await?,
                             ) {
-                                if let Some(result) = operation_result_from(&result)? {
-                                    self.completion.complete(result);
-                                }
+                                self.completion.complete(result);
                             } else {
                                 log_lost_lease(&op, PhaseTag::Succeeded);
                             }
@@ -991,16 +1018,10 @@ impl OperationRuntime {
                 if let Some(result) = self.leave_write(
                     &op,
                     self.repo
-                        .set_phase(
-                            &op,
-                            Phase::Succeeded,
-                            self.adapter(&op.kind)?.owns_parked_resource(),
-                        )
+                        .settle_claimed(&op, super::TerminalOutcome::Succeeded, adapter.as_ref())
                         .await?,
                 ) {
-                    if let Some(result) = operation_result_from(&result)? {
-                        self.completion.complete(result);
-                    }
+                    self.completion.complete(result);
                 } else {
                     log_lost_lease(&op, PhaseTag::Succeeded);
                 }
@@ -1085,23 +1106,27 @@ impl OperationRuntime {
             Ok(()) => Ok(self.leave_write(
                 &op,
                 self.repo
-                    .mark_failed(
+                    .settle_claimed(
                         &op,
-                        reason,
-                        from_phase,
-                        Some("internal".into()),
-                        self.adapter(&op.kind)?.owns_parked_resource(),
+                        crate::operation::TerminalOutcome::Failed {
+                            last_error: reason,
+                            from_phase,
+                            last_error_class: Some("internal".into()),
+                        },
+                        self.adapter(&op.kind)?.as_ref(),
                     )
                     .await?,
             )),
             Err(e) => Ok(self.leave_write(
                 &op,
                 self.repo
-                    .mark_stuck(
+                    .settle_claimed(
                         &op,
-                        format!("compensation failed: {e}"),
-                        PhaseTag::Compensating,
-                        self.adapter(&op.kind)?.owns_parked_resource(),
+                        crate::operation::TerminalOutcome::Stuck {
+                            reason: format!("compensation failed: {e}"),
+                            from_phase: PhaseTag::Compensating,
+                        },
+                        self.adapter(&op.kind)?.as_ref(),
                     )
                     .await?,
             )),
@@ -1413,12 +1438,14 @@ impl OperationRuntime {
         if let Some(result) = self.leave_write(
             &op,
             self.repo
-                .mark_failed(
+                .settle_claimed(
                     &op,
-                    reason,
-                    PhaseTag::Parked,
-                    last_error_class,
-                    self.adapter(&op.kind)?.owns_parked_resource(),
+                    crate::operation::TerminalOutcome::Failed {
+                        last_error: reason,
+                        from_phase: PhaseTag::Parked,
+                        last_error_class,
+                    },
+                    self.adapter(&op.kind)?.as_ref(),
                 )
                 .await?,
         ) {
@@ -1438,12 +1465,14 @@ impl OperationRuntime {
         if let Some(result) = self.leave_write(
             &op,
             self.repo
-                .mark_failed(
+                .settle_claimed(
                     &op,
-                    reason,
-                    PhaseTag::Parked,
-                    last_error_class,
-                    self.adapter(&op.kind)?.owns_parked_resource(),
+                    crate::operation::TerminalOutcome::Failed {
+                        last_error: reason,
+                        from_phase: PhaseTag::Parked,
+                        last_error_class,
+                    },
+                    self.adapter(&op.kind)?.as_ref(),
                 )
                 .await?,
         ) {
@@ -1508,11 +1537,13 @@ impl OperationRuntime {
                     if let Some(result) = self.leave_write(
                         &op,
                         self.repo
-                            .mark_stuck(
+                            .settle_claimed(
                                 &op,
-                                format!("operation recovery apply failed: {e}"),
-                                from_phase,
-                                self.adapter(&op.kind)?.owns_parked_resource(),
+                                crate::operation::TerminalOutcome::Stuck {
+                                    reason: format!("operation recovery apply failed: {e}"),
+                                    from_phase,
+                                },
+                                self.adapter(&op.kind)?.as_ref(),
                             )
                             .await?,
                     ) {
@@ -1536,11 +1567,15 @@ impl OperationRuntime {
                         if let Some(result) = self.leave_write(
                             &op,
                             self.repo
-                                .mark_stuck(
+                                .settle_claimed(
                                     &op,
-                                    format!("operation compensation recovery failed: {e}"),
-                                    PhaseTag::Compensating,
-                                    self.adapter(&op.kind)?.owns_parked_resource(),
+                                    crate::operation::TerminalOutcome::Stuck {
+                                        reason: format!(
+                                            "operation compensation recovery failed: {e}"
+                                        ),
+                                        from_phase: PhaseTag::Compensating,
+                                    },
+                                    self.adapter(&op.kind)?.as_ref(),
                                 )
                                 .await?,
                         ) {

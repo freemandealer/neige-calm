@@ -703,6 +703,7 @@ impl Scheduler {
                             return Err(race_lost_err());
                         }
                         let event = Event::TaskCompleted {
+ notification: if target_status == "done" { calm_types::event::PlannerNotification::Notify } else { calm_types::event::PlannerNotification::Suppress },
                             idempotency_key: snapshot.task_id,
                             result: json!({
                                 "source": "child-track",
@@ -730,6 +731,7 @@ impl Scheduler {
                             return Err(race_lost_err());
                         }
                         let event = Event::TaskFailed {
+ notification: calm_types::event::PlannerNotification::Notify,
                             idempotency_key: snapshot.task_id,
                             reason: format!(
                                 "child-track-incomplete: {} pending task(s) remain",
@@ -756,6 +758,7 @@ impl Scheduler {
                         return Err(race_lost_err());
                     }
                     let event = Event::TaskFailed {
+ notification: calm_types::event::PlannerNotification::Notify,
                         idempotency_key: snapshot.task_id,
                         reason: "child-track-deleted: child track was deleted".into(),
                         details: None,
@@ -1397,6 +1400,7 @@ impl Scheduler {
                     events.push((
                         scope,
                         Event::TaskFailed {
+                            notification: calm_types::event::PlannerNotification::Notify,
                             idempotency_key: task_id,
                             reason,
                             details: None,
@@ -1578,10 +1582,13 @@ impl Scheduler {
     async fn sweep_reconcile(self: &Arc<Self>) -> BTreeSet<String> {
         // The parked sweep recovers durable verdicts from dead gates and kill-fails
         // past-deadline work; every arm is fenced single-winner, so racing the live observer is safe.
-        if let Some(runtime) = self.operation_runtime.upgrade()
-            && let Err(e) = runtime.sweep_parked().await
-        {
-            tracing::warn!(error = %e, "scheduler sweep: sweep_parked failed; next tick retries");
+        if let Some(runtime) = self.operation_runtime.upgrade() {
+            // A terminal transaction can roll back before an adapter owns a parked
+            // resource. Retry expired drivable claims too; never rearm AwaitingRetry.
+            runtime.reconcile_drivable();
+            if let Err(error) = runtime.sweep_parked().await {
+                tracing::warn!(%error, "scheduler sweep: sweep_parked failed; next tick retries");
+            }
         }
         self.sweep_timeout_worker_cleanups().await;
         let mut pending_tracks: BTreeSet<String> = BTreeSet::new();
@@ -2200,6 +2207,11 @@ pub async fn complete_terminal_task(
                         1
                     },
                     Event::TaskCompleted {
+                        notification: if flip == SuccessReportFlip::Done {
+                            calm_types::event::PlannerNotification::Notify
+                        } else {
+                            calm_types::event::PlannerNotification::Suppress
+                        },
                         idempotency_key: task_id.clone(),
                         result: json!({
                             "exit_code": 0,
@@ -2236,6 +2248,7 @@ pub async fn complete_terminal_task(
                     )
                     .await?,
                     Event::TaskFailed {
+                        notification: calm_types::event::PlannerNotification::Notify,
                         idempotency_key: task_id.clone(),
                         reason,
                         details: Some(json!({

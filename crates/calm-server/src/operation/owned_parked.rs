@@ -5,16 +5,6 @@ use super::{
 };
 use crate::db::sqlite::begin_immediate_tx;
 use crate::error::{CalmError, Result};
-use crate::event::{BroadcastEnvelope, Event, EventScope, SYNC_EVENT_VERSION};
-use crate::ids::ActorId;
-
-/// The owner supplies every event fact; generic completion infers neither actor nor scope.
-#[derive(Clone, Debug)]
-pub struct OwnerEvent {
-    pub actor: ActorId,
-    pub scope: EventScope,
-    pub event: Event,
-}
 
 /// Both live observer and the existing boot/sweep loop use this one lease fence.
 /// The adapter must retain ownership until it has real stop/quiescence evidence.
@@ -39,29 +29,20 @@ pub(crate) fn reconcile<'a>(
                     let mut tx = begin_immediate_tx(&pool).await?;
                     super::repo_sqlite::require_live_claim_tx(&mut tx, op).await?;
                     let completion = complete_parked_tx(&mut tx, &op.id, &outcome).await?;
-                    let mut events = if matches!(completion, ParkedCompletion::Completed(_)) {
-                        adapter.complete_owned_parked_tx(&mut tx, op).await?
-                    } else {
-                        Vec::new()
-                    };
-                    if matches!(completion, ParkedCompletion::Completed(_))
-                        && let Some(OwnerEvent {
-                            actor,
-                            scope,
-                            event,
-                        }) = owner_event
-                    {
-                        let id = crate::db::sqlite::append_decision_event_in_tx(
-                            &mut tx, &actor, &scope, None, &event,
+                    let mut events = Vec::new();
+                    if matches!(completion, ParkedCompletion::Completed(_)) {
+                        events = adapter.complete_owned_parked_tx(&mut tx, op).await?;
+                        if let Some(event) = super::settlement::append_result_event_tx(
+                            &mut tx,
+                            op,
+                            adapter,
+                            &super::TerminalOutcome::from(&outcome),
+                            owner_event,
                         )
-                        .await?;
-                        events.push(BroadcastEnvelope {
-                            id,
-                            event_version: SYNC_EVENT_VERSION,
-                            actor,
-                            scope,
-                            event,
-                        });
+                        .await?
+                        {
+                            events.push(event);
+                        }
                     }
                     tx.commit().await?;
                     for event in events {

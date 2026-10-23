@@ -1,4 +1,4 @@
-pub use owned_parked::OwnerEvent;
+pub use settlement::OwnerEvent;
 #[cfg(test)]
 pub(crate) mod launch_cleanup_test_support;
 
@@ -9,6 +9,8 @@ mod driver;
 mod interaction_retry;
 pub use interaction_retry::OperationReceipt;
 pub(crate) mod owned_parked;
+mod settlement;
+pub use settlement::TerminalOutcome;
 mod repo_sqlite;
 pub(crate) mod workspace_lease;
 
@@ -772,6 +774,17 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn validate(&self, input: &Value) -> Result<()>;
 
+    /// Domain-owned failure notification, appended in the winning terminal transaction.
+    /// This hook must only read transaction-local facts; it never performs external effects.
+    async fn failure_event_tx(
+        &self,
+        _tx: &mut Tx<'_>,
+        _op: &Operation,
+        _reason: &str,
+    ) -> Result<Option<OwnerEvent>> {
+        Ok(None)
+    }
+
     /// Adapter declares the track whose checkout preparation must exclude clean.
     /// The driver holds its existing track guard through the occupancy commit,
     /// including boot recovery.
@@ -1080,20 +1093,11 @@ pub trait OperationRepo: Send + Sync {
         op: &Operation,
         state: &CompensationStateVersioned,
     ) -> Result<Option<Operation>>;
-    async fn mark_failed(
+    async fn settle_claimed(
         &self,
         op: &Operation,
-        last_error: String,
-        from_phase: PhaseTag,
-        last_error_class: Option<String>,
-        owner_key: Option<&'static str>,
-    ) -> Result<LeaveWrite<OperationResult>>;
-    async fn mark_stuck(
-        &self,
-        op: &Operation,
-        reason: String,
-        from_phase: PhaseTag,
-        owner_key: Option<&'static str>,
+        outcome: TerminalOutcome,
+        adapter: &dyn ProviderAdapter,
     ) -> Result<LeaveWrite<OperationResult>>;
 }
 
