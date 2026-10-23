@@ -19,13 +19,15 @@ export interface QueryCachePort extends AreaQueryLifecyclePort {
 
 /**
  * TanStack reuses an in-flight initial fetch even after `invalidateQueries`, and the stale response
- * then clears `isInvalidated`. Reports, overlays and conversation metadata need a replacement
+ * then clears `isInvalidated`. Event-driven reads need a replacement
  * read started after the event, even when the transport ignores abort.
  */
 function invalidateMappedQuery(client: QueryCachePort, queryKey: readonly unknown[]): void {
   const cancelFirst = queryKey[0] === 'track' || queryKey[0] === 'track-conversations'
     || queryKey[0] === 'track-report' || queryKey[0] === 'conversation-initial-input'
     || queryKey[0] === 'harness-items' || queryKey[0] === 'planner-run'
+    || queryKey[0] === 'track-backlinks' || queryKey[0] === 'plugins'
+    || queryKey[0] === 'track-templates' || queryKey[0] === 'plugin-data'
     || (queryKey[0] === 'overlays' && queryKey[1] === 'track');
   if (!cancelFirst) {
     void client.invalidateQueries({ queryKey });
@@ -41,6 +43,10 @@ export function mapPlannedQueryKey(key: QueryKey): readonly unknown[] | null {
     && 'kind' in first && first.kind === 'card' && 'cardId' in first && typeof first.cardId === 'string') {
     return queryKeys.modelCatalog({ kind: 'card', cardId: first.cardId });
   }
+  if (head === 'track-backlinks' && key.length === 1) return queryKeys.trackBacklinksPrefix();
+  if (head === 'plugins' && key.length === 1) return queryKeys.plugins();
+  if (head === 'track-templates' && key.length === 1) return queryKeys.trackTemplates();
+  if (head === 'plugin-data' && typeof first === 'string' && key.length === 2) return queryKeys.pluginDataPrefix(first);
   if (head === 'areas' && key.length === 1) return queryKeys.areas();
   if (head === 'tracks' && first === 'area' && typeof second === 'string') return queryKeys.tracksInArea(second);
   if (head === 'track' && typeof first === 'string' && key.length === 2) return queryKeys.trackDetail(first);
