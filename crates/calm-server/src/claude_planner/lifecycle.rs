@@ -84,6 +84,22 @@ pub async fn boot(repo: &dyn RepoEventWrite, host: &ClaudePlannerHost) -> Result
     Ok(())
 }
 
+/// Read-only proof check over every row the scoped sweep would revoke, including
+/// claimless and inactive sessions. Check before any route side effect. The boot
+/// unproven set is fixed; later sessions are proven by construction. The sweep's
+/// transactional check remains the authoritative fence.
+pub(crate) async fn preflight(
+    repo: &dyn crate::db::Repo,
+    host: &ClaudePlannerHost,
+    scope: ClaudePlannerScope<'_>,
+) -> Result<()> {
+    let db = repo
+        .sqlite_db()
+        .ok_or(crate::error::CalmError::ExecutionUnavailable)?;
+    let ids = crate::db::sqlite::claude_planner_session_ids(db.read_pool(), scope).await?;
+    crate::provider_execution::PreC4Sweep::require_absent(host.pre_c4.get(), &ids)
+}
+
 /// Before a destructive step on a track (its deletion, its area's deletion, a workspace repoint):
 /// revoke then Stop and settle every Claude provider execution of the track, in any state. `Err` aborts the step
 /// before anything moves.
@@ -118,6 +134,7 @@ async fn sweep_scope(
         ClaudePlannerScope::Track(id) => Scope::Track(id.into()),
         ClaudePlannerScope::Card(id) => Scope::Card(id.into()),
     };
+    let proof = host.pre_c4.get().cloned();
     let sessions = write_in_tx_typed(repo, move |tx| {
         Box::pin(async move {
             let scope = match &scope {
@@ -126,6 +143,8 @@ async fn sweep_scope(
                 Scope::Card(id) => ClaudePlannerScope::Card(id),
             };
             let ids = claude_planner_revoke_tx(tx, scope).await?;
+            // Check even claimless sessions; refusal rolls back all revocation.
+            crate::provider_execution::PreC4Sweep::require_absent(proof.as_ref(), &ids)?;
             let mut retained = Vec::new();
             for id in ids {
                 if calm_truth::db::sqlite::provider_execution::retained(tx, &id).await? {
