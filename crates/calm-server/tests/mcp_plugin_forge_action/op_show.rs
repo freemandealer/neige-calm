@@ -240,6 +240,20 @@ async fn op_show_refuses_undecodable_out_of_scope_rows_like_an_absent_id() {
             resp.get("result").is_none(),
             "{op_id} must be refused: {resp:#?}"
         );
+        // The overflow view must apply the same scope filter before decoding, too.
+        let (mut rd, mut wr) = connect(&fx.socket_path).await;
+        handshake(&mut rd, &mut wr, &fx.raw_token).await;
+        send_frame(
+            &mut wr,
+            tools_call_frame(
+                id + 100,
+                "neige_track_cat",
+                &fx.thread_id,
+                json!({"path":format!("ops/{op_id}/result")}),
+            ),
+        )
+        .await;
+        assert_eq!(recv_frame(&mut rd).await["error"]["code"], -32404);
         let mut normalized = resp["error"].clone();
         normalized["message"] = json!(
             normalized["message"]
@@ -335,4 +349,110 @@ async fn op_show_failed_keeps_the_replay_error_shape() {
         "{shown:#?}"
     );
     fx.plugin_host.stop(PLUGIN_ID).await.expect("stop plugin");
+}
+
+#[tokio::test]
+async fn op_show_output_inline_and_virtual_continuation_are_track_scoped() {
+    let _env = env_guards().await;
+    for size in [10, 5000, 20000] {
+        let fx = boot_fixture_with_role(StubMode::Awaited, CardRole::Planner).await;
+        let text = if size == 5000 {
+            "<".repeat(size)
+        } else {
+            "界".repeat(size)
+        };
+        let resp = call_forge_tool_with_args(
+            &fx,
+            5,
+            json!({
+                "event":{"event_kind":"forge.issue.searched","fields":{}},
+                "overrides":{"argv":["/bin/sh","-c","printf '%s' \"$1\"","sh",text]}
+            }),
+        )
+        .await;
+        let id = op_id_of(&resp);
+        assert_eq!(
+            resp["result"]["structuredContent"]["status"], "succeeded",
+            "{resp}"
+        );
+        let shown = op_show(&fx, 6, &id).await;
+        assert_eq!(shown["result"], resp["result"]);
+        if size == 10 {
+            assert_eq!(
+                shown["result"]["structuredContent"]["result"]["stdout"],
+                text
+            );
+        } else {
+            assert!(
+                shown["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len()
+                    <= 16 * 1024
+            );
+            assert_eq!(
+                shown["result"]["structuredContent"]["result"]["output_ref"],
+                format!("ops/{id}/result")
+            );
+        }
+        let (mut rd, mut wr) = connect(&fx.socket_path).await;
+        handshake(&mut rd, &mut wr, &fx.raw_token).await;
+        send_frame(
+            &mut wr,
+            tools_call_frame(
+                7,
+                "neige_track_cat",
+                &fx.thread_id,
+                json!({"path": if size == 10 { format!("ops/{id}/result") } else { shown["result"]["structuredContent"]["result"]["output_ref"].as_str().unwrap().to_owned() }}),
+            ),
+        )
+        .await;
+        let full = recv_frame(&mut rd).await;
+        assert_eq!(
+            full["result"]["structuredContent"]["content"], text,
+            "{full}"
+        );
+        let foreign = create_track_caller(&fx, CardRole::Planner).await;
+        let (mut rd, mut wr) = connect(&fx.socket_path).await;
+        handshake(&mut rd, &mut wr, &foreign.raw_token).await;
+        send_frame(
+            &mut wr,
+            tools_call_frame(
+                8,
+                "neige_track_cat",
+                &foreign.thread_id,
+                json!({"path":format!("ops/{id}/result")}),
+            ),
+        )
+        .await;
+        assert_eq!(recv_frame(&mut rd).await["error"]["code"], -32404);
+        if size == 10 {
+            let artifact = shown["result"]["structuredContent"]["result"]["event"]["artifact_path"]
+                .as_str()
+                .unwrap();
+            std::fs::remove_file(artifact).unwrap();
+            sqlx::query(
+                "UPDATE operations SET tx_output_json = json_remove(
+                    json_set(tx_output_json, '$.result.event.head_sha', ?2), '$.result.stdout')
+                 WHERE id = ?1",
+            )
+            .bind(&id)
+            .bind("界".repeat(20000))
+            .execute(fx.repo.pool())
+            .await
+            .unwrap();
+            let missing = op_show(&fx, 9, &id).await;
+            assert_eq!(
+                missing["result"]["structuredContent"]["result"]["output_unavailable"],
+                true
+            );
+            assert!(
+                missing["result"]["structuredContent"]["result"]
+                    .get("output_ref")
+                    .is_none()
+            );
+            assert!(missing.to_string().len() < 30000);
+        }
+        fx.plugin_host.stop(PLUGIN_ID).await.unwrap();
+    }
 }

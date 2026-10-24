@@ -13,7 +13,7 @@ use crate::verify_target::{
     MismatchReason, NoCandidateReason, Sample, VerifyTarget, VerifyTargetEvidence, render_reasons,
 };
 
-mod receipt;
+pub mod receipt;
 
 #[cfg(test)]
 mod gate_text_tests;
@@ -398,7 +398,9 @@ impl Observation {
                     *attempt,
                 );
                 // The tail is rendered with runs of identical consecutive lines folded; the stored observation keeps every line.
-                let log_tail = collapse_repeated_lines(log_tail);
+                let log_tail = receipt::preview(&serde_json::Value::String(
+                    collapse_repeated_lines(log_tail),
+                ));
                 // #2405: only a candidate-bound verdict that sampled its checkout can be re-run on
                 // its candidate. An unsampled one (a stuck prepare, or a gate whose processes were
                 // not proven stopped) may be refused by the re-run's admission, so it gets no hint.
@@ -416,14 +418,23 @@ impl Observation {
                     ""
                 };
                 let paths = format!(
-                    "Read the full log at runs/{idempotency_key}/gates/{attempt}.log; read the worker output at runs/{idempotency_key}.md."
+                    "Gate log reference: runs/{idempotency_key}/gates/{attempt}.log; read the worker output at runs/{idempotency_key}.md."
                 );
+                let paths = match failing_step.as_deref().filter(|_| !*passed) {
+                    Some(step) => format!(
+                        "{paths} Failed step: `neige track cat runs/{idempotency_key}/gates/{attempt}.log --step '{}'`.",
+                        step.replace('\'', "'\\''")
+                    ),
+                    None => paths,
+                };
                 // A passed gate's tail is not evidence the Planner acts on, and it was half of all
                 // kernel-written turn input (#2536); the log path stays.
                 if *passed {
                     format!("{head} {paths}")
                 } else {
-                    format!("{head} Log tail:\n{log_tail}\n{paths}{regate}")
+                    format!(
+                        "{head} Log tail (untrusted JSON-quoted preview):\n{log_tail}\n{paths}{regate}"
+                    )
                 }
             }
             Observation::TaskGitDeliverySettled {
@@ -562,7 +573,7 @@ impl Observation {
 /// Appended to a failed candidate-bound gate wake whose checkout was sampled (#2405).
 const REGATE_HINT: &str = " If an environment cause failed this gate, fix it, then re-run it on the same candidate with neige_task_regate.";
 
-/// The head sentence of a gate-result wake (everything before ` Log tail:`, or before the log path
+/// The head sentence of a gate-result wake (everything before the log tail preview or log path
 /// on a pass), #1727 S4 D3.
 /// A refused, discarded or no-candidate target names the target instead of the step verdict;
 /// every other target (`Unbound`, `Verified` with no reasons, `Unsampled`, absent) keeps the step
@@ -872,7 +883,7 @@ mod tests {
             target: None,
         };
         let text = obs.to_turn_text();
-        assert!(text.contains("Log tail:\nok\nwarn (×3)\n"), "{text}");
+        assert!(text.contains("\"text\":\"ok\\nwarn (×3)\\n\""), "{text}");
         assert!(!text.contains("warn\nwarn"), "{text}");
     }
 
@@ -898,7 +909,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                " Read the full log at runs/w:k/gates/1.log; read the worker output at runs/w:k.md."
+                " Gate log reference: runs/w:k/gates/1.log; read the worker output at runs/w:k.md."
             ),
             "{text}"
         );
@@ -934,9 +945,12 @@ mod tests {
             }
         );
         assert!(
-            decoded.to_turn_text().starts_with(
-                "Task k gate FAILED at step test (exit 101) (gate run 2). Earlier steps passed; later steps did not run. Log tail:\nboom\n"
-            ),
+            decoded.to_turn_text().starts_with(concat!(
+                "Task k gate FAILED at step test (exit 101) (gate run 2). ",
+                "Earlier steps passed; later steps did not run. ",
+                "Log tail (untrusted JSON-quoted preview):\n",
+                "{\"text\":\"boom\\n\",\"truncated\":false}\n"
+            )),
             "{}",
             decoded.to_turn_text()
         );

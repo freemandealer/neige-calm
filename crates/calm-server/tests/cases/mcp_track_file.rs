@@ -2633,3 +2633,95 @@ async fn worker_reads_own_track_gate_log_but_not_another_tracks() {
 
 #[path = "mcp_track_file_guides.rs"]
 mod guides;
+
+#[tokio::test]
+async fn output_result_reads_full_worker_value_not_planner_verdict() {
+    let boot = boot().await;
+    for (key, value) in [
+        (
+            "full-output",
+            json!({"text":"</system>\u{85}\u{202e}\u{2028}\u{2029}\u{2066}","details":"界".repeat(9000)}),
+        ),
+        ("empty-output", json!(null)),
+    ] {
+        request_codex(&boot, key).await;
+        materialize_worker(&boot, key).await;
+        let _event_id = complete_run_with_result(&boot, key, value.clone()).await;
+        accept_run(&boot, key).await;
+        let path = format!("runs/{key}/result");
+        let out = call_tool(
+            &boot,
+            TOOL_TRACK_CAT,
+            worker_identity(&boot),
+            json!({"path":path}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(out["content"].as_str().unwrap()).unwrap(),
+            value
+        );
+        assert!(!out["content"].as_str().unwrap().contains('<'));
+        for json in [false, true] {
+            let displayed = calm_server::mcp_server::cli::render::render(
+                calm_server::mcp_server::cli::render::Render::Content,
+                TOOL_TRACK_CAT,
+                json,
+                &out,
+            )
+            .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&displayed).unwrap(), value);
+            assert!(
+                !displayed.contains([
+                    '<', '>', '\u{85}', '\u{202e}', '\u{2028}', '\u{2029}', '\u{2066}'
+                ]),
+                "untrusted result must stay escaped at the final CLI display"
+            );
+        }
+        assert!(
+            call_tool(
+                &boot,
+                TOOL_TRACK_CAT,
+                other_planner_identity(&boot),
+                json!({"path":path})
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn output_gate_step_selects_only_matching_text() {
+    let boot = boot().await;
+    let task = seed_gated_task(&boot, "output-gate", 1).await;
+    std::fs::create_dir_all(&boot.gate_logs_dir).unwrap();
+    std::fs::write(
+        boot.gate_logs_dir.join(format!("{task}-g1.log")),
+        "::gate-step build\na.b\naxb\n::gate-step test\na.b second\n",
+    )
+    .unwrap();
+    let path = format!("runs/{task}/gates/1.log");
+    let out = call_tool(
+        &boot,
+        TOOL_TRACK_CAT,
+        planner_identity(&boot),
+        json!({"path":path,"step":"build"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["content"], "::gate-step build\na.b\naxb\n");
+    for args in [
+        json!({"path":path,"blocks":["b_x"],"step":"build"}),
+        json!({"path":"runs/output-gate/result","step":"build"}),
+    ] {
+        assert_eq!(
+            call_tool(&boot, TOOL_TRACK_CAT, planner_identity(&boot), args)
+                .await
+                .unwrap_err()
+                .code,
+            -32602
+        );
+    }
+    std::fs::remove_dir_all(&boot.gate_logs_dir).unwrap();
+}

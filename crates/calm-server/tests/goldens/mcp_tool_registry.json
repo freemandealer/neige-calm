@@ -409,7 +409,7 @@
   },
   {
     "name": "neige_op_show",
-    "description_sha256": "cf9102f06b1c086c6697455731a2604aae8141a281c4ce493fe680cf204d972c",
+    "description_sha256": "850c244302504bf3e40d62a48bc8f40390bb45bbc914d167d89add8d29d3cb3e",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -1703,7 +1703,7 @@
   },
   {
     "name": "neige_track_cat",
-    "description_sha256": "d6ab35677ab7c06c8e29a8e98f3fca00bee4a5e7aa027ffd6fcf1a2a17810f87",
+    "description_sha256": "56504599d3e554143fe121672bd894eca8776a6f8f67e1e687a5c911926730d7",
     "input_schema": {
       "additionalProperties": false,
       "properties": {
@@ -1725,6 +1725,11 @@
           },
           "minItems": 1,
           "type": "array"
+        },
+        "step": {
+          "description": "Gate logs only: select one displayed step.",
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [

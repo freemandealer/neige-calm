@@ -661,7 +661,10 @@ fn every_positional_is_also_its_option() {
     );
     assert_eq!(
         refusal(&["track", "cat", "a", "--path", "b"]),
-        "unexpected argument `a`; usage: neige track cat <path> [--blocks <id,...> | --sections <heading,...>] [--json]"
+        concat!(
+            "unexpected argument `a`; usage: neige track cat <path> ",
+            "[--blocks <id,...> | --sections <heading,...>] [--step NAME] [--json]"
+        )
     );
     for command in COMMANDS {
         for slot in command.positionals {
@@ -983,4 +986,10 @@ fn task_report_surfaces_name_the_execution_id_attempt_id() {
             );
         }
     }
+}
+
+#[test]
+fn gate_step_reaches_track_cat() {
+    let parsed = parse_args(&["track", "cat", "runs/a/gates/1.log", "--step", "test"]).unwrap();
+    assert_eq!(parsed.args["step"], "test");
 }

@@ -36,9 +36,10 @@ where
     Arc::new(move |ctx, identity, args| -> ToolHandlerFuture {
         let result = f(ctx, identity, args);
         Box::pin(async move {
-            result
-                .await
-                .map(crate::mcp_server::result::ToolResult::structured)
+            result.await.map(|value| {
+                let text = calm_types::observation::receipt::escape_json(&value.to_string());
+                crate::mcp_server::result::ToolResult::structured_with_summary(value, text)
+            })
         })
     })
 }
@@ -75,6 +76,7 @@ fn cat_descriptor() -> ToolDescriptor {
             "required": ["path"],
             "properties": {
                 "path": { "type": "string" },
+                "step": { "type": "string", "minLength": 1, "description": "Gate logs only: select one displayed step." },
                 "blocks": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -144,6 +146,22 @@ async fn track_cat(
 ) -> Result<Value, RpcError> {
     let path = parse_path_arg(&args, true)?;
     let selection = parse_selection_arg(&args)?;
+    let step = args
+        .get("step")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|step| !step.is_empty())
+                .ok_or_else(|| RpcError::invalid_params("step must be a non-empty string"))
+        })
+        .transpose()?;
+    if step.is_some()
+        && (selection.is_some() || !path.ends_with(".log") || !path.starts_with("runs/"))
+    {
+        return Err(RpcError::invalid_params(
+            "step selects gate logs only, without report selectors",
+        ));
+    }
     if let Some(area_path) = area_reports::classify(&path) {
         return super::area_reports::cat(&ctx, &identity, &path, area_path, selection.as_ref())
             .await;
@@ -167,10 +185,25 @@ async fn track_cat(
     // Gate logs are enabled only here (MCP carries a card identity, so the track is the caller's own); the gate-logs dir is the configured one, never recomputed from env.
     let view = TrackFsView::new(ctx.repo.as_ref(), &ctx.write)
         .with_gate_log_access(ctx.gate_logs_dir.clone());
-    let content = view
-        .cat(&track, path.as_str())
-        .await
-        .map_err(track_fs_error_to_rpc)?;
+    let mut content = if let Some(op_id) = path
+        .strip_prefix("ops/")
+        .and_then(|rest| rest.strip_suffix("/result"))
+    {
+        let op = super::op::lookup(&ctx, &identity, op_id).await?;
+        TrackFsContent {
+            content: crate::mcp_server::forge_receipt::output::read(&op)
+                .await
+                .map_err(|error| RpcError::invalid_params(error.to_string()))?,
+            content_type: "text/plain".into(),
+        }
+    } else {
+        view.cat(&track, path.as_str())
+            .await
+            .map_err(track_fs_error_to_rpc)?
+    };
+    if let Some(step) = step {
+        content.content = super::output_projection::step_text(&content.content, step);
+    }
     serde_json::to_value(content)
         .map_err(|e| RpcError::internal(format!("json serialization: {e}")))
 }

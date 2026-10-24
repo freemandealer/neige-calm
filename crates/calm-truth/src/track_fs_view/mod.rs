@@ -212,6 +212,9 @@ impl<'a> TrackFsView<'a> {
                         .map_err(|e| TrackFsError::Internal(format!("planner messages: {e}")))?;
                     return content_json(&messages);
                 }
+                if parts.len() == 3 && parts[2] == "result" {
+                    return self.run_result(track, parts[1]).await;
+                }
                 let runs = self.runs_for_track(track).await?;
                 let run_path = path.trim_start_matches("runs/");
                 if let Some(key) = run_path.strip_suffix(".md") {
@@ -226,6 +229,48 @@ impl<'a> TrackFsView<'a> {
             }
             other => Err(path_not_available(other)),
         }
+    }
+
+    /// Read the immutable worker completion value from the authoritative projection.
+    async fn run_result(
+        &self,
+        track: &Track,
+        attempt_id: &str,
+    ) -> Result<TrackFsContent, TrackFsError> {
+        let event = self
+            .run_output_event(track, attempt_id, "completed")
+            .await?;
+        let result = event
+            .payload
+            .get("result")
+            .ok_or_else(|| path_not_available("missing worker result"))?;
+        let mut content = content_json(result)?;
+        content.content = calm_types::observation::receipt::escape_json(&content.content);
+        Ok(content)
+    }
+
+    /// Authoritative worker event projection, shared by result reads and receipt matching.
+    /// Planner verdict events are deliberately excluded by `project_runs`.
+    pub async fn run_output_event(
+        &self,
+        track: &Track,
+        attempt_id: &str,
+        kind: &str,
+    ) -> Result<TrackFsRunEventRef, TrackFsError> {
+        let runs = self.runs_for_track(track).await?;
+        let run = run_by_key(&runs, attempt_id)?;
+        let event = match kind {
+            "completed" => run.completed_event.as_ref(),
+            "failed" => run.failed_event.as_ref(),
+            _ => None,
+        }
+        .ok_or_else(|| path_not_available(&format!("runs/{attempt_id}/result")))?;
+        Ok(TrackFsRunEventRef {
+            event_id: event.event_id,
+            created_at: event.at,
+            kind: event.kind.to_owned(),
+            payload: event.payload.clone(),
+        })
     }
 
     async fn cards_for_track(&self, track: &Track) -> Result<Vec<Card>, TrackFsError> {

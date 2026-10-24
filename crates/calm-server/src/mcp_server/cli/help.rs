@@ -114,7 +114,7 @@ const HELP: &[CommandHelp] = &[
     command_help!(
         track_file::TOOL_TRACK_CAT,
         "Print one file from the current track view",
-        "Usage: neige track cat <path> [--blocks <id,...> | --sections <heading,...>] [--json]",
+        "Usage: neige track cat <path> [--blocks <id,...> | --sections <heading,...>] [--step NAME] [--json]",
         "",
         "Arguments:",
         "  <path>  View path to read (also --path)",
@@ -135,6 +135,8 @@ const HELP: &[CommandHelp] = &[
         "Options:",
         "      --blocks <id,...>            Print only these blocks of a report (comma-separated ids)",
         "      --sections <heading,...>     Print only these H1 sections of a report",
+        "      --step NAME                 Select one displayed gate-log step",
+        "Pipe track cat into tail or grep to narrow text further.",
         "      --json                       Emit errors as JSON",
         "  -h, --help                       Print help",
     ),

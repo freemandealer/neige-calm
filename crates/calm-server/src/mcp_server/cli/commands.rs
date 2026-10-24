@@ -206,6 +206,7 @@ pub(crate) const COMMANDS: &[Command] = &[
         tool: track_file::TOOL_TRACK_CAT,
         positionals: &[pos("path", true)],
         options: &[
+            opt("--step", "step", OptValue::Text, false),
             opt("--blocks", "blocks", OptValue::CommaList, false),
             opt("--sections", "sections", OptValue::CommaList, false),
         ],
