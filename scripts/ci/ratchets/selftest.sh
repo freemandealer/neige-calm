@@ -107,7 +107,7 @@ run_clean_case() {
       exit 1
     fi
   done
-  echo "PASS clean: both ratchets accepted legal 0055 regression fixture"
+  echo "PASS clean: both ratchets accepted historical migrations and non-SQL fixtures"
 }
 
 run_single_mutation_case() {
