@@ -70,6 +70,7 @@ pub struct ChildTrackAdapter {
     track_area_cache: crate::track_area_cache::TrackAreaCache,
     /// The managed workspace root; the child's own workspace is derived under it and materialized in `prepare_tx`.
     workspace_root: std::path::PathBuf,
+    teardown_targets: workspace_runtime::sweep::TeardownTargets,
     selection_context: Option<crate::planner_model::child_selection::ChildSelectionContext>,
 }
 
@@ -79,12 +80,14 @@ impl ChildTrackAdapter {
         card_role_cache: crate::card_role_cache::CardRoleCache,
         track_area_cache: crate::track_area_cache::TrackAreaCache,
         workspace_root: std::path::PathBuf,
+        teardown_targets: workspace_runtime::sweep::TeardownTargets,
     ) -> Self {
         Self {
             acp_planner,
             card_role_cache,
             track_area_cache,
             workspace_root,
+            teardown_targets,
             selection_context: None,
         }
     }
@@ -141,6 +144,14 @@ impl ChildTrackAdapter {
         };
         let plan = child_workspace_plan(&frozen.track.workspace, &self.workspace_root)?;
         let seed = render_child_seed(&payload);
+        calm_truth::db::sqlite::admit_attached_workspace_tx(
+            tx,
+            &frozen.track.workspace.path,
+            &self.workspace_root,
+            &self.teardown_targets.snapshot(),
+            &plan,
+        )
+        .await?;
         let child = track_create_tx(
             tx,
             NewTrack {
@@ -377,6 +388,13 @@ impl ProviderAdapter for ChildTrackAdapter {
                     "(child)",
                     &repository,
                 )?;
+                // Freeze the physical repository root, as the independent create entry does.
+                let repo_root = std::fs::canonicalize(&repo_root).map_err(|error| {
+                    CalmError::BadRequest(format!(
+                        "cannot resolve repository root {}: {error}",
+                        repo_root.display()
+                    ))
+                })?;
                 Ok((head, repo_root))
             })
             .await
@@ -537,6 +555,12 @@ mod tests {
             .to_path_buf()
     }
 
+    fn test_parent_path() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| tempfile::tempdir().expect("attached parent directory"))
+            .path()
+    }
+
     pub(super) async fn seed_parent(
         repo: &SqlxRepo,
         non_default_lifecycle_metadata: bool,
@@ -559,7 +583,7 @@ mod tests {
                 area_id: area.id,
                 title: "parent".into(),
                 sort: None,
-                cwd: "/parent-cwd".into(),
+                cwd: test_parent_path().to_str().unwrap().into(),
                 template_id: Some("must-not-inherit".into()),
                 plugin_scope: Some("must-inherit-plugin".into()),
                 template_input: Some(json!({"must":"not-inherit"})),
@@ -764,6 +788,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let output = adapter
@@ -845,6 +870,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             workspace_root.clone(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let output = adapter
@@ -971,6 +997,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             workspace_root.clone(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let output = adapter
@@ -1128,6 +1155,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let output = adapter
@@ -1223,6 +1251,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let output = adapter
@@ -1261,12 +1290,10 @@ mod tests {
         }
         let child_id = output.data["child_track_id"].as_str().unwrap();
         // Attached children own a worktree under the same repository.
-        let expected_child_workspace = workspace::worktree::track_worktree_path_for(
-            std::path::Path::new("/parent-cwd"),
-            child_id,
-        )
-        .to_string_lossy()
-        .into_owned();
+        let expected_child_workspace =
+            workspace::worktree::track_worktree_path_for(test_parent_path(), child_id)
+                .to_string_lossy()
+                .into_owned();
         assert_eq!(output.data["cwd"], expected_child_workspace);
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT workspace_kind FROM tracks WHERE id=?1")
@@ -1296,7 +1323,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            inherited.0, "/parent-cwd",
+            inherited.0,
+            test_parent_path().to_str().unwrap(),
             "workspace_path retains the source repository; agent_cwd uses the child worktree"
         );
         assert_eq!(inherited.1, None, "template_id must not inherit");
@@ -1348,6 +1376,7 @@ mod tests {
                 repo.card_role_cache().clone(),
                 repo.track_area_cache().clone(),
                 test_workspace_root(),
+                workspace_runtime::sweep::TeardownTargets::default(),
             );
             let mut tx = repo.pool().begin().await.unwrap();
             let output = adapter
@@ -1385,6 +1414,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let error = adapter
@@ -1423,6 +1453,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         adapter
@@ -1460,6 +1491,7 @@ mod tests {
                 repo.card_role_cache().clone(),
                 repo.track_area_cache().clone(),
                 test_workspace_root(),
+                workspace_runtime::sweep::TeardownTargets::default(),
             );
             let mut tx = repo.pool().begin().await.unwrap();
             let output = adapter
@@ -1512,6 +1544,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         sqlx::query("UPDATE tracks SET tree_task_budget=2 WHERE id=?1")
             .bind(&parent)
@@ -1586,6 +1619,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         adapter
@@ -1741,6 +1775,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let mut tx = repo.pool().begin().await.unwrap();
         let error = adapter
@@ -1829,6 +1864,7 @@ mod tests {
             repo.card_role_cache().clone(),
             repo.track_area_cache().clone(),
             test_workspace_root(),
+            workspace_runtime::sweep::TeardownTargets::default(),
         );
         let before: i64 = sqlx::query_scalar("SELECT count(*) FROM tracks")
             .fetch_one(repo.pool())

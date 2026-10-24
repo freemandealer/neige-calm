@@ -452,3 +452,105 @@ fn detached_worktree_symlinked_parent_reuses_and_removes_registration() {
     assert!(!path.exists());
     assert!(!git_stdout(&repo, ["worktree", "list", "--porcelain"]).contains("detached"));
 }
+
+#[test]
+fn track_worktree_post_admission_ancestor_swap_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo);
+    let path = crate::worktree::track_worktree_path_for(&repo, "swap");
+    let target = crate::worktree::track_worktree_target("swap", path.to_str().unwrap()).unwrap();
+    let redirected = tmp.path().join("redirected");
+    std::fs::create_dir(&redirected).unwrap();
+    std::fs::create_dir(repo.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(&redirected, repo.join(".claude/worktrees")).unwrap();
+    let result = crate::worktree::ensure_track_worktree(
+        &target,
+        |root, _| crate::base::resolve_head_base(root),
+        |_, _| {},
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert!(!redirected.join("track-swap").exists());
+    assert!(!git_ref_exists(&repo, &format!("refs/heads/{}", target.branch)).unwrap());
+}
+
+#[test]
+fn track_worktree_redirect_during_add_is_left_intact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo);
+    let path = crate::worktree::track_worktree_path_for(&repo, "during-add");
+    let target =
+        crate::worktree::track_worktree_target("during-add", path.to_str().unwrap()).unwrap();
+    let redirected = tmp.path().join("redirected");
+    std::fs::create_dir(&redirected).unwrap();
+    let result = crate::worktree::ensure_track_worktree(
+        &target,
+        |root, _| {
+            std::fs::create_dir_all(root.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(&redirected, root.join(".claude/worktrees")).unwrap();
+            crate::base::resolve_head_base(root)
+        },
+        |_, _| {},
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(redirected.join("track-during-add/README.md")).unwrap(),
+        "initial\n"
+    );
+    assert!(repo.join(".claude/worktrees").is_symlink());
+    let listed = git_stdout(&repo, ["worktree", "list", "--porcelain"]);
+    assert!(listed.contains("track-during-add"), "{listed}");
+}
+
+#[test]
+fn track_worktree_post_checkout_redirect_preserves_preexisting_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_git_repo(&repo);
+    let path = crate::worktree::track_worktree_path_for(&repo, "hook-redirect");
+    let target =
+        crate::worktree::track_worktree_target("hook-redirect", path.to_str().unwrap()).unwrap();
+    let other = tmp.path().join("preexisting");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join("sentinel"), "keep me\n").unwrap();
+    let moved = tmp.path().join("moved-checkout");
+    let hook = repo.join(".git/hooks/post-checkout");
+    // Git runs this hook inside the newly added checkout. Its copied pointer still
+    // identifies the registration at `path`, despite the directory substitution.
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -eu\ncp .git '{other}/.git'\nmv '{path}' '{moved}'\nln -s '{other}' '{path}'\n",
+            other = other.display(),
+            path = path.display(),
+            moved = moved.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let result = crate::worktree::ensure_track_worktree(
+        &target,
+        |root, _| crate::base::resolve_head_base(root),
+        |_, _| {},
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("refusing redirected worktree"), "{error}");
+    assert!(other.is_dir(), "pre-existing directory was removed");
+    assert_eq!(
+        std::fs::read_to_string(other.join("sentinel")).expect("sentinel was deleted"),
+        "keep me\n"
+    );
+    assert_eq!(std::fs::read_link(&path).unwrap(), other);
+    assert_eq!(
+        std::fs::read_to_string(moved.join("README.md")).unwrap(),
+        "initial\n"
+    );
+    let pointer = std::fs::read(moved.join(".git")).unwrap();
+    assert_eq!(std::fs::read(other.join(".git")).unwrap(), pointer);
+    let listed = git_stdout(&repo, ["worktree", "list", "--porcelain"]);
+    assert!(listed.contains(path.to_str().unwrap()), "{listed}");
+}

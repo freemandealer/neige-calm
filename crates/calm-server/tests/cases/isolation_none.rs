@@ -624,3 +624,155 @@ async fn isolation_none_reset_response_projects_workspace() {
     assert_eq!(value["track"]["workspace"]["isolation"], "none", "{value}");
     assert_eq!(fingerprint(&source), before);
 }
+
+#[tokio::test]
+async fn worktree_admission_refuses_owned_locations_and_symlinks() {
+    let b = boot().await;
+    let area = create_area(&b, "owned-worktree-admission").await;
+    let (_, managed) = managed_track(&b, &area, "managed").await;
+    user_repo(&b.workspace_root);
+    let system = user_repo(&b.workspace_root.join("system-area"));
+    let trash = user_repo(&b.workspace_root.join(".trash"));
+    let source = user_repo(&b.tmp.path().join("source"));
+    let owner = attached_track(&b, &area, "owner", &source).await;
+    let worktree = PathBuf::from(
+        b.repo
+            .track_get(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .worktree
+            .unwrap(),
+    );
+    let managed_sub = managed.join("sub");
+    let worktree_sub = worktree.join("sub");
+    std::fs::create_dir(&managed_sub).unwrap();
+    std::fs::create_dir(&worktree_sub).unwrap();
+    // The lexical fence must also refuse a symlink pointing OUT of an owned root.
+    let outward = managed.join("outside-alias");
+    std::os::unix::fs::symlink(&source, &outward).unwrap();
+    for (i, root) in [
+        b.workspace_root.clone(),
+        managed,
+        managed_sub,
+        system,
+        trash,
+        worktree,
+        worktree_sub,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let alias = b.tmp.path().join(format!("worktree-alias-{i}"));
+        std::os::unix::fs::symlink(root, &alias).unwrap();
+        for cwd in [root, &alias] {
+            assert_worktree_refused(&b, &area, cwd).await;
+        }
+    }
+    assert_worktree_refused(&b, &area, &outward).await;
+}
+
+async fn assert_worktree_refused(b: &Boot, area: &str, cwd: &Path) {
+    let mut body = none_body(area, cwd);
+    body["isolation"] = json!("worktree");
+    let (status, error) = request(b.app.clone(), "POST", "/api/tracks", Some(body)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}: {error}",
+        cwd.display()
+    );
+    assert!(error.contains("Neige-owned location"), "{error}");
+}
+
+#[tokio::test]
+async fn worktree_admission_allows_repository_containing_owned_worktrees() {
+    let b = boot().await;
+    let area = create_area(&b, "repository-worktree-admission").await;
+    let source = user_repo(&b.tmp.path().join("source"));
+    let first = attached_track(&b, &area, "first", &source).await;
+    let alias = b.tmp.path().join("repository-alias");
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    let second = attached_track(&b, &area, "second", &alias).await;
+    assert_ne!(first, second);
+    for id in [first, second] {
+        let track = b.repo.track_get(&id).await.unwrap().unwrap();
+        let root = PathBuf::from(track.workspace.worktree.unwrap());
+        assert_eq!(
+            root,
+            workspace::worktree::track_worktree_path_for(&source, &id)
+        );
+        assert_eq!(std::fs::canonicalize(&root).unwrap(), root);
+        assert!(root.join(".git").is_file());
+    }
+}
+
+async fn assert_redirect_admission(i: usize) {
+    let b = boot().await;
+    let area = create_area(&b, "redirect-admission").await;
+    let (_, managed) = managed_track(&b, &area, "managed").await;
+    let owner_source = user_repo(&b.tmp.path().join("owner-source"));
+    let owner = attached_track(&b, &area, "owner", &owner_source).await;
+    let owned_worktree = PathBuf::from(
+        b.repo
+            .track_get(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .worktree
+            .unwrap(),
+    );
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM tracks")
+        .fetch_one(b.repo.pool())
+        .await
+        .unwrap();
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM area_folders")
+        .fetch_one(b.repo.pool())
+        .await
+        .unwrap();
+    let destinations = [managed, b.workspace_root.clone(), owned_worktree];
+    let destination = &destinations[i];
+    let source = user_repo(&b.tmp.path().join(format!("redirect-source-{i}")));
+    if i == 0 {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["config", "core.worktree", destination.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    } else {
+        std::fs::create_dir_all(source.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(destination, source.join(".claude/worktrees")).unwrap();
+    }
+    assert_worktree_refused(&b, &area, &source).await;
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM tracks")
+        .fetch_one(b.repo.pool())
+        .await
+        .unwrap();
+    let after_claims: i64 = sqlx::query_scalar("SELECT count(*) FROM area_folders")
+        .fetch_one(b.repo.pool())
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after_claims, claims);
+}
+
+#[tokio::test]
+async fn worktree_admission_refuses_redirected_repository_without_claims() {
+    assert_redirect_admission(0).await;
+}
+
+#[tokio::test]
+async fn worktree_admission_refuses_redirected_target_managed_root_without_claims() {
+    assert_redirect_admission(1).await;
+}
+
+#[tokio::test]
+async fn worktree_admission_refuses_redirected_target_owned_worktree_without_claims() {
+    assert_redirect_admission(2).await;
+}
