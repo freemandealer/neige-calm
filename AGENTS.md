@@ -152,6 +152,12 @@ in the pull request so reviewers can assess the boundary and maintenance cost.
   do not apply those rules or commands to the legacy `web/` tree.
 - Keep hand-written source files at or below 800 lines where practical. Split by
   responsibility and explain any necessary exception for core code.
+- Assert caller-observable contracts: error variants, status codes or stable codes, not full messages
+  unless reviewed agent- or user-facing copy is itself a contract. Assert call counts and order only
+  when they define behavior (idempotency, no duplicate submissions, boundary enforcement). Do not use assertions
+  merely to pin implementation details: internal shapes, test-only markers, historical results of frozen
+  migrations, or source/documentation wording or order. Reviewed static rules enforcing declared architecture,
+  security, registration completeness, or replay invariants remain valid, subject to Cost of permanence.
 
 ## Mutation verification
 
