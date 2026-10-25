@@ -1,0 +1,209 @@
+//! Conservative removal of an event-owned extra Git worktree. No force, prune, branch deletion,
+//! or directory fallback. Lifecycle fences and event ownership are supplied by the caller.
+use crate::{
+    base,
+    bounded_git::{BoundedOutput, GIT_BOUND},
+    command::isolated_git_command,
+    error::{Error, Result},
+    git::{GitWorktreeRegistration, git_failed},
+    metadata_lock,
+};
+use std::{
+    path::{Path, PathBuf},
+    process::Output,
+    time::Instant,
+};
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ReclaimRequest {
+    pub repo: PathBuf,
+    pub path: PathBuf,
+    /// Live/default checkouts and all other outstanding claims. Ancestors are protected too.
+    pub protected: Vec<PathBuf>,
+    /// Ref names or prefixes scheduled for deletion by the same sweep.
+    pub excluded_refs: Vec<String>,
+    pub ownership_conflict: bool,
+    /// Current cwd cannot be proven for an unsettled terminal, even in another track.
+    pub unknown_terminal: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    Removed,
+    Retained(&'static str),
+}
+
+/// A preflight either retains the path or returns the isolated command with its metadata lock.
+/// External Git and filesystem writers remain outside this cooperative lock.
+pub enum Preparation {
+    Ready(Box<PreparedReclaim>),
+    Retained(&'static str),
+}
+
+/// Keeps the same cooperative Git metadata lock through the execution's settlement.
+/// The caller must retain this value until the exact admitted command has stopped.
+pub struct PreparedReclaim {
+    _lock: metadata_lock::GitMetadataLock,
+    pub command: std::process::Command,
+    deadline: Instant,
+}
+
+pub fn reclaim(request: &ReclaimRequest, observe: impl Fn(&str, &Path)) -> Result<ReclaimOutcome> {
+    match prepare(request, observe)? {
+        Preparation::Retained(reason) => Ok(ReclaimOutcome::Retained(reason)),
+        Preparation::Ready(mut prepared) => {
+            let result = prepared
+                .command
+                .bounded_output(prepared.deadline)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            if !result.status.success() {
+                return Err(git_failed("extra worktree reclaim", &request.repo, &result));
+            }
+            Ok(ReclaimOutcome::Removed)
+        }
+    }
+}
+
+fn command(repo: &Path) -> std::process::Command {
+    let mut command = isolated_git_command();
+    command
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-C",
+        ])
+        .arg(repo);
+    command
+}
+
+pub fn prepare(request: &ReclaimRequest, observe: impl Fn(&str, &Path)) -> Result<Preparation> {
+    use Preparation::Retained;
+    let path = &request.path;
+    if !path.is_absolute() {
+        return Ok(Retained("relative path"));
+    }
+    if request.ownership_conflict {
+        return Ok(Retained("ownership conflict"));
+    }
+    if request.unknown_terminal {
+        return Ok(Retained("unsettled terminal"));
+    }
+    if request.protected.iter().any(|p| {
+        !p.is_absolute()
+            || p.starts_with(path)
+            || std::fs::canonicalize(p)
+                .ok()
+                .is_some_and(|real| real.starts_with(path))
+    }) {
+        return Ok(Retained("protected checkout or descendant"));
+    }
+    // Resolving aliases is useful for identifying them, never permission to remove them.
+    if std::fs::canonicalize(path).ok().as_ref() != Some(path)
+        || base::is_symlink_leaf(&path.join(".git"))?
+        || !path.join(".git").is_file()
+    {
+        return Ok(Retained("non-canonical or missing linked checkout"));
+    }
+    let deadline = Instant::now() + GIT_BOUND;
+    let _lock = metadata_lock::GitMetadataLock::acquire(&request.repo, &observe)?;
+    let listed = git(
+        &request.repo,
+        &["worktree", "list", "--porcelain", "-z"],
+        deadline,
+    )?;
+    if base::worktree_registration_in(&listed.stdout, &request.repo, path)?
+        != GitWorktreeRegistration::Present
+        || base::lease_git_common_dir(path)? != base::lease_git_common_dir(&request.repo)?
+    {
+        return Ok(Retained("foreign registration"));
+    }
+    let top = git(path, &["rev-parse", "--show-toplevel"], deadline)?;
+    if String::from_utf8_lossy(&top.stdout).trim_end() != path.to_string_lossy() {
+        return Ok(Retained("checkout identity mismatch"));
+    }
+    // Git status (and even no-force worktree remove) can hide tracked edits under
+    // assume-unchanged or skip-worktree. The public ls-files -v protocol uses
+    // lowercase tags for assume-unchanged and S/s for skip-worktree. Only ordinary
+    // cached entries (H) let status establish cleanliness; retain sparse checkouts
+    // and unexpected records too, without changing the user's index flags.
+    let index = git(path, &["ls-files", "--cached", "-v", "-z"], deadline)?;
+    if !index_allows_status(&index.stdout) {
+        return Ok(Retained("hidden or unknown index state"));
+    }
+    let status = git(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        deadline,
+    )?;
+    if !status.stdout.is_empty() {
+        return Ok(Retained("dirty"));
+    }
+    let head = git(path, &["rev-parse", "--verify", "HEAD^{commit}"], deadline)?;
+    let head = String::from_utf8(head.stdout).map_err(|e| Error::Internal(e.to_string()))?;
+    let refs = git(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "--contains",
+            head.trim(),
+        ],
+        deadline,
+    )?;
+    let refs = String::from_utf8(refs.stdout).map_err(|e| Error::Internal(e.to_string()))?;
+    if !refs.lines().any(|name| {
+        !request.excluded_refs.iter().any(|excluded| {
+            if excluded.ends_with('/') {
+                name.starts_with(excluded)
+            } else {
+                name == excluded
+            }
+        })
+    }) {
+        return Ok(Retained("no surviving ref"));
+    }
+    // This observation is deliberately immediately before the attempt, after every preflight.
+    observe("extra-worktree-remove-attempt", path);
+    let mut command = command(&request.repo);
+    command.args([
+        "worktree",
+        "remove",
+        "--",
+        base::utf8_path(path, "extra worktree")?,
+    ]);
+    Ok(Preparation::Ready(Box::new(PreparedReclaim {
+        _lock,
+        command,
+        deadline,
+    })))
+}
+
+fn index_allows_status(output: &[u8]) -> bool {
+    output
+        .split_inclusive(|byte| *byte == 0)
+        .all(|record| record.starts_with(b"H ") && record.len() > 3 && record.last() == Some(&0))
+}
+
+fn git(repo: &Path, args: &[&str], deadline: Instant) -> Result<Output> {
+    let result = command(repo)
+        .args(args)
+        .bounded_output(deadline)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    if !result.status.success() {
+        return Err(git_failed("extra worktree reclaim", repo, &result));
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests;

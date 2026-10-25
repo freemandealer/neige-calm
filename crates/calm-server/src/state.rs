@@ -600,6 +600,7 @@ fn build_operation_adapters(
     );
     (
         vec![
+            Arc::new(crate::workspace_service::reclaim::operation::Adapter::new()),
             typed_terminal,
             terminal_adapter,
             terminal_worker_adapter,
@@ -1728,7 +1729,10 @@ impl AppState {
             crate::track_vcs::spawn_track_history_pruner(pool.clone());
             workspace_runtime::worktree_clean::spawn(
                 crate::workspace_service::ports::ServerClosedWorktreeFacts {
-                    pool: pool.read_pool().clone(),
+                    receipts: crate::workspace_service::reclaim::ServerReclaimPorts {
+                        runtime: state.operation_runtime.clone(),
+                        db: pool.clone(),
+                    },
                     runtime: state.operation_runtime.clone(),
                 },
                 crate::workspace_service::ports::observe,

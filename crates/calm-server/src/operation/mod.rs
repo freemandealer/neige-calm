@@ -52,7 +52,9 @@ pub use repo_sqlite::SqlxOperationRepo;
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub use repo_sqlite::complete_parked_for_test;
-pub(crate) use repo_sqlite::{checkpoint_app_server_interact_tx, complete_parked_tx};
+pub(crate) use repo_sqlite::{
+    checkpoint_app_server_interact_tx, complete_parked_tx, require_live_claim_tx,
+};
 use repo_sqlite::{fetch_claimed_parked, operation_from_row};
 pub use tx_only::TxOnlyAdapter;
 
@@ -94,7 +96,7 @@ pub const TASK_BOUND_ADAPTER_KINDS: [&str; 6] = [
     "child-track",
 ];
 
-pub const NON_TASK_BOUND_ADAPTER_KINDS: [&str; 12] = [
+pub const NON_TASK_BOUND_ADAPTER_KINDS: [&str; 13] = [
     card_create_adapter::CARD_CREATE,
     track_recipe_create_adapter::TRACK_RECIPE_CREATE,
     "terminal-create",
@@ -107,6 +109,7 @@ pub const NON_TASK_BOUND_ADAPTER_KINDS: [&str; 12] = [
     "planner-harness-shutdown",
     "forge-action",
     objective_check_run::KIND,
+    crate::workspace_service::reclaim::operation::KIND,
 ];
 
 #[doc(hidden)]
@@ -278,6 +281,7 @@ impl TxOutput {
 
 #[derive(Clone)]
 pub struct SpawnCtx {
+    pub(crate) reclaim_admission: Arc<tokio::sync::RwLock<()>>,
     pub track_delete_locks: crate::per_card_lock::KeyedLocks,
     pub execution: crate::execution_quiesce::ExecutionLifecycle,
     pub repo: Arc<dyn crate::db::RouteRepo>,
@@ -308,6 +312,7 @@ impl SpawnCtx {
             track_delete_locks: crate::per_card_lock::new_keyed_locks(),
             shared_codex_appserver: None,
             execution: Default::default(),
+            reclaim_admission: Default::default(),
         }
     }
 
