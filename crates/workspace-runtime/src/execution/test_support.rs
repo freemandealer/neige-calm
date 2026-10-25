@@ -273,6 +273,7 @@ pub fn intent(root: std::path::PathBuf) -> ExecutionIntent {
                 },
             },
             program: ExecutionSpecification {
+                ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
                 program: "/bin/true".into(),
                 args: vec![],
                 environment: vec![],

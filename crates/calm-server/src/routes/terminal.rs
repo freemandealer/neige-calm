@@ -140,6 +140,7 @@ pub(crate) fn launch_specification(
     path_prepend: &str,
 ) -> workspace_runtime::execution::ExecutionSpecification {
     workspace_runtime::execution::ExecutionSpecification {
+        ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
         program: "/bin/sh".into(),
         args: vec!["-c".into(), format!("{path_prepend}\n{program}")],
         environment: terminal_child_envs(env),

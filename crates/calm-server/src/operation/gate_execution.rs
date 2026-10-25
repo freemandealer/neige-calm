@@ -88,6 +88,7 @@ pub(crate) async fn admit(
         root,
         track,
         ExecutionSpecification {
+            ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
             program: "/bin/sh".into(),
             args: vec![files.script.display().to_string()],
             environment,

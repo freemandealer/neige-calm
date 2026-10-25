@@ -68,15 +68,9 @@ pub enum ExecutionRegistration {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionSpecification {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    /// Complete explicit child environment. No ambient values are added.
-    pub environment: Vec<(String, String)>,
-    pub io_mode: IoMode,
-    pub replay_bytes: usize,
-}
+mod specification;
+pub use specification::*;
+pub mod proxy;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreparedSource {
@@ -152,6 +146,24 @@ pub enum ExecutionRequest {
         execution_id: ExecutionId,
         lifecycle: CapabilityToken,
     },
+    /// Validation replies contain no supervisor environment values.
+    PreflightEnvironment(EnvironmentPreflight),
+    /// Requires a successful PreflightEnvironment response before admission.
+    PrepareAmbient(#[serde(with = "specification::ambient_prepare")] PrepareExecution),
+}
+
+impl ExecutionRequest {
+    /// Select the additive wire extension only for an explicitly ambient execution.
+    fn for_wire(self) -> Self {
+        match self {
+            Self::Prepare(request)
+                if request.specification.ambient_environment != AmbientEnvironment::None =>
+            {
+                Self::PrepareAmbient(request)
+            }
+            request => request,
+        }
+    }
 }
 
 /// All process actions, including future variants, must first resolve this exact capability.
@@ -453,7 +465,7 @@ impl RegisteredExecutorConnection {
         self.begin()?;
         rights::send(
             &self.stream,
-            &super::ControlMsg::Execution(Box::new(request)),
+            &super::ControlMsg::Execution(Box::new(request.for_wire())),
             &[],
         )
         .await?;
@@ -476,3 +488,6 @@ impl RegisteredExecutorConnection {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compatibility_tests;

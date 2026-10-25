@@ -317,10 +317,18 @@ pub(super) fn spawn(
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .collect::<Vec<_>>();
-    let environment = specification
-        .environment
-        .iter()
-        .map(|(key, value)| CString::new(format!("{key}={value}")))
+    let launch_environment = crate::child_environment::launch_environment(specification)?;
+    let environment = launch_environment
+        .decode()?
+        .into_iter()
+        .map(|(k, v)| (k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec()))
+        .chain(
+            specification
+                .environment
+                .iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())),
+        )
+        .map(|(key, value)| CString::new([key.as_slice(), b"=", value.as_slice()].concat()))
         .collect::<Result<Vec<_>, _>>()?;
     let argv = arguments
         .iter()

@@ -212,6 +212,7 @@ async fn pipe_admission(config: super::pipe::PipeConfig, gate_facade: bool) {
             cwd.path().canonicalize().unwrap(),
             "pipe-track",
             ExecutionSpecification {
+                ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "read -r go".into()],
                 environment: vec![],

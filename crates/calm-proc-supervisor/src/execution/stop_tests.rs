@@ -35,6 +35,7 @@ async fn stop_before_started_deadline_and_shutdown() {
         process_alias: "monitor-owned-child".into(),
     };
     let specification = ExecutionSpecification {
+        ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "trap '' TERM; printf ready; sleep 3".into()],
         environment: vec![],

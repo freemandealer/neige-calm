@@ -14,6 +14,7 @@ impl Payload {
         let output =
             super::super::output::OutputLog::open(&root.path().join("output"), 4096).unwrap();
         let specification = ExecutionSpecification {
+            ambient_environment: calm_session::control::execution::AmbientEnvironment::None,
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
