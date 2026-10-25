@@ -1329,6 +1329,21 @@ impl Inner {
         } else {
             return;
         };
+        let target_session = harness.worker_session_id().to_owned();
+        let observation = match crate::report_read_ledger::delta::attach(
+            self.repo.as_ref(),
+            &target_session,
+            event,
+            observation,
+        )
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => {
+                tracing::warn!(%track_id, %error, "Report suggestion failed; preserving replay cursor");
+                return;
+            }
+        };
         // Recovery may have already accepted this prefix while the Dispatcher
         // cache is cold. Share that trusted floor with every mapped observation,
         // including a failure arriving before or after its settlement replay.
@@ -1348,6 +1363,7 @@ impl Inner {
         let preceding = match crate::harness::catch_up::observations_since(
             self.repo.as_ref(),
             &track_id,
+            &target_session,
             cursor,
             Some(envelope_id - 1),
         )
@@ -1578,6 +1594,7 @@ pub(crate) fn harness_observation_from_event(
             author,
             ..
         } => Some(HarnessObservation::ReportEdited {
+            presentation: Default::default(),
             track_id: track_id.clone(),
             body_sha256: sha256_hex(body_after),
             body: body_after.clone(),
