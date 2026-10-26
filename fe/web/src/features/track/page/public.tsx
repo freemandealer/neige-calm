@@ -1,3 +1,5 @@
+import { LayerDismissal } from '../../../ui/dialog/public.tsx';
+import { LayerDepthProvider } from '@astryxdesign/core/Layer';
 import type { TrackClosedControl } from './closed-control.ts';
 import { NO_ISOLATION_LABEL, NO_ISOLATION_EXPLANATION } from '../../../../../core/domain/workspace-isolation.ts';
 import { ExplanationBadge } from '../../../ui/explanation-badge/public.tsx';
@@ -281,18 +283,11 @@ export function TrackPage({ mobileReportIntro, mobileChatComposer,
   const mobileActionsRef = useRef<HTMLSpanElement | null>(null);
   const previousPanel = useRef<MobilePanelKind | null>(null);
 
-  useEffect(() => {
-    if (!mobilePanelOpen || mobilePanelObscured) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.defaultPrevented) return;
-      // A dialog or workspace sheet owns Escape until its foreground layer closes.
-      if (document.querySelector('[data-nc-escape-layer]') !== null) return;
-      // Through the URL, not a local flag: Escape and the hardware Back button must end in the same place.
-      onClosePanel?.();
-    };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
-  }, [mobilePanelOpen, mobilePanelObscured, onClosePanel]);
+  const dismissalLayer = <LayerDismissal {...{
+    isActive: mobilePanelOpen && !mobilePanelObscured,
+    onDismiss: () => onClosePanel?.(),
+    getContainer: () => mobilePanelRef.current,
+  }} />;
 
   /* Focus: opening moves it into the panel container; closing returns it to the menu that opened it. Driven off `panel`, not the click, so the hardware Back button and a cold-start `?panel=` deep link behave too. */
   useEffect(() => {
@@ -357,6 +352,7 @@ export function TrackPage({ mobileReportIntro, mobileChatComposer,
       className={`${styles.page} ${boardOpen ? styles.pageBoard : ''}`}
       data-nc-track-page=""
     >
+      {dismissalLayer}
       <PageHeader
         className={styles.workHeader}
         title={
@@ -475,7 +471,7 @@ export function TrackPage({ mobileReportIntro, mobileChatComposer,
              lands when the panel opens, never a Tab stop of its own. */
           tabIndex={mobilePanelOpen ? -1 : undefined}
         >
-          <div
+          <LayerDepthProvider><div
             className={styles.mobileListSurface}
             /* The projection's root on this surface: the two surfaces are siblings in the DOM at the same time, so a whole-page scan would read them as one tree. */
             data-nc-mobile-panel=""
@@ -526,7 +522,7 @@ export function TrackPage({ mobileReportIntro, mobileChatComposer,
               /* Every row module goes through `core/view`, in one branch: what is left of `MobilePanelKind` is exactly `RowModuleView['key']`. The four declaration words are deliberately not quoted anywhere in this file. */
               paintMobileModule(mobilePainter, rowModule(panelView, mobilePanelKind))
             ))}
-          </div>
+          </div></LayerDepthProvider>
           <div
             className={styles.desktopPanelSurface}
             /* The projection's root on this surface; `.mobileListSurface` is a sibling in the DOM at the same time. */

@@ -1,13 +1,27 @@
-import { LayerDepthProvider, useLayerDismissal } from '@astryxdesign/core/Layer';
+import { LayerDepthProvider, useLayerDismissal, type UseLayerDismissalOptions, type UseLayerDismissalReturn } from '@astryxdesign/core/Layer';
 import { readSurfaceFrame, type LiftOrigin } from '../motion/geometry.ts';
 import { useSurfacePresence } from '../motion/surface-presence.ts';
 import styles from './dialog.module.css';
 import { CardFrame } from '../card-frame/public.tsx';
-import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, type KeyboardEventHandler, type ReactNode, type RefObject } from 'react';
+import { createContext, useCallback, useContext, useEffect, useId, useImperativeHandle, useMemo, useRef, type KeyboardEventHandler, type ReactNode, type Ref, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon } from '../icon/public.tsx';
 import { useVisibleViewport } from '../viewport/public.ts';
 import { useState } from '../state/public.ts';
+type LayerDismissalProps = UseLayerDismissalOptions & { ref?: Ref<UseLayerDismissalReturn> };
+
+/** Each open lifetime gets a new Astryx identity; ordinary rerenders retain its order.
+ * Mount beside (outside) the owner's LayerDepthProvider, just like the hook. */
+export function LayerDismissal(props: LayerDismissalProps) {
+  return props.isActive ? <ActiveLayerDismissal {...props} /> : null;
+}
+
+function ActiveLayerDismissal({ ref, ...options }: LayerDismissalProps) {
+  const dismissal = useLayerDismissal(options);
+  useImperativeHandle(ref, () => dismissal, [dismissal]);
+  return null;
+}
+
 export type DialogOrigin = Exclude<LiftOrigin, { kind: 'paired-edge' }>;
 
 export interface DialogChildView { title: ReactNode; body: ReactNode; onEscape?: () => void }
@@ -120,7 +134,7 @@ export function Dialog({ origin, open, onClose, title, hideTitleRow, hideClose, 
     });
     return () => cancelAnimationFrame(frame);
   }, [open, view?.id, views.length]);
-  useLayerDismissal({ isActive: open,
+  const dismissalLayer = <LayerDismissal {...{ isActive: open,
     onDismiss: () => { if (view) { if (view.onEscape) view.onEscape(); else popView(); } else onClose(); },
     getContainer: () => panelRef.current,
     isPresent: () => {
@@ -128,7 +142,7 @@ export function Dialog({ origin, open, onClose, title, hideTitleRow, hideClose, 
         .filter(layer => layer.closest('[hidden]') === null);
       return open && panelRef.current !== null && layers.at(-1) === panelRef.current;
     },
-  });
+  }} />;
   useEffect(() => {
     if (!open) return;
     const overflow = document.body.style.overflow;
@@ -197,7 +211,7 @@ export function Dialog({ origin, open, onClose, title, hideTitleRow, hideClose, 
       event.preventDefault(); (event.shiftKey ? last : first)?.focus();
     }
   };
-  return createPortal(<LayerDepthProvider><DialogViewContext.Provider value={controller}><div
+  return createPortal(<>{dismissalLayer}<LayerDepthProvider><DialogViewContext.Provider value={controller}><div
     className={showingView || wide ? 'dialog-overlay dialog-overlay-wide' : 'dialog-overlay'} role="presentation"
     style={{ insetBlockStart: viewport.bottomEdge - viewport.height, insetBlockEnd: viewport.bottomInset }}
     onMouseDown={(event) => { if (!showingView && event.target === event.currentTarget) onClose(); }}>
@@ -218,7 +232,7 @@ export function Dialog({ origin, open, onClose, title, hideTitleRow, hideClose, 
       )}
     </CardFrame>
     </div>
-  </div></DialogViewContext.Provider></LayerDepthProvider>, document.body);
+  </div></DialogViewContext.Provider></LayerDepthProvider></>, document.body);
 }
 
 export function ConfirmDialog({ origin, open, title, description, confirmLabel = 'Confirm', cancelLabel = 'Cancel', onConfirm, onCancel, destructive = true, confirmState = 'ready', confirmBusyLabel, initialFocusRef }: ConfirmDialogProps) {
