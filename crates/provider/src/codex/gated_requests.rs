@@ -36,7 +36,9 @@ impl CodexAppServer {
         config: Option<serde_json::Value>,
         gate: &PreSendGate<'_>,
     ) -> Result<ThreadResult> {
-        let mut value = json!({ "threadId": thread_id });
+        // Resume consumers need identity and live state, not retained turns. A long
+        // history can exceed the bounded WebSocket message budget in one response.
+        let mut value = json!({ "threadId": thread_id, "excludeTurns": true });
         if let Some(config) = config {
             value["config"] = config;
         }

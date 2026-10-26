@@ -437,10 +437,10 @@ impl CodexAppServer {
             .await
     }
 
-    /// `thread/resume` — fails with `-32600 "no rollout found …"` if the thread has not yet run a turn.
+    /// Resume metadata and live state without downloading retained turns. Fails with
+    /// `-32600 "no rollout found …"` if the thread has not yet run a turn.
     pub async fn thread_resume(&self, thread_id: &str) -> Result<ThreadResult> {
-        self.request("thread/resume", json!({ "threadId": thread_id }))
-            .await
+        self.thread_resume_with_config(thread_id, None).await
     }
 
     pub async fn thread_resume_with_config(
