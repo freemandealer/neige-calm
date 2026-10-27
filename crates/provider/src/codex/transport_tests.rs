@@ -91,3 +91,100 @@ async fn oversized_frame_keeps_memory_fence_and_original_diagnostic() {
     .await
     .unwrap();
 }
+
+enum ResumeCall {
+    Plain,
+    Configured,
+    Gated,
+}
+
+async fn resume_without_history_keeps_catalog(call: ResumeCall) {
+    use tokio::io::AsyncWriteExt;
+
+    let (client, _notifications, mut peer, _root) = connection().await;
+    let serving = async {
+        while let Some(Ok(Message::Text(raw))) = peer.next().await {
+            let request: Value = serde_json::from_str(&raw).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "thread/resume" => {
+                    if request["params"]["excludeTurns"] != true {
+                        // Codex returns the full history unless explicitly excluded.
+                        // Model an over-budget response using only its frame header.
+                        let mut header = vec![0x81, 127];
+                        header.extend_from_slice(&(64_u64 * 1024 * 1024 + 1).to_be_bytes());
+                        peer.get_mut().write_all(&header).await.unwrap();
+                        let _ = peer.next().await;
+                        std::future::pending::<()>().await;
+                        return;
+                    }
+                    json!({"thread":{"id":"long-thread","status":{"type":"idle"},"turns":[]},"model":"catalog-model"})
+                }
+                "model/list" => {
+                    json!({"data":[{"id":"catalog-model","model":"catalog-model"}],"nextCursor":null})
+                }
+                method => panic!("unexpected method: {method}"),
+            };
+            peer.send(Message::Text(
+                json!({"id":request["id"],"result":result}).to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+    };
+    let requesting = async {
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(2);
+        let before = client.model_list(None, deadline()).await.unwrap();
+        assert_eq!(before.data[0]["model"], "catalog-model");
+        let config = Some(json!({"model_reasoning_effort":"high"}));
+        let result = match call {
+            ResumeCall::Plain => client.thread_resume("long-thread").await,
+            ResumeCall::Configured => {
+                client
+                    .thread_resume_with_config("long-thread", config)
+                    .await
+            }
+            ResumeCall::Gated => {
+                client
+                    .thread_resume_with_config_gated(
+                        "long-thread",
+                        config,
+                        &PreSendGate::new(gated_requests::allow_send),
+                    )
+                    .await
+            }
+        };
+        let resumed = result.expect("resuming must not download an oversized retained history");
+        assert_eq!(resumed.thread_id(), Some("long-thread"));
+        assert_eq!(resumed.thread["status"]["type"], "idle");
+        let after = client.model_list(None, deadline()).await.unwrap();
+        assert_eq!(
+            after.data, before.data,
+            "resume must preserve the model catalog"
+        );
+        assert!(!client.is_closed());
+    };
+    // The peer is deliberately persistent; stop it only after the client checks.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = serving => panic!("peer closed before the catalog checks finished"),
+            () = requesting => {}
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn plain_resume_without_history_preserves_model_catalog() {
+    resume_without_history_keeps_catalog(ResumeCall::Plain).await;
+}
+
+#[tokio::test]
+async fn configured_resume_without_history_preserves_model_catalog() {
+    resume_without_history_keeps_catalog(ResumeCall::Configured).await;
+}
+
+#[tokio::test]
+async fn gated_resume_without_history_preserves_model_catalog() {
+    resume_without_history_keeps_catalog(ResumeCall::Gated).await;
+}
