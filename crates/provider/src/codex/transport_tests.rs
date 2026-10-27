@@ -188,3 +188,93 @@ async fn configured_resume_without_history_preserves_model_catalog() {
 async fn gated_resume_without_history_preserves_model_catalog() {
     resume_without_history_keeps_catalog(ResumeCall::Gated).await;
 }
+
+#[tokio::test]
+async fn disconnect_notification_stream_retains_capacity_failure() {
+    use tokio::io::AsyncWriteExt;
+    let (_client, mut notifications, mut peer, _root) = connection().await;
+    let mut header = vec![0x81, 127];
+    header.extend_from_slice(&(64_u64 * 1024 * 1024 + 1).to_be_bytes());
+    peer.get_mut().write_all(&header).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), notifications.recv_result())
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("67108865 > 67108864"),
+        "notification path lost the original failure: {error}"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_peer_close_preserves_code_and_drains_notifications_without_peer_text() {
+    use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+    let (client, mut notifications, mut peer, _root) = connection().await;
+    peer.send(Message::Text(
+        json!({"method":"test/queued", "params":{}}).to_string(),
+    ))
+    .await
+    .unwrap();
+    peer.send(Message::Close(Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: "secret peer text".into(),
+    })))
+    .await
+    .unwrap();
+    assert!(
+        matches!(notifications.recv_result().await.unwrap(), Notification::Other {method, ..} if method=="test/queued")
+    );
+    let error = tokio::time::timeout(Duration::from_secs(2), notifications.recv_result())
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("1001"), "close code must survive: {error}");
+    assert!(!error.contains("secret peer text"));
+    client.transport.poison();
+    assert_eq!(
+        notifications.recv_result().await.unwrap_err().to_string(),
+        error
+    );
+}
+
+#[tokio::test]
+async fn disconnect_aborted_reader_notifies_consumers_without_hanging() {
+    let (client, mut notifications, _peer, _root) = connection().await;
+    client.reader.abort();
+    let error = tokio::time::timeout(Duration::from_secs(2), notifications.recv_result())
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reader or dispatch owner dropped"),
+        "reader cancellation must have its own reason: {error}"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_aborted_reader_fails_pending_rpc_without_waiting_for_deadline() {
+    let (client, _notifications, mut peer, _root) = connection().await;
+    let request = client.thread_start(None);
+    tokio::pin!(request);
+    tokio::select! {
+        result = &mut request => panic!("peer has not replied: {result:?}"),
+        frame = peer.next() => {
+            let frame = frame.unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["method"], "thread/start");
+        }
+    }
+    client.reader.abort();
+    let error = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("reader teardown must release the pending RPC before its 30s deadline")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reader or dispatch owner dropped"),
+        "{error}"
+    );
+}

@@ -29,7 +29,7 @@ pub use request_attempt::{RequestCrossing, RpcAttemptFailure, RpcRemoteError};
 mod server_request_tests;
 mod server_requests;
 pub mod tool_names;
-use client_transport::TransportAbort;
+use client_transport::{ReaderLifetime, TransportAbort};
 
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -65,6 +65,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The receiving half of the notification stream; the channel ends when the connection closes.
 pub struct NotificationStream {
     rx: mpsc::UnboundedReceiver<Notification>,
+    transport: Arc<TransportAbort>,
 }
 
 impl NotificationStream {
@@ -75,7 +76,13 @@ impl NotificationStream {
 
     /// Like `recv`, but a closed stream is a deterministic error.
     pub async fn recv_result(&mut self) -> Result<Notification> {
-        self.rx.recv().await.ok_or_else(notification_stream_closed)
+        self.rx.recv().await.ok_or_else(|| {
+            self.transport
+                .check()
+                .err()
+                .map(|cause| Error::Transport(format!("notification stream closed: {cause}")))
+                .unwrap_or_else(notification_stream_closed)
+        })
     }
 
     /// Await the next notification satisfying `predicate`; non-matching ones are consumed, and a stream that ends first is an error rather than `None`.
@@ -121,7 +128,8 @@ pub struct CodexAppServer {
 
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
-        self.transport.poison();
+        self.transport
+            .close("Codex connection owner dropped; pending outcomes unknown".into());
         self.reader.abort();
     }
 }
@@ -269,22 +277,28 @@ impl CodexAppServer {
         let notifications = notif_tx.downgrade();
         let reader = tokio::spawn(reader_loop(
             read,
-            pending.clone(),
-            notif_tx,
+            ReaderLifetime::new(notif_tx, pending.clone(), transport.clone()),
             sink.clone(),
             transport.clone(),
             routes,
         ));
         let client = Self {
             sink,
-            transport,
+            transport: transport.clone(),
             pending,
             next_id: AtomicU64::new(1),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reader,
             notifications,
         };
-        (client, NotificationStream { rx: notif_rx }, server)
+        (
+            client,
+            NotificationStream {
+                rx: notif_rx,
+                transport,
+            },
+            server,
+        )
     }
 
     /// Connect to a `codex app-server` on `sock_path`, spawn the reader, return the client and its [`NotificationStream`]. Does NOT send `initialize`. Every server request is refused.
@@ -369,8 +383,7 @@ impl CodexAppServer {
 
         let reader = tokio::spawn(reader_loop(
             read,
-            pending.clone(),
-            notif_tx,
+            ReaderLifetime::new(notif_tx, pending.clone(), transport.clone()),
             sink.clone(),
             transport.clone(),
             routes,
@@ -380,14 +393,20 @@ impl CodexAppServer {
 
         let client = Self {
             sink,
-            transport,
+            transport: transport.clone(),
             pending,
             next_id: AtomicU64::new(1),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reader,
             notifications,
         };
-        Ok((client, NotificationStream { rx: notif_rx }))
+        Ok((
+            client,
+            NotificationStream {
+                rx: notif_rx,
+                transport,
+            },
+        ))
     }
 
     /// Override the per-request response timeout, builder-style.
@@ -609,8 +628,7 @@ impl CodexAppServer {
 /// Background reader: demultiplexes inbound frames into responses, server requests and notifications; exits on close, transport error, or when the notification consumer is gone.
 async fn reader_loop(
     mut read: futures_util::stream::SplitStream<WebSocketStream<UnixStream>>,
-    pending: Pending,
-    notif_tx: mpsc::UnboundedSender<Notification>,
+    notif_tx: ReaderLifetime,
     sink: WsSink,
     transport: Arc<TransportAbort>,
     routes: Arc<ApprovalRoutes>,
@@ -622,7 +640,10 @@ async fn reader_loop(
                 if matches!(finished, Some(Ok(true))) { continue; }
                 break;
             }
-            frame = read.next() => match frame { Some(frame) => frame, None => break },
+            frame = read.next() => match frame {
+                Some(frame) => frame,
+                None => { transport.close("WebSocket peer reached EOF; pending outcomes unknown".into()); break; }
+            },
         };
         let msg = match frame {
             Ok(m) => m,
@@ -638,7 +659,12 @@ async fn reader_loop(
             Message::Text(t) => t,
             Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
             // tungstenite auto-replies to pings; a Close ends the stream on the next poll.
-            Message::Close(_) => {
+            Message::Close(frame) => {
+                // Peer-provided reason text is untrusted and may contain sensitive data.
+                let code = frame.as_ref().map(|frame| u16::from(frame.code));
+                transport.close(format!(
+                    "WebSocket peer sent Close (code {code:?}); pending outcomes unknown"
+                ));
                 tracing::debug!("codex app-server: ws close frame; reader stopping");
                 break;
             }
@@ -665,7 +691,7 @@ async fn reader_loop(
             v.as_u64()
                 .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
         }) {
-            let sender = { pending.lock().unwrap().remove(&id) };
+            let sender = { notif_tx.pending.lock().unwrap().remove(&id) };
             if let Some(sender) = sender {
                 let payload = if let Some(err) = obj.get("error") {
                     Err(
@@ -691,7 +717,10 @@ async fn reader_loop(
             }
             let notif = Notification::parse(method.to_string(), params);
             // `unbounded_send` never awaits capacity, so a slow consumer can never block response routing; the only failure is a dropped receiver.
-            if notif_tx.send(notif).is_err() {
+            if notif_tx.sender.send(notif).is_err() {
+                transport.close(
+                    "WebSocket notification consumer dropped; pending outcomes unknown".into(),
+                );
                 tracing::debug!("codex app-server: notification consumer dropped; reader stopping");
                 break;
             }
@@ -699,9 +728,7 @@ async fn reader_loop(
     }
 
     transport.close("WebSocket reader stopped; pending outcomes unknown".into());
-    // Drain pending requests so their futures resolve with "connection closed" instead of hanging.
-    let mut guard = pending.lock().unwrap();
-    guard.clear();
+    // ReaderLifetime owns retirement for normal return, panic and cancellation.
 }
 
 #[cfg(test)]
