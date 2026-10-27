@@ -3,6 +3,8 @@
 //! never reorders beyond `(priority DESC, created_at ASC, key ASC)`, never edits the plan.
 
 pub(crate) mod card_disposal;
+mod terminal_completion;
+pub(crate) use terminal_completion::complete_terminal_task_tx;
 mod git_delivery;
 mod planner_compaction;
 mod running_worker;
@@ -1041,8 +1043,9 @@ impl Scheduler {
     }
 
     /// Build the deterministic payload, submit the worker operation (`idempotency_key =
-    /// task.id`), `wait()` it to a terminal phase, then reconcile the row with guarded
-    /// writes. Shared between the live dispatch path and the sweep's `dispatched` arm.
+    /// task.id`), `wait()` it to a terminal phase or a Pipe park handed off as Running, then
+    /// reconcile the row with guarded writes. Shared between the live dispatch path and the
+    /// sweep's `dispatched` arm.
     async fn drive_spawn(&self, task: &Task, track: &Track, recovering: bool) -> Result<()> {
         if task.kind == TaskKind::Compact {
             return self.drive_compact(task, track, recovering).await;
@@ -1101,7 +1104,17 @@ impl Scheduler {
             // retry counting) — log-and-leave for the next trigger/sweep.
             Err(e) => return Err(e),
         };
-        let result = runtime.wait(&op_id).await?;
+        // The preparation may be deferred past submit (a Busy fence), so the owned park can come
+        // at any point of the wait; a handed-off execution outlives this dispatch.
+        let result = match runtime.wait_settled_or_owned_parked(&op_id).await? {
+            crate::operation::OperationWait::Settled(result) => result,
+            crate::operation::OperationWait::OwnedParked(op) => {
+                if self.acknowledge_pipe_parked(task, &op).await? {
+                    return Ok(());
+                }
+                runtime.wait(&op_id).await?
+            }
+        };
         let outcome = match result.outcome {
             OperationOutcome::Failed {
                 last_error,
@@ -1865,6 +1878,9 @@ impl Scheduler {
     /// Sweep `running`-terminal arm: a recorded exit gets the SAME guarded completion tx as
     /// the live exit hook; first writer wins via the status guard.
     async fn reconcile_running_terminal(&self, task: Task) {
+        if terminal_completion::terminal_task_uses_pipe(self.repo.as_ref(), &task.id).await {
+            return;
+        }
         let worker_card_id = match &task.worker_card_id {
             Some(id) => Some(id.clone()),
             // Crash between op success and the running stamp can leave the card unstamped;
@@ -2141,6 +2157,9 @@ impl TerminalTaskHook {
         if task.kind != TaskKind::Terminal {
             return;
         }
+        if terminal_completion::terminal_task_uses_pipe(self.repo.as_ref(), &task.id).await {
+            return;
+        }
         if let Err(e) = complete_terminal_task(
             self.repo.as_ref(),
             &self.events,
@@ -2172,7 +2191,7 @@ impl TerminalTaskHook {
 pub async fn complete_terminal_task(
     repo: &dyn Repo,
     events: &EventBus,
-    write: &WriteContext,
+    _write: &WriteContext,
     task_id: &str,
     track_id: &str,
     worker_card_id: &str,
@@ -2181,112 +2200,31 @@ pub async fn complete_terminal_task(
     pty_output: &str,
     pty_output_truncated: bool,
 ) -> Result<()> {
-    let Some(track) = repo.track_get(track_id).await? else {
-        return Ok(());
-    };
-    let scope = EventScope::Track {
-        track: track.id.clone(),
-        area: track.area_id.clone(),
-    };
-    let success = !signal_killed && exit_code == Some(0);
     let task_id = task_id.to_string();
-    let track_id_str = track_id.to_string();
+    let track_id = track_id.to_string();
     let worker_card_id = worker_card_id.to_string();
     let pty_output = pty_output.to_string();
-    let result = write_with_actor_events_typed::<(), _>(repo, None, events, write, move |tx| {
+    crate::db::write_in_tx_typed(repo, move |tx| {
         Box::pin(async move {
-            let now = now_ms();
-            // The payload `idempotency_key` is mutable via `PATCH /api/cards/{id}`, so it is NOT
-            // proof of ownership: only the card the worker-spawn op actually created may flip an
-            // UNSTAMPED row; a forged-payload card fails both sides → 0 rows → no event.
-            let owns_key =
-                crate::db::sqlite::worker_op_targets_card_tx(tx, &task_id, &worker_card_id).await?;
-            let reporter = TaskReporter::Card {
-                card_id: worker_card_id.as_str(),
-                owns_key,
-            };
-            // A gated terminal task's clean exit is still a self-report: the row goes to `verifying`.
-            let (rows, event) = if success {
-                let flip =
-                    task_report_success_from_worker_tx(tx, &task_id, &track_id_str, reporter, now)
-                        .await?;
-                (
-                    if flip == SuccessReportFlip::None {
-                        0
-                    } else {
-                        1
-                    },
-                    Event::TaskCompleted {
-                        notification: if flip == SuccessReportFlip::Done {
-                            calm_types::event::PlannerNotification::Notify
-                        } else {
-                            calm_types::event::PlannerNotification::Suppress
-                        },
-                        idempotency_key: task_id.clone(),
-                        result: json!({
-                            "exit_code": 0,
-                            "source": "terminal-exit",
-                            "pty_output": pty_output,
-                            "pty_output_truncated": pty_output_truncated,
-                        }),
-                        artifacts: Vec::new(),
-                        agent_message: None,
-                    },
-                )
-            } else {
-                let reason = if signal_killed {
-                    "terminal worker killed by signal".to_string()
-                } else {
-                    match exit_code {
-                        Some(-1) => {
-                            "terminal worker exited while the kernel was down (outcome unknown)"
-                                .to_string()
-                        }
-                        Some(code) => format!("terminal worker exited with code {code}"),
-                        None => "terminal worker exited without an exit code".to_string(),
-                    }
-                };
-                (
-                    // The same interpreted reason the event carries lands on the row.
-                    task_fail_from_worker_tx(
-                        tx,
-                        &task_id,
-                        &track_id_str,
-                        reporter,
-                        &status_detail_with_reason("worker-reported", &reason),
-                        now,
-                    )
-                    .await?,
-                    Event::TaskFailed {
-                        notification: calm_types::event::PlannerNotification::Notify,
-                        idempotency_key: task_id.clone(),
-                        reason,
-                        details: Some(json!({
-                            "exit_code": exit_code,
-                            "signal_killed": signal_killed,
-                            "source": "terminal-exit",
-                            "pty_output": pty_output,
-                            "pty_output_truncated": pty_output_truncated,
-                        })),
-                        agent_message: None,
-                    },
-                )
-            };
-            if rows == 0 {
-                // First writer already won (live hook vs sweep, or a
-                // belt-and-suspenders worker self-report) — no row
-                // change, no event.
-                return Err(race_lost_err());
-            }
-            Ok(((), vec![(ActorId::KernelDispatcher, scope, event)]))
+            complete_terminal_task_tx(
+                tx,
+                &task_id,
+                &track_id,
+                &worker_card_id,
+                exit_code,
+                signal_killed,
+                &pty_output,
+                pty_output_truncated,
+            )
+            .await
         })
     })
-    .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) if is_race_lost(&e) => Ok(()),
-        Err(e) => Err(e),
-    }
+    .await
+    .map(|envelopes| {
+        for envelope in envelopes {
+            events.emit_envelope(envelope);
+        }
+    })
 }
 
 #[cfg(test)]

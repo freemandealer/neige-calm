@@ -278,6 +278,8 @@ pub trait RepoRead: Send + Sync + 'static {
     async fn task_contexts_inflight_fresh(&self) -> Result<Vec<TaskContextRow>>;
     /// Recovery sweep source for non-terminal rows that already carry stale.
     async fn task_contexts_inflight_stale(&self) -> Result<Vec<TaskContextRow>>;
+    /// Kernel-persisted terminal worker preparation log address; never read from a mutable card payload.
+    async fn terminal_worker_log_path(&self, attempt_id: &str) -> Result<Option<String>>;
     /// `worker_sessions.spawn_op_id` resolves to `operations.idempotency_key`, the immutable task id the worker operation was submitted with.
     async fn operation_idempotency_key_by_id(&self, op_id: &str) -> Result<Option<String>>;
 
