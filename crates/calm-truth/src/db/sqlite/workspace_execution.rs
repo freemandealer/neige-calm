@@ -1,6 +1,9 @@
 //! Execution persistence SQL. Domain transactions reuse these writes; no lifecycle policy here.
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+/// Planner owner namespace, shared by admission and closed-track clean history.
+pub const PLANNER_ALIAS_PREFIX: &str = "planner";
+
 /// Sole mapping between Terminal identity and the execution alias namespace.
 pub fn terminal_alias(id: &str) -> String {
     format!("term:{id}")
@@ -168,6 +171,21 @@ pub async fn consumer_inventory<'a>(
         }
     }
     Ok(inventory)
+}
+
+/// Persisted settlement history in an owner's alias namespace, including retired rows.
+/// Proof strength is classified by the executor contract at the caller.
+pub async fn settlement_history(
+    pool: &SqlitePool,
+    prefix: &str,
+) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT execution_id,settlement_json FROM workspace_executions \
+         WHERE alias >= ?1 || ':' AND alias < ?1 || ';' AND settled_at_ms IS NOT NULL",
+    )
+    .bind(prefix)
+    .fetch_all(pool)
+    .await
 }
 
 /// Occupancy scopes; lifecycle policy belongs to callers.
