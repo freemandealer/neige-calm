@@ -8,6 +8,7 @@ pub struct TurnContext {
     pub thread_id: String,
     pub turn_id: String,
     pub native_session_id: String,
+    pub usage: super::usage::UsageTracker,
 }
 pub struct TurnTranslator {
     context: TurnContext,
@@ -54,6 +55,13 @@ impl TurnTranslator {
             return Ok(Vec::new());
         }
         let mut events = Vec::new();
+        if let Some((used, size)) = self.context.usage.reading(params) {
+            events.push(self.event(PlannerEventKind::TokenUsage {
+                params: json!({"turnId": self.context.turn_id, "tokenUsage": {
+                    "last": {"totalTokens": used}, "modelContextWindow": size,
+                }}),
+            }));
+        }
         match kind {
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let content = &update["content"];
