@@ -629,3 +629,6 @@ async fn status(app: &axum::Router, cookie: &str, uri: &str, key: &str, body: Va
 }
 
 mod u7_nondelivery;
+
+#[cfg(feature = "fixtures")]
+mod p1_workspace_upload;
