@@ -214,19 +214,43 @@ impl CardStartFence {
     }
 }
 
-/// Called only after Human acceptance/ACK commits, for both Fresh and Replayed
-/// requests. Wait only for source handoff, never for lifecycle/native startup.
+/// Already-bound edits and cold creation: edits register their exact source
+/// synchronously, and a dormant carrier has no native thread to schedule before
+/// retained activation binds sources. Other existing-worker mutations use
+/// finish_canonical_human_handoff with a pre-commit guard.
+/// Called only after Human acceptance/ACK commits. Wait only for source handoff, never for lifecycle/native startup.
 /// The detached owner survives cancellation of the HTTP waiter.
 pub(crate) async fn wake_canonical_human(
     state: crate::state::RouteState,
     card_id: CardId,
     source: crate::auth::HumanInputSource,
 ) {
+    wake_human(state, card_id, source, None).await;
+}
+
+/// Existing-worker mutations must acquire this handoff before commit. The
+/// detached owner retains it if the HTTP waiter disappears.
+pub(crate) async fn finish_canonical_human_handoff(
+    state: crate::state::RouteState,
+    card_id: CardId,
+    source: crate::auth::HumanInputSource,
+    handoff: crate::harness::registry::SourceHandoff,
+) {
+    wake_human(state, card_id, source, Some(handoff)).await;
+}
+
+async fn wake_human(
+    state: crate::state::RouteState,
+    card_id: CardId,
+    source: crate::auth::HumanInputSource,
+    mut handoff: Option<crate::harness::registry::SourceHandoff>,
+) {
     let (handed_off, observed) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         #[cfg(feature = "fixtures")]
         crate::test_seams::pause_point("canonical-human-source-handoff", card_id.as_str()).await;
-        if let Err(error) = state
+        use super::planner_harness_start_adapter::RetainedSourceObservation;
+        match state
             .planner_start_adapter
             .observe_retained_human(
                 &state.operation_runtime,
@@ -236,9 +260,17 @@ pub(crate) async fn wake_canonical_human(
             )
             .await
         {
-            // Acceptance already committed. The original lifecycle below must
-            // re-read its current target, rather than lose this accepted wake.
-            tracing::debug!(%card_id, reason = canonical_wake_reason(&error), "accepted source awaits retained lifecycle revalidation");
+            Ok(RetainedSourceObservation::Observed) => {
+                // Only positive source registration completes this handoff.
+                drop(handoff.take());
+            }
+            Ok(RetainedSourceObservation::Deferred) => {
+                // A reserved/dormant owner may become live before the fallback
+                // gets its lifecycle fence. Retain ownership across that gap.
+            }
+            Err(error) => {
+                tracing::debug!(%card_id, reason = canonical_wake_reason(&error), "accepted source awaits retained lifecycle revalidation");
+            }
         }
         let _ = handed_off.send(());
         let fence = CardStartFence::lock(
@@ -260,6 +292,7 @@ pub(crate) async fn wake_canonical_human(
             let reason = canonical_wake_reason(&error);
             tracing::warn!(%card_id, reason, "accepted canonical work remains held by its original lifecycle");
         }
+        drop(handoff);
         #[cfg(feature = "fixtures")]
         crate::test_seams::pause_point("canonical-human-wake-finished", card_id.as_str()).await;
     });
