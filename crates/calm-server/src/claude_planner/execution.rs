@@ -96,6 +96,8 @@ impl ProviderExecutionOwner for Owner {
                         if end.turn != *turn_id || end.shared.params.worker_session_id != session {
                             return Err(conflict("Claude completion identity changed"));
                         }
+                        // A released process may have created its native session before
+                        // publishing init. Neither EOF nor settlement proves absence.
                         let event = match end.event {
                             super::driver::TerminalEvent::Exit { .. } => {
                                 let diagnostic =
@@ -197,7 +199,24 @@ impl ProviderExecutionOwner for Owner {
                             .store(qualified, std::sync::atomic::Ordering::Release);
                         return Ok(());
                     }
-                    Some(KnownEnd::ClaudeRefused) => {}
+                    Some(KnownEnd::ClaudeRefused) => {
+                        // A refusal whose claim was never released never ran Claude, so its
+                        // launch cannot have created the session. Once released, it is kept.
+                        let retired = match self.repo() {
+                            Ok(repo) => {
+                                super::identity::retire_unreleased_launch(
+                                    repo.as_ref(),
+                                    session,
+                                    id.as_str(),
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = retired {
+                            tracing::warn!(%error, "Claude launch record retained");
+                        }
+                    }
                     Some(
                         KnownEnd::RewindCheck
                         | KnownEnd::ClaudeWorkerTurn(_)

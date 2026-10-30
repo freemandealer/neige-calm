@@ -364,7 +364,7 @@ impl PlannerHarness {
         let native = self
             .inner
             .backend
-            .carrier_idle_for_detach(thread.as_deref())
+            .carrier_idle_for_recovery(thread.as_deref())
             .await
             .ok_or_else(|| CalmError::Conflict("old native execution is still active".into()))?;
         let park = self
@@ -386,5 +386,12 @@ impl PlannerHarness {
     pub(crate) async fn restore_normal_join_after_keep(&self) -> Result<()> {
         let _issuance = self.inner.issuance.lock().await;
         self.inner.backend.restore_normal_join_after_keep().await
+    }
+}
+
+impl PlannerHarness {
+    /// Display-only provider knowledge; lifecycle and native gates remain authoritative.
+    pub(crate) fn identity_known_in_host(&self) -> bool {
+        self.inner.backend.identity_known_in_host()
     }
 }
