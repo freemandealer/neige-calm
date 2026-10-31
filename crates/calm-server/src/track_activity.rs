@@ -569,7 +569,16 @@ impl TrackActivityProjector {
             }
         };
         for id in ids {
-            if let Err(e) = self.recompute_track(&id).await {
+            #[cfg(all(test, feature = "fixtures"))]
+            let hook = crate::test_seams::take("activity-tick-success", &id);
+            let result = self.recompute_track(&id).await;
+            #[cfg(all(test, feature = "fixtures"))]
+            if matches!(&result, Ok(Recompute::Written(_) | Recompute::Unchanged(_)))
+                && let Some(hook) = hook
+            {
+                hook.entered.notify_one();
+            }
+            if let Err(e) = result {
                 tracing::warn!(track_id = %id, error = %e, "track_activity: reconcile failed");
             }
         }
@@ -657,8 +666,8 @@ impl TrackActivityProjector {
                             }
                             let result = self.recompute_track(&track_id).await;
                             #[cfg(all(test, feature = "fixtures"))]
-                            if matches!(env.event, Event::TrackReportEdited { .. }) {
-                                let _ = self.report_completions.send(ReportCompletion::Report {
+                            if matches!(env.event, Event::TrackReportEdited { .. } | Event::HarnessPhaseChanged { .. } | Event::HarnessUserMessageEnqueued { .. }) {
+                                let _ = self.report_completions.send(ReportCompletion::Event {
                                     env: Box::new(env),
                                     outcome: ReportOutcome::from_result(&result),
                                 });
