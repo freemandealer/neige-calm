@@ -21,6 +21,7 @@ mod passive_scheduling_tests;
 mod phase_diagnostics;
 mod planner_compact_tests;
 use phase_diagnostics::PhaseWaitStage;
+mod pressure_measurement;
 mod scheduling_tests;
 mod selection_authority_tests;
 
@@ -747,3 +748,5 @@ async fn context_usage_canonical_known_and_invalidated_readings() {
         fx.harness.shutdown().await.unwrap();
     }
 }
+
+mod reconciliation_acceptance;
