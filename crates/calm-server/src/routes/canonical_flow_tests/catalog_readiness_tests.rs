@@ -88,8 +88,10 @@ async fn historical_creation_samples_readiness_before_the_area_lock() {
             release: Arc::new(Notify::new()),
         };
         install_pause_for_test("key-lock-waiting", &area, pause.clone());
+        // Named attachment without cwd retains the historical Managed entry.
         let body = json!({"planner_provider":"claude", "area_id":area,
             "title":"sampled historical mint", "template_id":"small-change",
+            "attach_folder":true,
             "theme":{"fg":[216,219,226],"bg":[15,20,24]}});
         let create = status(&app, &cookie, "/api/tracks", "sampled-readiness", body);
         tokio::pin!(create);
