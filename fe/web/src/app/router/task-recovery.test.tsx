@@ -139,9 +139,40 @@ it('refreshes collapsed current execution through task events without reopening 
   expect(disclosure.open).toBe(false);
 });
 
+it('does not read never-opened execution history for a folded initial visit', async () => {
+  const fixture = setup('event-advance');
+  await screen.findByText('Reference');
+  await waitFor(() => expect(fixture.client.isFetching()).toBe(0));
+  expect(document.querySelector('[data-nc-task-state]')).toBeNull();
+  expect(fixture.requests.filter(request => request.path.endsWith('/attempts'))).toEqual([]);
+});
+
+it('refreshes previously admitted execution after revisiting with Reference still folded', async () => {
+  const fixture = setup('event-advance');
+  await fixture.open();
+  await screen.findByText('Current attempt 1 · Failed');
+  const reads = fixture.requests.filter(request => request.path.endsWith('/attempts')).length;
+  cleanup();
+  await act(() => { fixture.advance('done'); return Promise.resolve(); });
+  fixture.mount();
+  await screen.findByText('Reference');
+  await userEvent.click(await screen.findByRole('button', { name: 'Progress' }));
+  await waitFor(() => {
+    const row = document.querySelector('[data-nc-row="task:b-task"]');
+    expect(row?.textContent).toContain('Finished');
+  });
+  expect(document.querySelector<HTMLDetailsElement>('[data-nc-report-reference]')?.open).toBe(false);
+  expect(document.querySelector('[data-nc-task-state]')).toBeNull();
+  expect(fixture.requests.filter(request => request.path.endsWith('/attempts')).length).toBeGreaterThan(reads);
+  await userEvent.click(screen.getByRole('button', { name: 'Actions for b' }));
+  await userEvent.click(await screen.findByRole('menuitem', { name: 'View execution' }));
+  await waitFor(() => expect(fixture.router.state.location.href).toContain('card=new-worker'));
+});
+
 it('keeps the current failed dependency explanation after loading pending task history', async () => {
   const { open, advance } = setup('dependency');
   const cause = 'Blocked by b (failed). Declare a new task in place of b before c can continue.';
+  await userEvent.click(await screen.findByRole('button', { name: 'Progress' }));
   expect(await screen.findByTitle(cause)).toBeTruthy();
   await open();
   await screen.findByText('Current attempt 2 · Queued');
@@ -160,6 +191,7 @@ it.each([
   ['capacity', 'All execution slots are occupied. Waiting for capacity.'],
 ] as const)('explains current admission blocker %s without requiring a projected row', async (mode, cause) => {
   await setup(mode).open();
+  await userEvent.click(screen.getByRole('button', { name: 'Progress' }));
   await screen.findByText(mode === 'capacity' ? 'Current attempt 2 · Queued' : 'Current attempt 2 · Waiting to start');
   expect(screen.getByText(cause)).toBeTruthy();
   expect(document.querySelector('[data-nc-task-state] > summary [title]')!.getAttribute('title')).toContain(cause);
