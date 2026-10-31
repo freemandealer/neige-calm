@@ -214,6 +214,9 @@ async fn object_sweep_large_delta_count_and_bytes_are_observed_outside_writer() 
                     if many { 1 } else { 10_000 },
                 )
                 .await;
+            if !many {
+                compress_large_tree(&f, &tree.tree_hash).await;
+            }
             parent = f.publish(&tree, Some(&parent)).await;
         }
         pause.release();
@@ -248,6 +251,7 @@ async fn object_sweep_repeated_oversized_changes_defer_without_hot_loop_or_delet
     for n in 0..3 {
         pause.entered().await;
         let tree = f.tree(&format!("large changing tree {n}"), 10_000).await;
+        compress_large_tree(&f, &tree.tree_hash).await;
         parent = f.publish(&tree, Some(&parent)).await;
         pause.release();
     }
@@ -258,6 +262,70 @@ async fn object_sweep_repeated_oversized_changes_defer_without_hot_loop_or_delet
             .await
             .unwrap(),
         1
+    );
+    assert!(!f.exists(&orphan).await);
+}
+
+async fn compress_large_tree(f: &Fixture, hash: &str) {
+    let mut after = String::new();
+    loop {
+        let page = crate::track_vcs::object_compression::convert_page(f.repo.db(), &after)
+            .await
+            .unwrap();
+        after = page.after;
+        if page.complete {
+            break;
+        }
+    }
+    let encoding: String =
+        sqlx::query_scalar("SELECT encoding FROM track_vcs_objects WHERE hash=?")
+            .bind(hash)
+            .fetch_one(f.repo.pool())
+            .await
+            .unwrap();
+    assert_eq!(encoding, "zlib-v1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_sweep_frontier_compressed_tree_budget_stays_outside_writer() {
+    let f = Fixture::new().await;
+    let tree = f.tree("prepared compressed frontier", 10_000).await;
+    // Convert before observation: publication alone must use the incremental
+    // frontier rather than invalidating the unknown epoch with an object UPDATE.
+    compress_large_tree(&f, &tree.tree_hash).await;
+    let orphan = f.orphan("requires incremental validation").await;
+    let before: i64 = sqlx::query_scalar("SELECT revision FROM track_vcs_gc_frontier_state")
+        .fetch_one(f.repo.pool())
+        .await
+        .unwrap();
+    let (pause, sweep) = start(f.repo.db().clone(), vec![Phase::BeforeDelete, Phase::Parse]);
+    pause.entered().await;
+    f.publish(&tree, Some(&f.commit)).await;
+    let after: i64 = sqlx::query_scalar("SELECT revision FROM track_vcs_gc_frontier_state")
+        .fetch_one(f.repo.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "fixture must exercise the certified frontier"
+    );
+    pause.release();
+    pause.entered().await;
+    let db = f.repo.db().clone();
+    let mut writer = tokio::spawn(async move {
+        let tx = begin_immediate_tx(&db).await?;
+        tx.rollback().await?;
+        Ok::<_, crate::error::CalmError>(())
+    });
+    let released = tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer).await;
+    pause.release();
+    assert_eq!(finish(sweep).await.unwrap(), 1);
+    if released.is_err() {
+        writer.await.unwrap().unwrap();
+    }
+    assert!(
+        matches!(released, Ok(Ok(Ok(())))),
+        "frontier decoded work retained writer: {released:?}"
     );
     assert!(!f.exists(&orphan).await);
 }
