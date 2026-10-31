@@ -188,3 +188,263 @@ async fn declared_compaction_wakes_idle_and_rechecks_after_ingress_drains() {
     );
     super::compact_tests::shutdown(&fx.harness, &mut peer).await;
 }
+
+#[tokio::test]
+async fn running_turn_waits_for_native_result_without_fifty_ms_probes() {
+    let fx = Fixture::new().await;
+    let (_client, mut peer) = connect(&fx.daemon).await;
+    super::control_tests::running(&fx, &mut peer).await;
+    let card = fx.harness.inner.card_id.as_str();
+    let advance = PausePoint::default();
+    install_pause_for_test("canonical-before-progress-advance", card, advance.clone());
+    fx.harness.request_progress();
+    tokio::time::timeout(Duration::from_secs(3), advance.entered.notified())
+        .await
+        .unwrap();
+    let pass = PausePoint::default();
+    install_pause_for_test("canonical-tick-returned", card, pass.clone());
+    advance.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), pass.entered.notified())
+        .await
+        .unwrap();
+    let next = PausePoint::default();
+    install_pause_for_test("canonical-before-end-probe", card, next.clone());
+    pass.release.notify_one();
+    let polled = tokio::time::timeout(Duration::from_millis(250), next.entered.notified())
+        .await
+        .is_ok();
+    if polled {
+        next.release.notify_one();
+        crate::test_seams::take("canonical-before-end-probe", card);
+        let original = fx.frame().await;
+        notify_thread(
+            &fx.daemon,
+            &mut peer,
+            original.header.last_thread_id.as_deref().unwrap(),
+            "turn/completed",
+            json!({"id":original.header.last_turn_id,"status":"completed"}),
+        )
+        .await;
+        fx.wait_phase(HarnessPhaseTag::TurnCompleted).await;
+        peer.close(None).await.unwrap();
+        fx.harness.shutdown().await.unwrap();
+        panic!("an unchanged running execution must wait for readiness or its actual deadline");
+    }
+    let original = fx.frame().await;
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        original.header.last_thread_id.as_deref().unwrap(),
+        "turn/completed",
+        json!({"id":original.header.last_turn_id,"status":"completed"}),
+    )
+    .await;
+    // Native readiness must enter the actual progress path before reconciliation.
+    tokio::time::timeout(Duration::from_secs(1), next.entered.notified())
+        .await
+        .expect("native result must immediately wake the sleeping execution");
+    next.release.notify_one();
+    let done = fx.wait_phase(HarnessPhaseTag::TurnCompleted).await;
+    assert!(done.canonical_inputs.active.is_none());
+    peer.close(None).await.unwrap();
+    fx.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_uses_its_actual_deadline_while_waiting_for_late_native_end() {
+    let fx = Fixture::with_config(HarnessConfig {
+        interrupt_completion_budget: Duration::from_millis(250),
+        ..HarnessConfig::default()
+    })
+    .await;
+    let (_client, mut peer) = connect(&fx.daemon).await;
+    super::control_tests::running(&fx, &mut peer).await;
+    let original = fx.frame().await;
+    let stop = tokio::spawn({
+        let harness = fx.harness.clone();
+        let source = fx.source.clone();
+        async move { harness.stop_canonical(source).await }
+    });
+    let call = request(&mut peer).await;
+    assert_eq!(call["method"], "turn/interrupt");
+    send(&mut peer, json!({"id":call["id"],"result":{}})).await;
+    stop.await.unwrap().unwrap();
+    let wedged = tokio::time::timeout(
+        Duration::from_millis(900),
+        fx.wait_phase(HarnessPhaseTag::Wedged),
+    )
+    .await
+    .expect("armed Stop deadline must preempt the 30-second result reconciliation");
+    assert_eq!(
+        wedged.header.wedged_reason.as_deref(),
+        Some(calm_types::harness::HARNESS_INTERRUPT_TIMEOUT_REASON)
+    );
+    assert_eq!(
+        wedged.canonical_inputs, original.canonical_inputs,
+        "timeout cannot certify END"
+    );
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        original.header.last_thread_id.as_deref().unwrap(),
+        "turn/completed",
+        json!({"id":original.header.last_turn_id,"status":"interrupted"}),
+    )
+    .await;
+    let done = fx.wait_phase(HarnessPhaseTag::TurnCompleted).await;
+    assert!(done.canonical_inputs.active.is_none());
+    assert!(done.header.interruption_intent.is_none());
+    peer.close(None).await.unwrap();
+    fx.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compact_completion_wakes_queued_input_and_returns_to_stable_idle() {
+    let (fx, _client, mut peer) = super::compact_tests::ready().await;
+    let original = fx.frame().await;
+    let thread = original.header.last_thread_id.as_deref().unwrap();
+    let compact = tokio::spawn({
+        let harness = fx.harness.clone();
+        let source = fx.source.clone();
+        async move { harness.compact_canonical(source).await }
+    });
+    let call = request(&mut peer).await;
+    assert_eq!(call["method"], "thread/compact/start");
+    send(&mut peer, json!({"id":call["id"],"result":{}})).await;
+    compact.await.unwrap().unwrap();
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/started",
+        json!({"id":"maintenance"}),
+    )
+    .await;
+    let card = fx.harness.inner.card_id.as_str();
+    let mut tx = begin_immediate_tx(fx.original.repo.db()).await.unwrap();
+    let mut carrier = current_input_carrier_tx(&mut tx, card, &fx.harness.inner.worker_session_id)
+        .await
+        .unwrap();
+    let accepted = crate::conversation_inputs::accept_human_tx(
+        &mut tx,
+        &fx.source.current_principal().unwrap(),
+        &mut carrier,
+        HumanPayload {
+            text: "run after maintenance".into(),
+            bound_attachments: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let AcceptedInputRef::Human { message } = accepted.input_ref else {
+        panic!("human")
+    };
+    fx.harness
+        .observe_canonical_source(message, fx.source.clone())
+        .await
+        .unwrap();
+    // Finish the start observation before measuring absence of repeated probes.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fx
+            .frame()
+            .await
+            .header
+            .compact_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.turn_id.as_deref())
+            != Some("maintenance")
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let advance = PausePoint::default();
+    install_pause_for_test("canonical-before-progress-advance", card, advance.clone());
+    fx.harness.request_progress();
+    tokio::time::timeout(Duration::from_secs(3), advance.entered.notified())
+        .await
+        .unwrap();
+    let waiting = PausePoint::default();
+    install_pause_for_test("canonical-result-wait", card, waiting.clone());
+    advance.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), waiting.entered.notified())
+        .await
+        .unwrap();
+    let probe = PausePoint::default();
+    install_pause_for_test("canonical-before-end-probe", card, probe.clone());
+    waiting.release.notify_one();
+    let polled = tokio::time::timeout(Duration::from_millis(250), probe.entered.notified())
+        .await
+        .is_ok();
+    probe.release.notify_one();
+    crate::test_seams::take("canonical-before-end-probe", card);
+    assert!(
+        !polled,
+        "pending input cannot require periodic probes while maintenance owns execution"
+    );
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/completed",
+        json!({"id":"maintenance","status":"completed"}),
+    )
+    .await;
+    // No new source notification here: it was already observed while compacting.
+    let call = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let call = request(&mut peer).await;
+            if call["method"] == "turn/start" {
+                break call;
+            }
+            assert_eq!(call["method"], "config/read");
+            send(&mut peer, json!({"id":call["id"],"result":{"config":{}}})).await;
+        }
+    })
+    .await
+    .expect("committed maintenance completion must wake the already-queued input");
+    assert!(
+        call["params"]["input"]
+            .to_string()
+            .contains("run after maintenance")
+    );
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/started",
+        json!({"id":"after-maintenance"}),
+    )
+    .await;
+    send(
+        &mut peer,
+        json!({"id":call["id"],"result":{"turn":{"id":"after-maintenance"}}}),
+    )
+    .await;
+    fx.wait_phase(HarnessPhaseTag::TurnRunning).await;
+    let idle = PausePoint::default();
+    install_pause_for_test("canonical-idle-wait", card, idle.clone());
+    notify_thread(
+        &fx.daemon,
+        &mut peer,
+        thread,
+        "turn/completed",
+        json!({"id":"after-maintenance","status":"completed"}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(3), idle.entered.notified())
+        .await
+        .expect("a settled maintenance outcome must not retain active probing");
+    let done = fx.frame().await;
+    assert!(done.canonical_inputs.active.is_none());
+    assert!(done.canonical_inputs.pending.is_empty());
+    assert_eq!(
+        done.header.compact_outcome.unwrap().status,
+        crate::harness::compact_outcome::CompactStatus::Completed
+    );
+    idle.release.notify_one();
+    peer.close(None).await.unwrap();
+    fx.harness.shutdown().await.unwrap();
+}
