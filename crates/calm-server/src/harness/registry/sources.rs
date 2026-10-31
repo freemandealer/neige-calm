@@ -22,7 +22,7 @@ struct State {
 #[derive(Default)]
 pub(crate) struct CanonicalSourceIndex {
     state: Mutex<State>,
-    changed: Notify,
+    changed: Arc<Notify>,
 }
 
 /// The producer acquires this before its transaction commits, then transfers it
@@ -44,6 +44,12 @@ impl CanonicalSourceIndex {
         self.changed.notify_one();
         SourceHandoff(self.clone())
     }
+    /// The installed consumer shares this coalescing wake signal with sources.
+    /// A notification carries no source, queue position or execution authority.
+    pub(crate) fn change_signal(&self) -> Arc<Notify> {
+        self.changed.clone()
+    }
+
     pub(crate) async fn changed(&self) {
         self.changed.notified().await;
     }
@@ -57,6 +63,11 @@ impl CanonicalSourceIndex {
             .clear();
         self.changed.notify_one();
     }
+    /// A producer may still commit after an empty persisted queue was observed.
+    pub(crate) fn has_handoffs(&self) -> bool {
+        self.state.lock().expect("canonical source index").handoffs > 0
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         let state = self.state.lock().expect("canonical source index");
         state.sources.is_empty() && state.handoffs == 0

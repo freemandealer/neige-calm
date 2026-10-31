@@ -14,7 +14,11 @@ impl PlannerHarness {
         // Canonical intent is already durable in the dispatched task row. Its
         // read-only acknowledgement must not queue behind the native RPC or a
         // track fence that the scheduler itself may be waiting to release.
-        if self.inner.inputs.canonical().is_some() {
+        if let Some(inputs) = self.inner.inputs.canonical() {
+            // The task is already committed. Its consumer must not wait for
+            // this read-only acknowledgement (or its concurrent readers).
+            // The hint grants no execution: maintenance revalidates its task.
+            inputs.request_progress();
             return request(&self.inner, request_id).await;
         }
         match &self.inner.observations {

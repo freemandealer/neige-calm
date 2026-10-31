@@ -23,7 +23,9 @@ mod content;
 mod inputs;
 pub(super) use inputs::CanonicalInputs;
 mod load;
+pub(super) mod scheduling;
 pub(super) use load::load_current;
+pub(super) use scheduling::{Progress, advance};
 mod report_context;
 mod resume;
 mod retry;
@@ -31,6 +33,8 @@ use resume::resume_unattempted;
 pub(super) mod control;
 pub(super) use content::{invalidate_context_usage, on_notification, persist_native_item};
 
+#[cfg(all(test, feature = "fixtures"))]
+mod observation_tests;
 #[cfg(all(test, feature = "fixtures"))]
 mod retry_tests;
 #[cfg(all(test, feature = "fixtures"))]
@@ -51,7 +55,10 @@ pub(super) fn written(frame: RuntimeFrameAfterWrite) -> Result<CommittedFrame> {
 }
 
 fn checked_snapshot(value: Value) -> Result<CanonicalHarnessSnapshot> {
-    let snapshot: CanonicalHarnessSnapshot = serde_json::from_value(value)?;
+    checked_frame(serde_json::from_value(value)?)
+}
+
+fn checked_frame(snapshot: CanonicalHarnessSnapshot) -> Result<CanonicalHarnessSnapshot> {
     if snapshot.header.phase == HarnessPhaseTag::IssuingInterrupt {
         let turn = snapshot
             .header
@@ -125,12 +132,20 @@ impl PublicFeedback {
 }
 
 pub(super) async fn read_current(inner: &Inner) -> Result<CommittedFrame> {
-    let card = inner.card_id.to_string();
-    let runtime = inner.worker_session_id.clone();
-    write_in_tx_typed(inner.repo.as_ref(), move |tx| {
-        Box::pin(async move { frame(&current_input_fact_carrier_tx(tx, &card, &runtime).await?) })
+    let db = inner
+        .repo
+        .sqlite_db()
+        .ok_or_else(|| CalmError::Internal("canonical observation requires SQLite".into()))?;
+    let observed = crate::db::sqlite::conversation::runtime_frame_observation(
+        db.read_pool(),
+        inner.card_id.as_str(),
+        &inner.worker_session_id,
+    )
+    .await?;
+    Ok(CommittedFrame {
+        snapshot: checked_frame(observed.snapshot)?,
+        fence: observed.execution_fence,
     })
-    .await
 }
 
 /// This cache is published only from a returned, committed SQL result. Native
@@ -254,31 +269,25 @@ pub(super) async fn publish_issuance_error(inner: &Inner, error: &CalmError) {
     *inner.issuance_retry_after.lock().await = Some(Instant::now() + TRANSIENT_RETRY_DELAY);
 }
 
-/// Timer and source transitions enter the same scheduler/error owner.
-pub(super) async fn advance(inner: &Arc<Inner>, ingress_empty: bool) {
-    if let Err(error) = tick(inner, ingress_empty).await {
-        publish_issuance_error(inner, &error).await;
-        tracing::warn!(%error, "canonical harness tick did not advance");
-    }
-    #[cfg(feature = "fixtures")]
-    crate::test_seams::pause_point("canonical-tick-returned", inner.card_id.as_str()).await;
-}
-
 /// Consume the one persisted pending order in the existing scheduler. Live
 /// source entries carry no body, queue order, or reusable execution grant.
 pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> {
+    advance_once(inner, ingress_empty).await.map(|_| ())
+}
+
+async fn advance_once(inner: &Arc<Inner>, ingress_empty: bool) -> Result<Progress> {
     if inner.parked.is_parked() || inner.shutting_down.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if ingress_empty {
         super::compact_command::canonical::planner::tick(inner).await?;
     }
     let _issuance = inner.issuance.lock().await;
     if inner.parked.is_parked() {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if inner.shutting_down.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if let Some(settled) = inner.backend.settle_kept_execution().await? {
         publish(inner, written(settled)?).await;
@@ -296,7 +305,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         publish_end(inner, done).await?;
     }
     if super::compact_command::canonical::observe(inner).await? {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     let current = read_current(inner).await?;
     publish(inner, current.clone()).await;
@@ -317,10 +326,12 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         || header.interruption_intent.is_some()
         || header.wedged_reason.is_some()
     {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if checkpoint.active.is_some() && !checkpoint.resolved_execution_without_target() {
-        return resume_unattempted(inner, &current, _issuance).await;
+        return resume_unattempted(inner, &current, _issuance)
+            .await
+            .map(|()| Progress::Deferred);
     }
     if checkpoint.pending.is_empty()
         || !matches!(
@@ -328,7 +339,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
             HarnessPhaseTag::Idle | HarnessPhaseTag::TurnCompleted
         ) && !checkpoint.resolved_execution_without_target()
     {
-        return Ok(());
+        return Ok(Progress::Observed);
     }
     if let Some(pending) = checkpoint.pending.first()
         && inner
@@ -341,7 +352,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         #[cfg(feature = "fixtures")]
         crate::test_seams::pause_point("canonical-missing-source-observed", inner.card_id.as_str())
             .await;
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     // Like historical issuance, take the track fence before the card issuance
     // lock. Cleaning may run while idle, but not across the durable claim.
@@ -361,16 +372,16 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         super::issuance::TrackIssuance::Acquired(guard) => guard,
         super::issuance::TrackIssuance::ShuttingDown
         | super::issuance::TrackIssuance::Busy
-        | super::issuance::TrackIssuance::Superseded => return Ok(()),
+        | super::issuance::TrackIssuance::Superseded => return Ok(Progress::Deferred),
     };
     #[cfg(feature = "fixtures")]
     crate::test_seams::pause_point("canonical-issuance-track-held", inner.card_id.as_str()).await;
     let _issuance = inner.issuance.lock().await;
     if inner.parked.is_parked() {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if inner.shutting_down.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     let current = read_current(inner).await?;
     let checkpoint = &current.snapshot.canonical_inputs;
@@ -388,7 +399,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         || header.interruption_intent.is_some()
         || header.wedged_reason.is_some()
     {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     if (checkpoint.active.is_some() && !checkpoint.resolved_execution_without_target())
         || (!matches!(
@@ -396,15 +407,15 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
             HarnessPhaseTag::Idle | HarnessPhaseTag::TurnCompleted
         ) && !checkpoint.resolved_execution_without_target())
     {
-        return Ok(());
+        return Ok(Progress::Deferred);
     }
     let Some(pending) = checkpoint.pending.first() else {
-        return Ok(());
+        return Ok(Progress::Deferred);
     };
     let inputs = inner.inputs.canonical().expect("canonical consumer");
     let message = pending.identity();
     let Some(source) = inputs.execution_source(&message)? else {
-        return Ok(());
+        return Ok(Progress::Deferred);
     };
     if let CanonicalPendingIdentity::ExplicitSuccessor { retry_intent_id } = &message {
         let track_fence = crate::provider_execution::TrackFenceHandoff::new(track_guard);
@@ -415,7 +426,8 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
             retry_intent_id.clone(),
             &track_fence,
         )
-        .await;
+        .await
+        .map(|()| Progress::Deferred);
     }
     let card = inner.card_id.to_string();
     let runtime = inner.worker_session_id.clone();
@@ -465,7 +477,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
             if let Err(error) = read_admission.revalidate().await {
                 publish_issuance_error(inner, &error).await;
             }
-            return Ok(());
+            return Ok(Progress::Deferred);
         }
     };
     if checkpoint
@@ -486,7 +498,9 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
             .await
         {
             Ok(crate::harness::backend::SettledActivity::Settled) => {}
-            Ok(crate::harness::backend::SettledActivity::Held) | Err(_) => return Ok(()),
+            Ok(crate::harness::backend::SettledActivity::Held) | Err(_) => {
+                return Ok(Progress::Deferred);
+            }
         }
     }
     let mut contexts = vec![];
@@ -566,6 +580,7 @@ pub(super) async fn tick(inner: &Arc<Inner>, ingress_empty: bool) -> Result<()> 
         &track_fence,
     )
     .await
+    .map(|()| Progress::Deferred)
 }
 
 #[allow(clippy::too_many_arguments)]

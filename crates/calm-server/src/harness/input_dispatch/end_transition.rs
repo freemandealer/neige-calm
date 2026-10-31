@@ -137,6 +137,21 @@ pub(crate) async fn complete_once(
     let card = card_id.to_owned();
     let runtime = worker_session_id.to_owned();
     let provider = backend.provider();
+    // A single-statement observation can rule out an empty execution without
+    // writer admission. It grants nothing: real candidates are sampled again
+    // in the original protected transaction, then revalidated by consume_tx.
+    let db = repo.sqlite_db().ok_or_else(|| {
+        crate::error::CalmError::Internal("canonical END observation requires SQLite".into())
+    })?;
+    if crate::db::sqlite::conversation::runtime_frame_observation(db.read_pool(), &card, &runtime)
+        .await?
+        .snapshot
+        .canonical_inputs
+        .active
+        .is_none()
+    {
+        return Ok(None);
+    }
     let sampled = write_in_tx_typed(repo, {
         let card = card.clone();
         let runtime = runtime.clone();
