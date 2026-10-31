@@ -231,12 +231,19 @@ describe('edit area', () => {
 });
 
 describe('destructive confirms', () => {
+  it('focuses the name input when opening an area delete confirmation', async () => {
+    renderSidebar();
+    await requestAreaDelete();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Type Work to confirm.' })));
+  });
+
   it('deletes a track only after Confirm, and nothing on Cancel', async () => {
     const onDeleteTrack = vi.fn();
     renderSidebar({ tracks: [track({ id: 'w1', title: 'Task' })], onDeleteTrack });
 
     await userEvent.click(screen.getByRole('button', { name: 'Delete Task' }));
     expect(screen.getByRole('dialog', { name: 'Delete this track?' })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' })));
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onDeleteTrack).not.toHaveBeenCalled();
 
@@ -762,4 +769,16 @@ it('does not claim an empty activity shortcut after its read fails', () => {
   for (const name of ['没有运行中的 Track。', '没有需要处理的 Track。', '没有未读的 Track。']) {
     expect(screen.queryByRole('heading', { name })).toBeNull();
   }
+});
+
+
+it('keeps a failed track delete alert inside its confirmation', async () => {
+  const onDeleteTrack = vi.fn().mockRejectedValue(new Error('offline'));
+  renderSidebar({ tracks: [track({ id: 'w1', title: 'Task' })], onDeleteTrack });
+  await userEvent.click(screen.getByRole('button', { name: 'Delete Task' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Delete track' }));
+  const dialog = screen.getByRole('dialog', { name: 'Delete this track?' });
+  expect(await within(dialog).findByRole('alert')).toBeTruthy();
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Delete track' }));
+  await waitFor(() => expect(onDeleteTrack).toHaveBeenCalledTimes(2));
 });
