@@ -127,124 +127,135 @@ fn borrowed(a: &Value, provider: &str, path: &std::path::Path, isolation: &str) 
 }
 
 #[tokio::test]
-async fn u8b_canonical_borrowed_shapes_commit_and_read() {
-    for provider in ["codex", "opencode"] {
+async fn u8b_canonical_borrowed_shapes_commit_and_read_empty() {
+    borrowed_shapes_commit_and_read(false).await;
+}
+
+#[tokio::test]
+async fn u8b_canonical_borrowed_shapes_commit_and_read_human() {
+    borrowed_shapes_commit_and_read(true).await;
+}
+
+async fn borrowed_shapes_commit_and_read(human: bool) {
+    // Bound full application fixtures per test process while retaining every
+    // provider/resource/input combination and the same production assertions.
+    for provider in calm_types::runtime::AgentProvider::ALL {
         for shape in ["none", "default", "worktree", "same", "cross", "named"] {
-            for human in [false, true] {
-                let fixture = Fixture::new().await;
-                let (state, app, cookie) = fixture.application().await;
-                let a = area(&app, &cookie, "borrower").await;
-                let path = repo(&fixture);
-                let mut request = borrowed(
-                    &a,
-                    provider,
-                    &path,
-                    if shape == "none" || shape == "same" {
-                        "none"
-                    } else {
-                        "default"
-                    },
-                );
-                request["admin"] = json!(human);
-                if human {
-                    request["first_message"] = json!(FIRST_BODY);
-                }
-                if shape == "worktree" {
-                    request["isolation"] = json!("worktree");
-                }
-                if shape == "same" {
-                    claim(&app, &cookie, &a, &path).await;
-                    request["attach_folder"] = json!(false);
-                }
-                if shape == "cross" {
-                    let source = area(&app, &cookie, "source").await;
-                    let folder = claim(&app, &cookie, &source, &path).await;
-                    request["allow_cross_area_cwd"] =
-                        json!({"area_id":source["id"],"folder_id":folder["id"]});
-                    request["attach_folder"] = json!(false);
-                }
-                if shape == "named" {
-                    request["template_id"] = json!("small-change");
-                }
-                // A worktree must read its selected commit, not the source's dirty bytes.
-                std::fs::write(path.join("marker.svg"), "dirty").unwrap();
-                let created = post(&app, &cookie, "/api/tracks", "first", request.clone()).await;
-                let track = created["id"].as_str().unwrap();
-                let (card, worker, frame) = fixture.carrier(track).await;
-                assert_eq!(frame.canonical_inputs.pending.len(), usize::from(human));
-                assert!(frame.canonical_inputs.active.is_none());
-                assert!(frame.canonical_inputs.attempts.is_empty());
-                assert_eq!(
-                    fixture.counts(&card).await,
-                    (i64::from(human), i64::from(human), 1, 0, 0)
-                );
-                let receipts: i64 =
-                    sqlx::query_scalar("SELECT count(*) FROM conversation_human_track_creations")
-                        .fetch_one(fixture.repo.pool())
-                        .await
-                        .unwrap();
-                assert_eq!(receipts, i64::from(human));
-                let saved = fixture.repo.track_get(track).await.unwrap().unwrap();
-                assert_eq!(created["workspace"]["kind"], "attached");
-                let none = shape == "none" || shape == "same";
-                assert_eq!(saved.workspace.worktree.is_none(), none);
-                assert_eq!(
-                    saved.workspace.agent_cwd(),
-                    if none {
-                        path.to_str().unwrap()
-                    } else {
-                        saved.workspace.worktree.as_deref().unwrap()
-                    }
-                );
-                read(&app, &cookie, track, if none { "dirty" } else { MARKER }).await;
-                let assistant = post(
-                    &app,
-                    &cookie,
-                    &format!("/api/tracks/{track}/conversations"),
-                    "assistant",
-                    json!({"provider":provider,"text":FIRST_BODY}),
-                )
-                .await;
-                let assistant_id = assistant["id"].as_str().unwrap();
-                let (_, assistant_frame) =
-                    super::assistant_canonical::carrier(&fixture, assistant_id).await;
-                assert_eq!(assistant_frame.canonical_inputs.pending.len(), 1);
-                assert_eq!(
-                    fixture
-                        .repo
-                        .card_get(assistant_id)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .track_id
-                        .as_str(),
-                    track
-                );
-                assert_eq!(
-                    fixture
-                        .repo
-                        .track_get(track)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .workspace
-                        .agent_cwd(),
-                    saved.workspace.agent_cwd()
-                );
-                assert_eq!(
-                    post(&app, &cookie, "/api/tracks", "first", request).await,
-                    created
-                );
-                assert_eq!(fixture.carrier(track).await, (card, worker, frame));
-                fixture.shutdown_process(&state).await;
-            }
+            borrowed_shape_commit_and_read(provider.wire_name(), shape, human).await;
         }
     }
 }
 
+async fn borrowed_shape_commit_and_read(provider: &str, shape: &str, human: bool) {
+    let fixture = Fixture::new().await;
+    let (state, app, cookie) = fixture.application().await;
+    let a = area(&app, &cookie, "borrower").await;
+    let path = repo(&fixture);
+    let mut request = borrowed(
+        &a,
+        provider,
+        &path,
+        if shape == "none" || shape == "same" {
+            "none"
+        } else {
+            "default"
+        },
+    );
+    request["admin"] = json!(human);
+    if human {
+        request["first_message"] = json!(FIRST_BODY);
+    }
+    if shape == "worktree" {
+        request["isolation"] = json!("worktree");
+    }
+    if shape == "same" {
+        claim(&app, &cookie, &a, &path).await;
+        request["attach_folder"] = json!(false);
+    }
+    if shape == "cross" {
+        let source = area(&app, &cookie, "source").await;
+        let folder = claim(&app, &cookie, &source, &path).await;
+        request["allow_cross_area_cwd"] = json!({"area_id":source["id"],"folder_id":folder["id"]});
+        request["attach_folder"] = json!(false);
+    }
+    if shape == "named" {
+        request["template_id"] = json!("small-change");
+    }
+    // A worktree must read its selected commit, not the source's dirty bytes.
+    std::fs::write(path.join("marker.svg"), "dirty").unwrap();
+    let created = post(&app, &cookie, "/api/tracks", "first", request.clone()).await;
+    let track = created["id"].as_str().unwrap();
+    let (card, worker, frame) = fixture.carrier(track).await;
+    assert_eq!(frame.canonical_inputs.pending.len(), usize::from(human));
+    assert!(frame.canonical_inputs.active.is_none());
+    assert!(frame.canonical_inputs.attempts.is_empty());
+    assert_eq!(
+        fixture.counts(&card).await,
+        (i64::from(human), i64::from(human), 1, 0, 0)
+    );
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversation_human_track_creations")
+            .fetch_one(fixture.repo.pool())
+            .await
+            .unwrap();
+    assert_eq!(receipts, i64::from(human));
+    let saved = fixture.repo.track_get(track).await.unwrap().unwrap();
+    assert_eq!(created["workspace"]["kind"], "attached");
+    let none = shape == "none" || shape == "same";
+    assert_eq!(saved.workspace.worktree.is_none(), none);
+    assert_eq!(
+        saved.workspace.agent_cwd(),
+        if none {
+            path.to_str().unwrap()
+        } else {
+            saved.workspace.worktree.as_deref().unwrap()
+        }
+    );
+    read(&app, &cookie, track, if none { "dirty" } else { MARKER }).await;
+    let assistant = post(
+        &app,
+        &cookie,
+        &format!("/api/tracks/{track}/conversations"),
+        "assistant",
+        json!({"provider":provider,"text":FIRST_BODY}),
+    )
+    .await;
+    let assistant_id = assistant["id"].as_str().unwrap();
+    let (_, assistant_frame) = super::assistant_canonical::carrier(&fixture, assistant_id).await;
+    assert_eq!(assistant_frame.canonical_inputs.pending.len(), 1);
+    assert_eq!(
+        fixture
+            .repo
+            .card_get(assistant_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .track_id
+            .as_str(),
+        track
+    );
+    assert_eq!(
+        fixture
+            .repo
+            .track_get(track)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace
+            .agent_cwd(),
+        saved.workspace.agent_cwd()
+    );
+    assert_eq!(
+        post(&app, &cookie, "/api/tracks", "first", request).await,
+        created
+    );
+    assert_eq!(fixture.carrier(track).await, (card, worker, frame));
+    fixture.shutdown_process(&state).await;
+}
+
 #[tokio::test]
 async fn u8b_canonical_claim_changes_preserve_fixed_locator() {
-    for provider in ["codex", "opencode"] {
+    for provider in calm_types::runtime::AgentProvider::ALL.map(|provider| provider.wire_name()) {
         for isolation in ["none", "default"] {
             let fixture = Fixture::new().await;
             let (state, app, cookie) = fixture.application().await;
@@ -314,7 +325,7 @@ async fn u8b_canonical_claim_changes_preserve_fixed_locator() {
 
 #[tokio::test]
 async fn u8b_canonical_receipt_abort_rolls_back_resources() {
-    for provider in ["codex", "opencode"] {
+    for provider in calm_types::runtime::AgentProvider::ALL.map(|provider| provider.wire_name()) {
         let fixture = Fixture::new().await;
         let (state, app, cookie) = fixture.application().await;
         let a = area(&app, &cookie, "atomic").await;
@@ -359,7 +370,7 @@ async fn u8b_canonical_receipt_abort_rolls_back_resources() {
 #[tokio::test]
 async fn u8b_canonical_authority_races_roll_back() {
     use crate::test_seams::{PausePoint, install_pause_for_test};
-    for provider in ["codex", "opencode"] {
+    for provider in calm_types::runtime::AgentProvider::ALL.map(|provider| provider.wire_name()) {
         for race in [
             "source",
             "target",
@@ -460,7 +471,7 @@ async fn u8b_canonical_authority_races_roll_back() {
 
 #[tokio::test]
 async fn u8b_canonical_keys_replay_original_ack() {
-    for provider in ["codex", "opencode"] {
+    for provider in calm_types::runtime::AgentProvider::ALL.map(|provider| provider.wire_name()) {
         for isolation in ["none", "default"] {
             let fixture = Fixture::new().await;
             let (state, app, cookie) = fixture.application().await;
@@ -492,7 +503,14 @@ async fn u8b_canonical_keys_replay_original_ack() {
                     }),
                 ),
                 ("admin", json!(true)),
-                ("planner_provider", json!("claude")),
+                (
+                    "planner_provider",
+                    json!(if provider == "claude" {
+                        "grok"
+                    } else {
+                        "claude"
+                    }),
+                ),
                 ("first_message", json!("changed")),
                 (
                     "allow_cross_area_cwd",
@@ -530,7 +548,7 @@ async fn u8b_canonical_keys_replay_original_ack() {
 
 #[tokio::test]
 async fn u8b_canonical_retained_borrowed_repoint_refused() {
-    for provider in ["codex", "opencode"] {
+    for provider in calm_types::runtime::AgentProvider::ALL.map(|provider| provider.wire_name()) {
         for human in [false, true] {
             let fixture = Fixture::new().await;
             let (state, app, cookie) = fixture.application().await;
