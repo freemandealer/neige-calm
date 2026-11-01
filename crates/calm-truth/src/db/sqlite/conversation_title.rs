@@ -8,13 +8,15 @@ use sqlx::{Row, SqliteConnection};
 
 // A per-card batch size, never a cap on how far the first visible input can be found.
 const CANDIDATE_BATCH: i64 = 32;
+// Guard the legacy seek itself: SQLite may evaluate the IN subquery before
+// the outer JOIN condition, even when the conversation is canonical.
 const SOURCES: &str = r#"
 SELECT c.id AS card_id, h.id AS item_id, h.params, h.input_segments, c.canonical
 FROM json_each(?1) request
 JOIN (SELECT c.id, c.role, {canonical_storage} AS canonical FROM cards c) c ON c.id = json_extract(request.value, '$.card_id')
 LEFT JOIN harness_items h ON NOT c.canonical AND h.id IN (
     SELECT candidate.id FROM harness_items candidate
-    WHERE candidate.card_id = c.id
+    WHERE candidate.card_id = CASE WHEN c.canonical THEN NULL ELSE c.id END
       AND candidate.id > json_extract(request.value, '$.after_id')
       AND candidate.method = 'item/completed'
       AND candidate.item_type IN ('userMessage', 'user_message')
@@ -67,7 +69,11 @@ async fn sources_on_connection(
                     });
             if row.try_get::<bool, _>("canonical")? {
                 source.input = Some(ConversationTitleInput::Canonical(
-                    canonical_title(connection, &source.card_id).await?,
+                    super::conversation_read::first_title_on_connection(
+                        connection,
+                        &source.card_id,
+                    )
+                    .await?,
                 ));
                 continue;
             }
@@ -98,34 +104,6 @@ async fn sources_on_connection(
             .collect();
     }
     Ok(sources.into_values().collect())
-}
-
-/// The finite presentation reader owns revision, withdrawal and private-erasure
-/// semantics. Advance bounded pages until its first Human, never a native echo.
-async fn canonical_title(connection: &mut SqliteConnection, card: &str) -> Result<Option<String>> {
-    let mut after = 0;
-    loop {
-        let page = super::conversation_read::page_on_connection(
-            connection,
-            card,
-            after,
-            CANDIDATE_BATCH,
-            false,
-        )
-        .await?;
-        for item in page.items {
-            if let calm_types::conversation_display::ConversationDisplaySource::Human {
-                text, ..
-            } = item.source
-            {
-                return Ok(crate::conversation_title::conversation_title(&text));
-            }
-        }
-        match page.next_cursor {
-            Some(cursor) => after = cursor.position,
-            None => return Ok(None),
-        }
-    }
 }
 
 pub(super) async fn context(
